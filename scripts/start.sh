@@ -140,7 +140,8 @@ if lsof -i :"$CHROMADB_PORT" >/dev/null 2>&1; then
   echo "ChromaDB is already running on port $CHROMADB_PORT."
 else
   echo "Starting ChromaDB on port $CHROMADB_PORT..."
-  chroma run --port "$CHROMADB_PORT" > /tmp/chromadb.log 2>&1 &
+  mkdir -p "$PROJECT_DIR/chroma"
+  chroma run --port "$CHROMADB_PORT" --path "$PROJECT_DIR/chroma" > /tmp/chromadb.log 2>&1 &
   sleep 2
   if lsof -i :"$CHROMADB_PORT" >/dev/null 2>&1; then
     echo "ChromaDB started (port $CHROMADB_PORT, log: /tmp/chromadb.log)"

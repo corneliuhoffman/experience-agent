@@ -2,7 +2,7 @@ open Lwt.Syntax
 open Types
 
 type t = {
-  base_sha : string;
+  mutable base_sha : string;
   mutable steps : step list;
   mutable next_number : int;
   port : int;
@@ -63,3 +63,20 @@ let format t =
   end
 
 let base_sha t = t.base_sha
+
+let last_step t =
+  match List.rev t.steps with
+  | s :: _ -> Some s
+  | [] -> None
+
+let remove_last t =
+  match List.rev t.steps with
+  | _ :: rest ->
+    t.steps <- List.rev rest;
+    t.next_number <- t.next_number - 1
+  | [] -> ()
+
+let reset t ~new_base_sha =
+  t.base_sha <- new_base_sha;
+  t.steps <- [];
+  t.next_number <- 1

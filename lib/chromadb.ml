@@ -72,9 +72,11 @@ let ensure_collections ~port ~project =
     ~name:(project ^ "_intents") in
   let* conversations_id = get_or_create_collection ~port
     ~name:(project ^ "_conversations") in
-  let+ session_id = get_or_create_collection ~port
+  let* session_id = get_or_create_collection ~port
     ~name:(project ^ "_session") in
-  { intents_id; conversations_id; session_id }
+  let+ groups_id = get_or_create_collection ~port
+    ~name:(project ^ "_groups") in
+  { intents_id; conversations_id; session_id; groups_id }
 
 (* Add document with embedding *)
 let add_document ~port ~collection_id ~id ~document ~metadata =
@@ -120,6 +122,20 @@ let save_session_step ~port ~(collections : collections) (s : step) =
   add_document ~port ~collection_id:collections.session_id
     ~id:s.experience_id ~document:doc ~metadata
 
+let save_experience_group ~port ~(collections : collections) (g : experience_group) =
+  let doc = Printf.sprintf "%s: %s" g.label g.intent in
+  let metadata = `Assoc [
+    "commit_sha", `String g.commit_sha;
+    "step_ids", `String (String.concat "," g.step_ids);
+    "diff", `String g.diff;
+    "files", `String (String.concat "," g.files);
+    "timestamp", `Float g.timestamp;
+    "label", `String g.label;
+    "intent", `String g.intent;
+  ] in
+  add_document ~port ~collection_id:collections.groups_id
+    ~id:g.group_id ~document:doc ~metadata
+
 (* Query with embedding *)
 let query_collection ~port ~collection_id ~query_text ~n =
   let* embedding = embed_text query_text in
@@ -163,37 +179,65 @@ let experience_from_metadata ~id ~distance (meta : Yojson.Safe.t) : search_resul
   } in
   { experience = exp; source = `Experience; distance }
 
-let search_two_stage ~port ~(collections : collections) ~query ~broad_k ~n =
-  (* Stage 1: broad search on intents *)
+let group_from_metadata ~id ~distance (meta : Yojson.Safe.t) : group_search_result =
+  let open Yojson.Safe.Util in
+  let g = {
+    group_id = id;
+    label = meta |> member "label" |> to_string_option |> Option.value ~default:"";
+    intent = meta |> member "intent" |> to_string_option |> Option.value ~default:"";
+    commit_sha = meta |> member "commit_sha" |> to_string_option |> Option.value ~default:"";
+    step_ids = (meta |> member "step_ids" |> to_string_option |> Option.value ~default:""
+                |> String.split_on_char ','
+                |> List.filter (fun s -> String.length s > 0));
+    diff = meta |> member "diff" |> to_string_option |> Option.value ~default:"";
+    files = (meta |> member "files" |> to_string_option |> Option.value ~default:""
+             |> String.split_on_char ','
+             |> List.filter (fun s -> String.length s > 0));
+    timestamp = (try meta |> member "timestamp" |> to_float with _ -> 0.0);
+  } in
+  { group = g; distance }
+
+(* Three-stage search: groups -> step intents -> step conversations *)
+let search_three_stage ~port ~(collections : collections) ~query ~broad_k ~n =
+  (* Stage 1: search experience groups *)
+  let* group_resp = query_collection ~port
+    ~collection_id:collections.groups_id ~query_text:query ~n:broad_k in
+  let group_results = parse_query_results group_resp
+    |> List.map (fun (id, dist, meta) ->
+      group_from_metadata ~id ~distance:dist meta) in
+  (* Stage 2: broad search on step intents *)
   let* intent_resp = query_collection ~port
     ~collection_id:collections.intents_id ~query_text:query ~n:broad_k in
   let intent_results = parse_query_results intent_resp in
-  if intent_results = [] then Lwt.return []
-  else begin
-    (* Stage 2: re-rank by querying conversations for same IDs *)
-    let* conv_resp = query_collection ~port
-      ~collection_id:collections.conversations_id ~query_text:query
-      ~n:broad_k in
-    let conv_results = parse_query_results conv_resp in
-    let conv_map = List.fold_left (fun acc (id, dist, _meta) ->
-      (id, dist) :: acc
-    ) [] conv_results in
-    let combined = List.map (fun (id, intent_dist, meta) ->
-      let conv_dist = match List.assoc_opt id conv_map with
-        | Some d -> d
-        | None -> 1.0
-      in
-      let combined_dist = (intent_dist +. conv_dist) /. 2.0 in
-      (id, combined_dist, meta)
-    ) intent_results in
-    let sorted = List.sort (fun (_, d1, _) (_, d2, _) ->
-      Float.compare d1 d2
-    ) combined in
-    let top_n = List.filteri (fun i _ -> i < n) sorted in
-    Lwt.return (List.map (fun (id, dist, meta) ->
-      (experience_from_metadata ~id ~distance:dist meta).experience
-    ) top_n)
-  end
+  (* Stage 3: re-rank steps by conversation similarity *)
+  let* step_results =
+    if intent_results = [] then Lwt.return []
+    else begin
+      let* conv_resp = query_collection ~port
+        ~collection_id:collections.conversations_id ~query_text:query
+        ~n:broad_k in
+      let conv_results = parse_query_results conv_resp in
+      let conv_map = List.fold_left (fun acc (id, dist, _meta) ->
+        (id, dist) :: acc
+      ) [] conv_results in
+      let combined = List.map (fun (id, intent_dist, meta) ->
+        let conv_dist = match List.assoc_opt id conv_map with
+          | Some d -> d
+          | None -> 1.0
+        in
+        let combined_dist = (intent_dist +. conv_dist) /. 2.0 in
+        (id, combined_dist, meta)
+      ) intent_results in
+      let sorted = List.sort (fun (_, d1, _) (_, d2, _) ->
+        Float.compare d1 d2
+      ) combined in
+      let top_n = List.filteri (fun i _ -> i < n) sorted in
+      Lwt.return (List.map (fun (id, dist, meta) ->
+        (experience_from_metadata ~id ~distance:dist meta).experience
+      ) top_n)
+    end
+  in
+  Lwt.return (group_results, step_results)
 
 let search_for_undo ~port ~(collections : collections) ~query ~n =
   let* session_resp = query_collection ~port
@@ -208,7 +252,7 @@ let search_for_undo ~port ~(collections : collections) ~query ~n =
     |> List.map (fun (id, dist, meta) ->
       experience_from_metadata ~id ~distance:dist meta) in
   let all = session_results @ exp_results in
-  let sorted = List.sort (fun a b ->
+  let sorted = List.sort (fun (a : search_result) (b : search_result) ->
     Float.compare a.distance b.distance
   ) all in
   Lwt.return (List.filteri (fun i _ -> i < n) sorted)
@@ -224,7 +268,8 @@ let delete ~port ~(collections : collections) ~id =
   in
   let* () = delete_from collections.intents_id in
   let* () = delete_from collections.conversations_id in
-  delete_from collections.session_id
+  let* () = delete_from collections.session_id in
+  delete_from collections.groups_id
 
 let list_all ~port ~(collections : collections) ~limit =
   let body = `Assoc [
@@ -241,6 +286,22 @@ let list_all ~port ~(collections : collections) ~limit =
     List.combine ids metadatas
     |> List.map (fun (id, meta) ->
       (experience_from_metadata ~id ~distance:0.0 meta).experience)
+
+let list_all_groups ~port ~(collections : collections) ~limit =
+  let body = `Assoc [
+    "limit", `Int limit;
+    "include", `List [`String "documents"; `String "metadatas"];
+  ] in
+  let+ resp = http_post ~port
+    ~path:(Printf.sprintf "/collections/%s/get" collections.groups_id) ~body in
+  let open Yojson.Safe.Util in
+  let ids = resp |> member "ids" |> safe_to_list |> List.map to_string in
+  let metadatas = resp |> member "metadatas" |> safe_to_list in
+  if ids = [] then []
+  else
+    List.combine ids metadatas
+    |> List.map (fun (id, meta) ->
+      (group_from_metadata ~id ~distance:0.0 meta).group)
 
 let clear_session ~port ~(collections : collections) =
   let body = `Assoc [

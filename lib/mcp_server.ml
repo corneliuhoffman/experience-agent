@@ -114,6 +114,54 @@ let tool_definitions = `List [
       "required", `List [`String "id"];
     ];
   ];
+  `Assoc [
+    "name", `String "start_experiences";
+    "description", `String "Enter auto-recording mode. After calling this, every conversation turn (user question + Claude's answer/action) becomes a step. Call save_step after each turn. If the user approves (says 'yes'), keep it. If the user rejects, call reject_step. Call save_experience when done to finalize the group.";
+    "inputSchema", `Assoc [
+      "type", `String "object";
+      "properties", `Assoc [];
+    ];
+  ];
+  `Assoc [
+    "name", `String "reject_step";
+    "description", `String "Reject and roll back the last step. Undoes the git micro-commit and removes the step from tracking and ChromaDB.";
+    "inputSchema", `Assoc [
+      "type", `String "object";
+      "properties", `Assoc [];
+    ];
+  ];
+  `Assoc [
+    "name", `String "save_experience";
+    "description", `String "Finalize the current group of steps into a single experience group. Squashes git micro-commits into one commit, saves the group as a searchable entity, and resets for the next group. Auto-recording stays on.";
+    "inputSchema", `Assoc [
+      "type", `String "object";
+      "properties", `Assoc [
+        "label", `Assoc [
+          "type", `String "string";
+          "description", `String "Short description of what the experience group accomplished";
+        ];
+        "intent", `Assoc [
+          "type", `String "string";
+          "description", `String "The overall user intent/goal for this group of steps";
+        ];
+      ];
+      "required", `List [`String "label"; `String "intent"];
+    ];
+  ];
+  `Assoc [
+    "name", `String "replay_experience";
+    "description", `String "Search for a past experience or experience group and return the full step-by-step conversation data for replay. Returns the matching experience with all steps and their conversations in order.";
+    "inputSchema", `Assoc [
+      "type", `String "object";
+      "properties", `Assoc [
+        "query", `Assoc [
+          "type", `String "string";
+          "description", `String "Natural language description of the experience to replay";
+        ];
+      ];
+      "required", `List [`String "query"];
+    ];
+  ];
 ]
 
 let text_result text =
@@ -133,6 +181,8 @@ type state = {
   mutable collections : collections option;
   mutable tracker : Step_tracker.t option;
   mutable last_undo_match : search_result option;
+  mutable auto_recording : bool;
+  mutable current_group_steps : string list;
 }
 
 let get_collections state =
@@ -166,10 +216,15 @@ let handle_search_experience state args =
   let n = args |> member "n_results" |> to_int_option |> Option.value ~default:3 in
   let broad_k = args |> member "broad_k" |> to_int_option |> Option.value ~default:10 in
   let* collections = get_collections state in
-  let+ results = Chromadb.search_two_stage ~port:state.port
+  let+ (group_results, step_results) = Chromadb.search_three_stage ~port:state.port
     ~collections ~query ~broad_k ~n in
-  let results_json = `List (List.map experience_to_yojson results) in
-  json_result results_json
+  let groups_json = `List (List.map (fun (r : group_search_result) ->
+    group_search_result_to_yojson r) group_results) in
+  let steps_json = `List (List.map experience_to_yojson step_results) in
+  json_result (`Assoc [
+    "groups", groups_json;
+    "experiences", steps_json;
+  ])
 
 let handle_save_step state args =
   let open Yojson.Safe.Util in
@@ -207,11 +262,15 @@ let handle_save_step state args =
   (* Save to persistent experience collections *)
   let exp = step_to_experience step in
   let* () = Chromadb.save_experience ~port:state.port ~collections exp in
+  (* Track step in current group if auto-recording *)
+  if state.auto_recording then
+    state.current_group_steps <- state.current_group_steps @ [step.experience_id];
   let result = `Assoc [
     "step_number", `Int step.number;
     "experience_id", `String step.experience_id;
     "commit_sha", `String commit_sha;
     "files_changed", `List (List.map (fun f -> `String f) files);
+    "auto_recording", `Bool state.auto_recording;
   ] in
   Lwt.return (json_result result)
 
@@ -239,13 +298,13 @@ let handle_go_back state args =
           ) (Step_tracker.all tracker) with
           | Some step -> Step_tracker.truncate_after tracker step.number
           | None -> Lwt.return_unit)
-        | `Experience -> Lwt.return_unit
+        | `Experience | `Group -> Lwt.return_unit
       in
       state.last_undo_match <- None;
       let+ () = Lwt.return_unit in
       text_result (Printf.sprintf "Rolled back to: %s (commit: %s, source: %s)"
         result.experience.label sha
-        (match result.source with `Session -> "session" | `Experience -> "experience"))
+        (match result.source with `Session -> "session" | `Experience -> "experience" | `Group -> "group"))
       end
   end else begin
     (* Search for matching state *)
@@ -285,7 +344,7 @@ let handle_go_back state args =
           "match_found", `Bool true;
           "label", `String best.experience.label;
           "source", `String (match best.source with
-            `Session -> "session" | `Experience -> "experience");
+            `Session -> "session" | `Experience -> "experience" | `Group -> "group");
           "distance", `Float best.distance;
           "files", `List (List.map (fun f -> `String f) best.experience.files);
           "instruction", `String "Call go_back again with confirm=true to apply this rollback.";
@@ -313,8 +372,12 @@ let handle_list_experiences state args =
   let limit = args |> member "limit" |> to_int_option
     |> Option.value ~default:10 in
   let* collections = get_collections state in
-  let+ exps = Chromadb.list_all ~port:state.port ~collections ~limit in
-  json_result (`List (List.map experience_to_yojson exps))
+  let* exps = Chromadb.list_all ~port:state.port ~collections ~limit in
+  let+ groups = Chromadb.list_all_groups ~port:state.port ~collections ~limit in
+  json_result (`Assoc [
+    "experiences", `List (List.map experience_to_yojson exps);
+    "groups", `List (List.map experience_group_to_yojson groups);
+  ])
 
 let handle_delete_experience state args =
   let open Yojson.Safe.Util in
@@ -322,6 +385,146 @@ let handle_delete_experience state args =
   let* collections = get_collections state in
   let+ () = Chromadb.delete ~port:state.port ~collections ~id in
   text_result (Printf.sprintf "Deleted experience %s" id)
+
+let handle_start_experiences state _args =
+  state.auto_recording <- true;
+  state.current_group_steps <- [];
+  Lwt.return (text_result (String.concat "\n" [
+    "Auto-recording mode enabled.";
+    "";
+    "Instructions:";
+    "- After every conversation turn (user question + your answer/action), call `save_step` with the full turn transcript.";
+    "- If the user's next message is 'yes' or starts with 'yes', keep the step.";
+    "- If the user rejects (says 'no', expresses disapproval), call `reject_step` to undo it.";
+    "- `go_back` still works as usual.";
+    "- When done, call `save_experience` with a label and intent to finalize the group.";
+  ]))
+
+let handle_reject_step state _args =
+  let* tracker = get_tracker state in
+  match Step_tracker.last_step tracker with
+  | None ->
+    Lwt.return (text_result "No steps to reject.")
+  | Some last_step ->
+    let prev_sha = match Step_tracker.get tracker (last_step.number - 1) with
+      | Some prev -> prev.commit_sha
+      | None -> Step_tracker.base_sha tracker
+    in
+    (* Roll back git *)
+    let* () = Git_ops.rollback_to ~cwd:state.project_dir ~sha:prev_sha in
+    (* Remove from tracker *)
+    Step_tracker.remove_last tracker;
+    (* Remove from ChromaDB *)
+    let* collections = get_collections state in
+    let* () = Chromadb.delete ~port:state.port ~collections
+      ~id:last_step.experience_id in
+    (* Remove from current group steps *)
+    state.current_group_steps <- List.filter
+      (fun id -> id <> last_step.experience_id) state.current_group_steps;
+    Lwt.return (text_result (Printf.sprintf
+      "Rejected step %d (%s). Rolled back to %s."
+      last_step.number last_step.label prev_sha))
+
+let handle_save_experience state args =
+  let open Yojson.Safe.Util in
+  let label = args |> member "label" |> to_string in
+  let intent = args |> member "intent" |> to_string in
+  let* tracker = get_tracker state in
+  let* collections = get_collections state in
+  let base = Step_tracker.base_sha tracker in
+  (* Compute full diff from base to current HEAD *)
+  let* current_sha = Git_ops.get_current_sha ~cwd:state.project_dir in
+  let* diff =
+    Lwt.catch
+      (fun () -> Git_ops.diff_between ~cwd:state.project_dir
+        ~from_sha:base ~to_sha:current_sha)
+      (fun _exn -> Lwt.return "")
+  in
+  let* files =
+    Lwt.catch
+      (fun () -> Git_ops.changed_files ~cwd:state.project_dir ~from_sha:base)
+      (fun _exn -> Lwt.return [])
+  in
+  (* Squash micro-commits into one *)
+  let* squashed_sha = Git_ops.squash_commit ~cwd:state.project_dir
+    ~message:(Printf.sprintf "%s: %s" label intent) ~base_sha:base in
+  (* Create experience group *)
+  let group_id = Uuidm.v4_gen (Random.State.make_self_init ()) ()
+    |> Uuidm.to_string in
+  let group : experience_group = {
+    group_id;
+    label;
+    intent;
+    commit_sha = squashed_sha;
+    step_ids = state.current_group_steps;
+    diff;
+    files;
+    timestamp = Unix.gettimeofday ();
+  } in
+  (* Save group to ChromaDB *)
+  let* () = Chromadb.save_experience_group ~port:state.port
+    ~collections group in
+  (* Reset tracker for next group *)
+  Step_tracker.reset tracker ~new_base_sha:squashed_sha;
+  let* () = Chromadb.clear_session ~port:state.port ~collections in
+  (* Reset group steps *)
+  state.current_group_steps <- [];
+  (* Auto-recording stays on *)
+  Lwt.return (json_result (`Assoc [
+    "group_id", `String group_id;
+    "commit_sha", `String squashed_sha;
+    "steps_count", `Int (List.length group.step_ids);
+    "files", `List (List.map (fun f -> `String f) files);
+    "auto_recording", `Bool state.auto_recording;
+  ]))
+
+let handle_replay_experience state args =
+  let open Yojson.Safe.Util in
+  let query = args |> member "query" |> to_string in
+  let* collections = get_collections state in
+  (* Search groups first *)
+  let* group_resp = Chromadb.query_collection ~port:state.port
+    ~collection_id:collections.groups_id ~query_text:query ~n:3 in
+  let group_hits = Chromadb.parse_query_results group_resp in
+  match group_hits with
+  | (id, dist, meta) :: _ ->
+    (* Found a group match — return it with step details *)
+    let group = (Chromadb.group_from_metadata ~id ~distance:dist meta).group in
+    (* Fetch individual step experiences for the group *)
+    let* step_experiences = Lwt_list.filter_map_s (fun step_id ->
+      (* Fetch step by direct ID *)
+      let body = `Assoc [
+        "ids", `List [`String step_id];
+        "include", `List [`String "documents"; `String "metadatas"];
+      ] in
+      let+ resp = Chromadb.http_post ~port:state.port
+        ~path:(Printf.sprintf "/collections/%s/get" collections.intents_id)
+        ~body in
+      let ids = resp |> member "ids" |> Chromadb.safe_to_list |> List.map to_string in
+      let metadatas = resp |> member "metadatas" |> Chromadb.safe_to_list in
+      match ids, metadatas with
+      | [found_id], [meta] ->
+        Some (Chromadb.experience_from_metadata ~id:found_id ~distance:0.0 meta).experience
+      | _ -> None
+    ) group.step_ids in
+    let replay = `Assoc [
+      "type", `String "group";
+      "group", experience_group_to_yojson group;
+      "steps", `List (List.map experience_to_yojson step_experiences);
+    ] in
+    Lwt.return (json_result replay)
+  | [] ->
+    (* No group found, try individual experiences *)
+    let+ (_, step_results) = Chromadb.search_three_stage ~port:state.port
+      ~collections ~query ~broad_k:5 ~n:1 in
+    match step_results with
+    | exp :: _ ->
+      json_result (`Assoc [
+        "type", `String "experience";
+        "experience", experience_to_yojson exp;
+      ])
+    | [] ->
+      text_result "No matching experience found for replay."
 
 let dispatch_tool state name args =
   match name with
@@ -332,6 +535,10 @@ let dispatch_tool state name args =
   | "commit" -> handle_commit state args
   | "list_experiences" -> handle_list_experiences state args
   | "delete_experience" -> handle_delete_experience state args
+  | "start_experiences" -> handle_start_experiences state args
+  | "reject_step" -> handle_reject_step state args
+  | "save_experience" -> handle_save_experience state args
+  | "replay_experience" -> handle_replay_experience state args
   | _ -> Lwt.return (text_result (Printf.sprintf "Unknown tool: %s" name))
 
 (* JSON-RPC message handling *)
@@ -411,6 +618,8 @@ let run ~port ~project_dir =
     collections = None;
     tracker = None;
     last_undo_match = None;
+    auto_recording = false;
+    current_group_steps = [];
   } in
   let stdin = Lwt_io.stdin in
   let stdout = Lwt_io.stdout in
