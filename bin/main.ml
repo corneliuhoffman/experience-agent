@@ -2,7 +2,7 @@ let () =
   Printexc.record_backtrace true;
   let port = ref 8000 in
   let project_dir = ref "." in
-  let web_port = ref 0 in
+  let web_port = ref 9878 in
   let wipe = ref false in
   let import_session = ref "" in
   let init = ref false in
