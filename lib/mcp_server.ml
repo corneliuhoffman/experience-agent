@@ -45,7 +45,7 @@ let tool_definitions = `List [
   ];
   `Assoc [
     "name", `String "replay_experience";
-    "description", `String "Search for a past experience and return the full conversation data for replay. Returns the matching experience with the complete interaction transcript.";
+    "description", `String "Search for a past experience and return the full conversation data for replay. Returns the matching experience with the complete interaction transcript.\n\nFor depth 'full' or 'with_subagents', returns a web URL to view the formatted conversation in the browser instead of dumping raw data.";
     "inputSchema", `Assoc [
       "type", `String "object";
       "properties", `Assoc [
@@ -401,61 +401,28 @@ let handle_replay_experience state args =
     if depth = "summary" then
       Lwt.return (json_result (experience_to_yojson exp))
     else begin
-      (* Try to read from JSONL *)
-      let jsonl_path = Filename.concat state.jsonl_dir
-        (exp.session_id ^ ".jsonl") in
-      if exp.session_id <> "" && Sys.file_exists jsonl_path then begin
-        let interactions = Jsonl_reader.parse_interactions ~filepath:jsonl_path in
-        let matching = List.filter (fun (i : interaction) ->
-          List.mem i.user_uuid exp.interaction_uuids
-        ) interactions in
-        (* If query is provided, search interactions to return only relevant ones *)
-        let* to_format = match query with
-          | Some q ->
-            let* int_collection_id = get_interactions_collection state in
-            let+ hits = Chromadb.search_interactions ~port:state.port
-              ~collection_id:int_collection_id ~experience_id:exp.id ~query:q ~n:3 in
-            if hits = [] then matching
-            else begin
-              let hit_uuids = List.map (fun (_idx, uuid, _dist) -> uuid) hits in
-              let filtered = List.filter (fun (i : interaction) ->
-                List.mem i.user_uuid hit_uuids
-              ) matching in
-              if filtered = [] then matching else filtered
-            end
-          | None -> Lwt.return matching
-        in
-        let formatted = match depth with
-          | "with_subagents" ->
-            String.concat "\n\n" (List.map
-              (Jsonl_reader.format_interaction_with_subagents
-                ~jsonl_dir:state.jsonl_dir ~filepath:jsonl_path) to_format)
-          | _ ->
-            String.concat "\n\n" (List.map
-              (Jsonl_reader.format_interaction ~filepath:jsonl_path) to_format)
-        in
-        let source = match query with
-          | Some _ when List.length to_format < List.length matching -> "jsonl_filtered"
-          | _ -> "jsonl"
-        in
-        Lwt.return (json_result (`Assoc [
-          "experience", experience_to_yojson exp;
-          "conversation", `String formatted;
-          "interactions_total", `Int (List.length matching);
-          "interactions_returned", `Int (List.length to_format);
-          "source", `String source;
-        ]))
-      end else begin
-        (* Fallback: show commit-level data *)
-        Lwt.return (json_result (`Assoc [
-          "experience", experience_to_yojson exp;
-          "conversation", `String (if exp.diff <> "" then
-            Printf.sprintf "Commit: %s\n\n%s\n\nDiff:\n%s"
-              exp.commit_sha exp.commit_message exp.diff
-            else "(JSONL file no longer available; commit metadata only)");
-          "source", `String "commit";
-        ]))
-      end
+      (* Return a web URL for viewing the full conversation *)
+      let url =
+        if state.web_port > 0 then
+          Printf.sprintf "http://localhost:%d/?id=%s" state.web_port exp.id
+        else
+          ""
+      in
+      let summary = Printf.sprintf "**%s**\n%s\n\nCommit: %s\nBranch: %s\nTimestamp: %.0f%s"
+        exp.label exp.intent
+        (String.sub exp.id 0 (min 8 (String.length exp.id)))
+        exp.branch
+        exp.timestamp
+        (if exp.reverted then " (reverted)" else "")
+      in
+      let fields = [
+        "experience", experience_to_yojson exp;
+        "summary", `String summary;
+      ] @ (if url <> "" then [
+        "url", `String url;
+        "view", `String (Printf.sprintf "View full conversation: %s" url);
+      ] else []) in
+      Lwt.return (json_result (`Assoc fields))
     end
 
 let handle_go_back state args =
@@ -919,8 +886,13 @@ let handle_explain_change state args =
            else exp.intent))
       end
     ) sha_to_exp in
-    (* Build a concise text response with a clickable URL *)
+    (* Build a concise text response with a clickable URL at the top *)
     let response = Buffer.create 256 in
+    if blame_url <> "" then begin
+      Buffer.add_string response blame_url;
+      Buffer.add_char response '\n';
+      Buffer.add_char response '\n'
+    end;
     Buffer.add_string response (Printf.sprintf
       "Found %d lines matching '%s' in %s, from %d commit(s) with %d experience(s).\n\n"
       (List.length filtered)
@@ -932,11 +904,6 @@ let handle_explain_change state args =
       Buffer.add_string response s;
       Buffer.add_char response '\n'
     ) summaries;
-    if blame_url <> "" then begin
-      Buffer.add_string response "\nView full conversation and blame details:\n";
-      Buffer.add_string response blame_url;
-      Buffer.add_char response '\n'
-    end;
     Lwt.return (text_result (Buffer.contents response))
   end
 

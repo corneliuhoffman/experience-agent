@@ -394,6 +394,11 @@ async function loadExperiences() {
       onSearchInput(sha);
       if (filteredExperiences.length > 0) selectExperience(filteredExperiences[0]);
     }
+    const idParam = params.get('id');
+    if (idParam) {
+      const match = experiences.find(e => e.id === idParam || e.id.startsWith(idParam));
+      if (match) selectExperience(match);
+    }
   } catch(e) {
     document.getElementById('status').textContent = 'Error: ' + e.message;
   }
@@ -1052,6 +1057,12 @@ let html_response body =
 let error_response status msg =
   json_response ~status (`Assoc ["error", `String msg])
 
+let redirect_response url =
+  let headers = Cohttp.Header.of_list [
+    "Location", url;
+  ] in
+  Cohttp_lwt_unix.Server.respond_string ~status:`Found ~headers ~body:"" ()
+
 (* API: GET /api/experiences[?sha=X] *)
 let handle_list_experiences state ~sha_filter =
   let* collection_id = Mcp_server.get_collection state in
@@ -1223,6 +1234,8 @@ let handle_request state _conn req _body =
     | ["api"; "blame"] ->
       let* result = handle_blame state uri in
       json_response result
+    | ["experience"; id] ->
+      redirect_response (Printf.sprintf "/?id=%s" (Uri.pct_encode id))
     | ["api"; "experiences"] ->
       let sha_filter = Uri.get_query_param uri "sha" in
       let* result = handle_list_experiences state ~sha_filter in
