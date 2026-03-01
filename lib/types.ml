@@ -1,134 +1,99 @@
-type step = {
-  number : int;
-  label : string;
-  intent : string;
-  conversation : string;
-  commit_sha : string;
-  diff : string;
-  files : string list;
-  timestamp : float;
-  experience_id : string;
+(* An interaction: user message + all responses until next user message *)
+(* Main JSONL is linear — simple line-range segmentation *)
+type interaction = {
+  index : int;
+  line_start : int;
+  line_end : int;
+  user_uuid : string;
+  timestamp : string;
+  user_text : string;
+  assistant_summary : string;
+  files_changed : string list;
+  branch : string;
 }
 
+(* An experience is a commit.
+   The commit SHA is the canonical experience ID.
+   Experience metadata is encoded in the commit message. *)
 type experience = {
-  id : string;
-  intent : string;
-  label : string;
-  conversation : string;
-  diff : string;
-  files : string list;
-  timestamp : float;
-  commit_sha : string;
-}
-
-type experience_group = {
-  group_id : string;
+  id : string;                    (* = commit SHA *)
   label : string;
   intent : string;
-  commit_sha : string;
-  step_ids : string list;
-  diff : string;
-  files : string list;
+  session_id : string;
+  interaction_uuids : string list;
+  head_sha : string;             (* HEAD at save time *)
+  commit_sha : string;           (* linked commit SHA (may differ from id for retroactive links) *)
+  commit_message : string;       (* full commit message *)
+  parent_sha : string;           (* parent commit SHA *)
+  diff : string;                 (* unified diff *)
+  branch : string;
+  files_changed : string list;
   timestamp : float;
+  reverted : bool;
 }
 
 type search_result = {
   experience : experience;
-  source : [ `Session | `Experience | `Group ];
   distance : float;
 }
 
-type group_search_result = {
-  group : experience_group;
-  distance : float;
-}
+(* Serialization *)
 
-type collections = {
-  intents_id : string;
-  conversations_id : string;
-  session_id : string;
-  groups_id : string;
-}
-
-let step_to_experience (s : step) : experience =
-  { id = s.experience_id;
-    intent = s.intent;
-    label = s.label;
-    conversation = s.conversation;
-    diff = s.diff;
-    files = s.files;
-    timestamp = s.timestamp;
-    commit_sha = s.commit_sha;
-  }
+let interaction_to_yojson (i : interaction) : Yojson.Safe.t =
+  `Assoc [
+    "index", `Int i.index;
+    "line_start", `Int i.line_start;
+    "line_end", `Int i.line_end;
+    "user_uuid", `String i.user_uuid;
+    "timestamp", `String i.timestamp;
+    "user_text", `String i.user_text;
+    "assistant_summary", `String i.assistant_summary;
+    "files_changed", `List (List.map (fun f -> `String f) i.files_changed);
+    "branch", `String i.branch;
+  ]
 
 let experience_to_yojson (e : experience) : Yojson.Safe.t =
   `Assoc [
     "id", `String e.id;
-    "intent", `String e.intent;
     "label", `String e.label;
-    "conversation", `String e.conversation;
-    "diff", `String e.diff;
-    "files", `List (List.map (fun f -> `String f) e.files);
-    "timestamp", `Float e.timestamp;
+    "intent", `String e.intent;
+    "session_id", `String e.session_id;
+    "interaction_uuids", `List (List.map (fun u -> `String u) e.interaction_uuids);
+    "head_sha", `String e.head_sha;
     "commit_sha", `String e.commit_sha;
+    "commit_message", `String e.commit_message;
+    "parent_sha", `String e.parent_sha;
+    "diff", `String e.diff;
+    "branch", `String e.branch;
+    "files_changed", `List (List.map (fun f -> `String f) e.files_changed);
+    "timestamp", `Float e.timestamp;
+    "reverted", `Bool e.reverted;
   ]
 
-let experience_of_yojson (j : Yojson.Safe.t) : experience =
+let experience_of_metadata (id : string) (meta : Yojson.Safe.t) : experience =
   let open Yojson.Safe.Util in
-  { id = j |> member "id" |> to_string;
-    intent = j |> member "intent" |> to_string;
-    label = j |> member "label" |> to_string;
-    conversation = j |> member "conversation" |> to_string_option |> Option.value ~default:"";
-    diff = j |> member "diff" |> to_string_option |> Option.value ~default:"";
-    files = j |> member "files" |> to_list |> List.map to_string;
-    timestamp = j |> member "timestamp" |> to_float;
-    commit_sha = j |> member "commit_sha" |> to_string_option |> Option.value ~default:"";
-  }
-
-let step_to_yojson (s : step) : Yojson.Safe.t =
-  `Assoc [
-    "number", `Int s.number;
-    "label", `String s.label;
-    "intent", `String s.intent;
-    "commit_sha", `String s.commit_sha;
-    "files", `List (List.map (fun f -> `String f) s.files);
-    "timestamp", `Float s.timestamp;
-    "experience_id", `String s.experience_id;
-  ]
-
-let experience_group_to_yojson (g : experience_group) : Yojson.Safe.t =
-  `Assoc [
-    "group_id", `String g.group_id;
-    "label", `String g.label;
-    "intent", `String g.intent;
-    "commit_sha", `String g.commit_sha;
-    "step_ids", `List (List.map (fun s -> `String s) g.step_ids);
-    "diff", `String g.diff;
-    "files", `List (List.map (fun f -> `String f) g.files);
-    "timestamp", `Float g.timestamp;
-  ]
-
-let experience_group_of_yojson (j : Yojson.Safe.t) : experience_group =
-  let open Yojson.Safe.Util in
-  { group_id = j |> member "group_id" |> to_string;
-    label = j |> member "label" |> to_string;
-    intent = j |> member "intent" |> to_string;
-    commit_sha = j |> member "commit_sha" |> to_string_option |> Option.value ~default:"";
-    step_ids = (j |> member "step_ids" |> to_list |> List.map to_string);
-    diff = j |> member "diff" |> to_string_option |> Option.value ~default:"";
-    files = (j |> member "files" |> to_list |> List.map to_string);
-    timestamp = (try j |> member "timestamp" |> to_float with _ -> 0.0);
+  let str key = meta |> member key |> to_string_option |> Option.value ~default:"" in
+  let split_csv s =
+    String.split_on_char ',' s |> List.filter (fun s -> String.length s > 0) in
+  {
+    id;
+    label = str "label";
+    intent = str "intent";
+    session_id = str "session_id";
+    interaction_uuids = split_csv (str "interaction_uuids");
+    head_sha = str "head_sha";
+    commit_sha = str "commit_sha";
+    commit_message = str "commit_message";
+    parent_sha = str "parent_sha";
+    diff = str "diff";
+    branch = str "branch";
+    files_changed = split_csv (str "files_changed");
+    timestamp = (try meta |> member "timestamp" |> to_float with _ -> 0.0);
+    reverted = (try meta |> member "reverted" |> to_bool with _ -> false);
   }
 
 let search_result_to_yojson (r : search_result) : Yojson.Safe.t =
   `Assoc [
     "experience", experience_to_yojson r.experience;
-    "source", `String (match r.source with `Session -> "session" | `Experience -> "experience" | `Group -> "group");
-    "distance", `Float r.distance;
-  ]
-
-let group_search_result_to_yojson (r : group_search_result) : Yojson.Safe.t =
-  `Assoc [
-    "group", experience_group_to_yojson r.group;
     "distance", `Float r.distance;
   ]

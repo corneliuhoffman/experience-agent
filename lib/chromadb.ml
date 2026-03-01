@@ -31,27 +31,93 @@ let http_post_raw ~url ~body =
 let http_post ~port ~path ~body =
   http_post_raw ~url:(base_url port ^ path) ~body
 
-let http_get ~port ~path =
+let http_delete ~port ~path =
   let uri = Uri.of_string (base_url port ^ path) in
-  let* _resp, body = Cohttp_lwt_unix.Client.get uri in
+  let* _resp, body = Cohttp_lwt_unix.Client.delete uri in
   let+ body_str = Cohttp_lwt.Body.to_string body in
-  Yojson.Safe.from_string body_str
+  ignore body_str
 
-(* Ollama embeddings *)
-let embed_text text =
+(* Ollama chat — summarize conversation *)
+let summarize_text text =
+  let prompt = Printf.sprintf
+    "Summarize this coding conversation in 2-3 sentences. Focus on: what was the goal, what approach was taken, and what was the outcome. Be specific about technologies, files, and patterns.\n\n%s"
+    text in
+  let body = `Assoc [
+    "model", `String "llama3.2";
+    "prompt", `String prompt;
+    "stream", `Bool false;
+  ] in
+  let+ resp = http_post_raw ~url:(ollama_url ^ "/api/generate") ~body in
+  let open Yojson.Safe.Util in
+  resp |> member "response" |> to_string_option |> Option.value ~default:text
+
+(* Split text into chunks of at most n chars, breaking at newlines *)
+let chunk_text ~max_chars text =
+  let len = String.length text in
+  if len <= max_chars then [text]
+  else
+    let chunks = ref [] in
+    let pos = ref 0 in
+    while !pos < len do
+      let remaining = len - !pos in
+      let chunk_end = if remaining <= max_chars then len
+        else
+          (* Look for last newline within range *)
+          let limit = !pos + max_chars in
+          let nl = ref limit in
+          while !nl > !pos && String.get text !nl <> '\n' do decr nl done;
+          if !nl > !pos then !nl + 1 else limit
+      in
+      chunks := String.sub text !pos (chunk_end - !pos) :: !chunks;
+      pos := chunk_end
+    done;
+    List.rev !chunks
+
+(* Embed a single chunk via Ollama *)
+let embed_single chunk =
   let body = `Assoc [
     "model", `String "nomic-embed-text";
-    "input", `String text;
+    "input", `String chunk;
   ] in
   let+ resp = http_post_raw ~url:(ollama_url ^ "/api/embed") ~body in
   let open Yojson.Safe.Util in
-  resp |> member "embeddings" |> to_list |> List.hd |> to_list
-  |> List.map to_float
+  match resp |> member "error" |> to_string_option with
+  | Some err -> failwith (Printf.sprintf "Ollama embed error: %s" err)
+  | None ->
+    match resp |> member "embeddings" with
+    | `Null | `Bool _ | `String _ ->
+      failwith (Printf.sprintf "Ollama returned no embeddings (response: %s)"
+        (Yojson.Safe.to_string resp |> fun s ->
+          if String.length s > 200 then String.sub s 0 200 ^ "..." else s))
+    | embeddings ->
+      embeddings |> to_list |> List.hd |> to_list |> List.map to_float
 
-let embed_texts texts =
-  Lwt_list.map_s embed_text texts
+(* Average a list of embedding vectors *)
+let average_embeddings vecs =
+  match vecs with
+  | [] -> []
+  | [v] -> v
+  | first :: _ ->
+    let n = Float.of_int (List.length vecs) in
+    let sums = Array.make (List.length first) 0.0 in
+    List.iter (fun v ->
+      List.iteri (fun i x -> sums.(i) <- sums.(i) +. x) v
+    ) vecs;
+    Array.to_list (Array.map (fun s -> s /. n) sums)
 
-(* Collections *)
+(* Ollama embeddings — splits long text into chunks and averages *)
+let embed_text text =
+  let chunks = chunk_text ~max_chars:2000 text in
+  let* embeddings = Lwt_list.map_s embed_single chunks in
+  Lwt.return (average_embeddings embeddings)
+
+(* Summarize then embed *)
+let summarize_and_embed text =
+  let* summary = summarize_text text in
+  let+ embedding = embed_text summary in
+  (summary, embedding)
+
+(* Single collection per project *)
 let get_or_create_collection ~port ~name =
   let body = `Assoc [
     "name", `String name;
@@ -67,16 +133,15 @@ let get_or_create_collection ~port ~name =
   | None ->
     resp |> member "id" |> to_string
 
-let ensure_collections ~port ~project =
-  let* intents_id = get_or_create_collection ~port
-    ~name:(project ^ "_intents") in
-  let* conversations_id = get_or_create_collection ~port
-    ~name:(project ^ "_conversations") in
-  let* session_id = get_or_create_collection ~port
-    ~name:(project ^ "_session") in
-  let+ groups_id = get_or_create_collection ~port
-    ~name:(project ^ "_groups") in
-  { intents_id; conversations_id; session_id; groups_id }
+let delete_collection ~port ~name =
+  let* _id = get_or_create_collection ~port ~name in
+  http_delete ~port ~path:(Printf.sprintf "/collections/%s" name)
+
+let ensure_collection ~port ~project =
+  get_or_create_collection ~port ~name:(project ^ "_experiences")
+
+let ensure_interactions_collection ~port ~project =
+  get_or_create_collection ~port ~name:(project ^ "_interactions")
 
 (* Add document with embedding *)
 let add_document ~port ~collection_id ~id ~document ~metadata =
@@ -91,63 +156,190 @@ let add_document ~port ~collection_id ~id ~document ~metadata =
     ~path:(Printf.sprintf "/collections/%s/add" collection_id) ~body in
   ()
 
-let save_experience ~port ~(collections : collections) (exp : experience) =
-  let intent_doc = Printf.sprintf "%s: %s" exp.label exp.intent in
+(* Save an experience — summarize full conversation via Ollama, then embed the summary.
+   Experience ID = commit SHA. Stores git metadata alongside conversation data. *)
+let save_experience ~port ~collection_id (exp : experience) ~full_conversation =
+  let* (summary, embedding) = summarize_and_embed full_conversation in
   let metadata = `Assoc [
-    "diff", `String exp.diff;
-    "files", `String (String.concat "," exp.files);
-    "timestamp", `Float exp.timestamp;
     "label", `String exp.label;
     "intent", `String exp.intent;
-    "conversation", `String exp.conversation;
+    "session_id", `String exp.session_id;
+    "interaction_uuids", `String (String.concat "," exp.interaction_uuids);
+    "head_sha", `String exp.head_sha;
     "commit_sha", `String exp.commit_sha;
+    "commit_message", `String exp.commit_message;
+    "parent_sha", `String exp.parent_sha;
+    "diff", `String (if String.length exp.diff <= 10000 then exp.diff
+                      else String.sub exp.diff 0 10000 ^ "\n... (truncated)");
+    "branch", `String exp.branch;
+    "files_changed", `String (String.concat "," exp.files_changed);
+    "timestamp", `Float exp.timestamp;
+    "reverted", `Bool exp.reverted;
+    "summary", `String summary;
+    "conversation_text", `String full_conversation;
   ] in
-  let* () = add_document ~port ~collection_id:collections.intents_id
-    ~id:exp.id ~document:intent_doc ~metadata in
-  add_document ~port ~collection_id:collections.conversations_id
-    ~id:exp.id ~document:exp.conversation ~metadata
-
-let save_session_step ~port ~(collections : collections) (s : step) =
-  let doc = Printf.sprintf "%s: %s" s.label s.intent in
-  let metadata = `Assoc [
-    "step_number", `Int s.number;
-    "commit_sha", `String s.commit_sha;
-    "diff", `String s.diff;
-    "files", `String (String.concat "," s.files);
-    "timestamp", `Float s.timestamp;
-    "label", `String s.label;
-    "intent", `String s.intent;
-    "conversation", `String s.conversation;
+  let body = `Assoc [
+    "ids", `List [`String exp.id];
+    "documents", `List [`String summary];
+    "embeddings", `List [`List (List.map (fun f -> `Float f) embedding)];
+    "metadatas", `List [metadata];
   ] in
-  add_document ~port ~collection_id:collections.session_id
-    ~id:s.experience_id ~document:doc ~metadata
+  let+ _resp = http_post ~port
+    ~path:(Printf.sprintf "/collections/%s/add" collection_id) ~body in
+  ()
 
-let save_experience_group ~port ~(collections : collections) (g : experience_group) =
-  let doc = Printf.sprintf "%s: %s" g.label g.intent in
-  let metadata = `Assoc [
-    "commit_sha", `String g.commit_sha;
-    "step_ids", `String (String.concat "," g.step_ids);
-    "diff", `String g.diff;
-    "files", `String (String.concat "," g.files);
-    "timestamp", `Float g.timestamp;
-    "label", `String g.label;
-    "intent", `String g.intent;
-  ] in
-  add_document ~port ~collection_id:collections.groups_id
-    ~id:g.group_id ~document:doc ~metadata
-
-(* Query with embedding *)
-let query_collection ~port ~collection_id ~query_text ~n =
-  let* embedding = embed_text query_text in
+(* Search experiences *)
+let search ~port ~collection_id ~query ~n =
+  let* embedding = embed_text query in
   let body = `Assoc [
     "query_embeddings", `List [`List (List.map (fun f -> `Float f) embedding)];
     "n_results", `Int n;
     "include", `List [`String "documents"; `String "metadatas"; `String "distances"];
   ] in
-  http_post ~port
-    ~path:(Printf.sprintf "/collections/%s/query" collection_id) ~body
+  let+ resp = http_post ~port
+    ~path:(Printf.sprintf "/collections/%s/query" collection_id) ~body in
+  let open Yojson.Safe.Util in
+  let ids_outer = resp |> member "ids" |> safe_to_list in
+  match ids_outer with
+  | [] -> []
+  | first_ids :: _ ->
+    let ids = first_ids |> safe_to_list |> List.map to_string in
+    let distances = (resp |> member "distances" |> safe_to_list
+      |> function [] -> [] | d :: _ -> d |> safe_to_list |> List.map to_float) in
+    let metadatas = (resp |> member "metadatas" |> safe_to_list
+      |> function [] -> [] | m :: _ -> m |> safe_to_list) in
+    if ids = [] then []
+    else
+      let results = List.combine (List.combine ids distances) metadatas
+        |> List.map (fun ((id, dist), meta) ->
+          let exp = experience_of_metadata id meta in
+          (* Deprioritize reverted experiences *)
+          let adjusted_dist = if exp.reverted then dist +. 0.5 else dist in
+          { experience = exp; distance = adjusted_dist })
+      in
+      List.sort (fun a b -> Float.compare a.distance b.distance) results
 
-let parse_query_results (resp : Yojson.Safe.t) : (string * float * Yojson.Safe.t) list =
+(* Update metadata for an experience (for link_commit and go_back) *)
+let update_metadata ~port ~collection_id ~id ~updates =
+  (* ChromaDB update: we need to re-add with same embedding *)
+  (* First get the existing document *)
+  let get_body = `Assoc [
+    "ids", `List [`String id];
+    "include", `List [`String "documents"; `String "metadatas"; `String "embeddings"];
+  ] in
+  let* resp = http_post ~port
+    ~path:(Printf.sprintf "/collections/%s/get" collection_id) ~body:get_body in
+  let open Yojson.Safe.Util in
+  let ids = resp |> member "ids" |> safe_to_list |> List.map to_string in
+  match ids with
+  | [] -> Lwt.return_unit
+  | _ ->
+    let old_meta = resp |> member "metadatas" |> safe_to_list
+      |> List.hd in
+    let old_fields = match old_meta with `Assoc l -> l | _ -> [] in
+    let new_fields = List.map (fun (k, v) ->
+      match List.assoc_opt k updates with
+      | Some new_v -> (k, new_v)
+      | None -> (k, v)
+    ) old_fields in
+    (* Add any new keys from updates not in old_fields *)
+    let extra = List.filter (fun (k, _) ->
+      not (List.mem_assoc k old_fields)
+    ) updates in
+    let merged = `Assoc (new_fields @ extra) in
+    let update_body = `Assoc [
+      "ids", `List [`String id];
+      "metadatas", `List [merged];
+    ] in
+    let+ _resp = http_post ~port
+      ~path:(Printf.sprintf "/collections/%s/update" collection_id)
+      ~body:update_body in
+    ()
+
+(* List all experiences *)
+let list_all ~port ~collection_id ~limit =
+  let body = `Assoc [
+    "limit", `Int limit;
+    "include", `List [`String "documents"; `String "metadatas"];
+  ] in
+  let+ resp = http_post ~port
+    ~path:(Printf.sprintf "/collections/%s/get" collection_id) ~body in
+  let open Yojson.Safe.Util in
+  let ids = resp |> member "ids" |> safe_to_list |> List.map to_string in
+  let metadatas = resp |> member "metadatas" |> safe_to_list in
+  if ids = [] then []
+  else
+    List.combine ids metadatas
+    |> List.map (fun (id, meta) -> experience_of_metadata id meta)
+
+(* List all experiences with their Ollama-generated summaries *)
+let list_all_with_summaries ~port ~collection_id ~limit =
+  let body = `Assoc [
+    "limit", `Int limit;
+    "include", `List [`String "documents"; `String "metadatas"];
+  ] in
+  let+ resp = http_post ~port
+    ~path:(Printf.sprintf "/collections/%s/get" collection_id) ~body in
+  let open Yojson.Safe.Util in
+  let ids = resp |> member "ids" |> safe_to_list |> List.map to_string in
+  let metadatas = resp |> member "metadatas" |> safe_to_list in
+  if ids = [] then []
+  else
+    List.combine ids metadatas
+    |> List.map (fun (id, meta) ->
+      let exp = experience_of_metadata id meta in
+      let summary = meta |> member "summary" |> to_string_option
+        |> Option.value ~default:"" in
+      (exp, summary))
+
+(* Delete an experience *)
+let delete ~port ~collection_id ~id =
+  let body = `Assoc [
+    "ids", `List [`String id];
+  ] in
+  let+ _resp = http_post ~port
+    ~path:(Printf.sprintf "/collections/%s/delete" collection_id) ~body in
+  ()
+
+(* Save a single interaction document into the interactions collection.
+   The document text is "User: <question>\nAssistant: <summary truncated to 500 chars>" *)
+let save_interaction ~port ~collection_id ~experience_id ~interaction_index
+    ~user_text ~assistant_summary ~user_uuid ~timestamp =
+  let summary_trunc =
+    if String.length assistant_summary <= 500 then assistant_summary
+    else String.sub assistant_summary 0 500 ^ "..." in
+  let document = Printf.sprintf "User: %s\nAssistant: %s" user_text summary_trunc in
+  let* embedding = embed_text document in
+  let id = Printf.sprintf "%s_%d" experience_id interaction_index in
+  let metadata = `Assoc [
+    "experience_id", `String experience_id;
+    "interaction_index", `Int interaction_index;
+    "user_uuid", `String user_uuid;
+    "user_text", `String (if String.length user_text <= 200 then user_text
+                          else String.sub user_text 0 200 ^ "...");
+    "timestamp", `String timestamp;
+  ] in
+  let body = `Assoc [
+    "ids", `List [`String id];
+    "documents", `List [`String document];
+    "embeddings", `List [`List (List.map (fun f -> `Float f) embedding)];
+    "metadatas", `List [metadata];
+  ] in
+  let+ _resp = http_post ~port
+    ~path:(Printf.sprintf "/collections/%s/add" collection_id) ~body in
+  ()
+
+(* Search interactions within a specific experience *)
+let search_interactions ~port ~collection_id ~experience_id ~query ~n =
+  let* embedding = embed_text query in
+  let body = `Assoc [
+    "query_embeddings", `List [`List (List.map (fun f -> `Float f) embedding)];
+    "n_results", `Int n;
+    "where", `Assoc ["experience_id", `Assoc ["$eq", `String experience_id]];
+    "include", `List [`String "documents"; `String "metadatas"; `String "distances"];
+  ] in
+  let+ resp = http_post ~port
+    ~path:(Printf.sprintf "/collections/%s/query" collection_id) ~body in
   let open Yojson.Safe.Util in
   let ids_outer = resp |> member "ids" |> safe_to_list in
   match ids_outer with
@@ -161,163 +353,18 @@ let parse_query_results (resp : Yojson.Safe.t) : (string * float * Yojson.Safe.t
     if ids = [] then []
     else
       List.combine (List.combine ids distances) metadatas
-      |> List.map (fun ((id, dist), meta) -> (id, dist, meta))
+      |> List.map (fun ((_id, distance), meta) ->
+        let idx = meta |> member "interaction_index" |> to_int_option
+          |> Option.value ~default:0 in
+        let user_uuid = meta |> member "user_uuid" |> to_string_option
+          |> Option.value ~default:"" in
+        (idx, user_uuid, distance))
 
-let experience_from_metadata ~id ~distance (meta : Yojson.Safe.t) : search_result =
-  let open Yojson.Safe.Util in
-  let exp = {
-    id;
-    intent = meta |> member "intent" |> to_string_option |> Option.value ~default:"";
-    label = meta |> member "label" |> to_string_option |> Option.value ~default:"";
-    conversation = meta |> member "conversation" |> to_string_option |> Option.value ~default:"";
-    diff = meta |> member "diff" |> to_string_option |> Option.value ~default:"";
-    files = (meta |> member "files" |> to_string_option |> Option.value ~default:""
-             |> String.split_on_char ','
-             |> List.filter (fun s -> String.length s > 0));
-    timestamp = (try meta |> member "timestamp" |> to_float with _ -> 0.0);
-    commit_sha = meta |> member "commit_sha" |> to_string_option |> Option.value ~default:"";
-  } in
-  { experience = exp; source = `Experience; distance }
-
-let group_from_metadata ~id ~distance (meta : Yojson.Safe.t) : group_search_result =
-  let open Yojson.Safe.Util in
-  let g = {
-    group_id = id;
-    label = meta |> member "label" |> to_string_option |> Option.value ~default:"";
-    intent = meta |> member "intent" |> to_string_option |> Option.value ~default:"";
-    commit_sha = meta |> member "commit_sha" |> to_string_option |> Option.value ~default:"";
-    step_ids = (meta |> member "step_ids" |> to_string_option |> Option.value ~default:""
-                |> String.split_on_char ','
-                |> List.filter (fun s -> String.length s > 0));
-    diff = meta |> member "diff" |> to_string_option |> Option.value ~default:"";
-    files = (meta |> member "files" |> to_string_option |> Option.value ~default:""
-             |> String.split_on_char ','
-             |> List.filter (fun s -> String.length s > 0));
-    timestamp = (try meta |> member "timestamp" |> to_float with _ -> 0.0);
-  } in
-  { group = g; distance }
-
-(* Three-stage search: groups -> step intents -> step conversations *)
-let search_three_stage ~port ~(collections : collections) ~query ~broad_k ~n =
-  (* Stage 1: search experience groups *)
-  let* group_resp = query_collection ~port
-    ~collection_id:collections.groups_id ~query_text:query ~n:broad_k in
-  let group_results = parse_query_results group_resp
-    |> List.map (fun (id, dist, meta) ->
-      group_from_metadata ~id ~distance:dist meta) in
-  (* Stage 2: broad search on step intents *)
-  let* intent_resp = query_collection ~port
-    ~collection_id:collections.intents_id ~query_text:query ~n:broad_k in
-  let intent_results = parse_query_results intent_resp in
-  (* Stage 3: re-rank steps by conversation similarity *)
-  let* step_results =
-    if intent_results = [] then Lwt.return []
-    else begin
-      let* conv_resp = query_collection ~port
-        ~collection_id:collections.conversations_id ~query_text:query
-        ~n:broad_k in
-      let conv_results = parse_query_results conv_resp in
-      let conv_map = List.fold_left (fun acc (id, dist, _meta) ->
-        (id, dist) :: acc
-      ) [] conv_results in
-      let combined = List.map (fun (id, intent_dist, meta) ->
-        let conv_dist = match List.assoc_opt id conv_map with
-          | Some d -> d
-          | None -> 1.0
-        in
-        let combined_dist = (intent_dist +. conv_dist) /. 2.0 in
-        (id, combined_dist, meta)
-      ) intent_results in
-      let sorted = List.sort (fun (_, d1, _) (_, d2, _) ->
-        Float.compare d1 d2
-      ) combined in
-      let top_n = List.filteri (fun i _ -> i < n) sorted in
-      Lwt.return (List.map (fun (id, dist, meta) ->
-        (experience_from_metadata ~id ~distance:dist meta).experience
-      ) top_n)
-    end
-  in
-  Lwt.return (group_results, step_results)
-
-let search_for_undo ~port ~(collections : collections) ~query ~n =
-  let* session_resp = query_collection ~port
-    ~collection_id:collections.session_id ~query_text:query ~n in
-  let session_results = parse_query_results session_resp
-    |> List.map (fun (id, dist, meta) ->
-      { (experience_from_metadata ~id ~distance:dist meta) with
-        source = `Session }) in
-  let* intent_resp = query_collection ~port
-    ~collection_id:collections.intents_id ~query_text:query ~n in
-  let exp_results = parse_query_results intent_resp
-    |> List.map (fun (id, dist, meta) ->
-      experience_from_metadata ~id ~distance:dist meta) in
-  let all = session_results @ exp_results in
-  let sorted = List.sort (fun (a : search_result) (b : search_result) ->
-    Float.compare a.distance b.distance
-  ) all in
-  Lwt.return (List.filteri (fun i _ -> i < n) sorted)
-
-let delete ~port ~(collections : collections) ~id =
-  let delete_from coll_id =
-    let body = `Assoc [
-      "ids", `List [`String id];
-    ] in
-    let+ _resp = http_post ~port
-      ~path:(Printf.sprintf "/collections/%s/delete" coll_id) ~body in
-    ()
-  in
-  let* () = delete_from collections.intents_id in
-  let* () = delete_from collections.conversations_id in
-  let* () = delete_from collections.session_id in
-  delete_from collections.groups_id
-
-let list_all ~port ~(collections : collections) ~limit =
+(* Delete all interaction documents for an experience *)
+let delete_interactions ~port ~collection_id ~experience_id =
   let body = `Assoc [
-    "limit", `Int limit;
-    "include", `List [`String "documents"; `String "metadatas"];
+    "where", `Assoc ["experience_id", `Assoc ["$eq", `String experience_id]];
   ] in
-  let+ resp = http_post ~port
-    ~path:(Printf.sprintf "/collections/%s/get" collections.intents_id) ~body in
-  let open Yojson.Safe.Util in
-  let ids = resp |> member "ids" |> safe_to_list |> List.map to_string in
-  let metadatas = resp |> member "metadatas" |> safe_to_list in
-  if ids = [] then []
-  else
-    List.combine ids metadatas
-    |> List.map (fun (id, meta) ->
-      (experience_from_metadata ~id ~distance:0.0 meta).experience)
-
-let list_all_groups ~port ~(collections : collections) ~limit =
-  let body = `Assoc [
-    "limit", `Int limit;
-    "include", `List [`String "documents"; `String "metadatas"];
-  ] in
-  let+ resp = http_post ~port
-    ~path:(Printf.sprintf "/collections/%s/get" collections.groups_id) ~body in
-  let open Yojson.Safe.Util in
-  let ids = resp |> member "ids" |> safe_to_list |> List.map to_string in
-  let metadatas = resp |> member "metadatas" |> safe_to_list in
-  if ids = [] then []
-  else
-    List.combine ids metadatas
-    |> List.map (fun (id, meta) ->
-      (group_from_metadata ~id ~distance:0.0 meta).group)
-
-let clear_session ~port ~(collections : collections) =
-  let body = `Assoc [
-    "include", `List [`String "documents"];
-  ] in
-  let* resp = http_post ~port
-    ~path:(Printf.sprintf "/collections/%s/get" collections.session_id) ~body in
-  let open Yojson.Safe.Util in
-  let ids = resp |> member "ids" |> safe_to_list |> List.map to_string in
-  if ids = [] then Lwt.return_unit
-  else begin
-    let del_body = `Assoc [
-      "ids", `List (List.map (fun id -> `String id) ids);
-    ] in
-    let+ _resp = http_post ~port
-      ~path:(Printf.sprintf "/collections/%s/delete" collections.session_id)
-      ~body:del_body in
-    ()
-  end
+  let+ _resp = http_post ~port
+    ~path:(Printf.sprintf "/collections/%s/delete" collection_id) ~body in
+  ()
