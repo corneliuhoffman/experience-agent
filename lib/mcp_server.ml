@@ -198,6 +198,32 @@ let tool_definitions = `List [
       "required", `List [`String "filepath"];
     ];
   ];
+  `Assoc [
+    "name", `String "explain_change";
+    "description", `String "Explain WHY code was changed. Given a file and function/pattern, finds the experiences that last touched those lines and returns the full conversation context — including the user's request, assistant's thinking, and what was done. Use when asked 'why did we change X?' or 'what was the reasoning for this code?'";
+    "inputSchema", `Assoc [
+      "type", `String "object";
+      "properties", `Assoc [
+        "filepath", `Assoc [
+          "type", `String "string";
+          "description", `String "File path relative to project root";
+        ];
+        "pattern", `Assoc [
+          "type", `String "string";
+          "description", `String "Function name or code pattern to search for in the file";
+        ];
+        "line_start", `Assoc [
+          "type", `String "integer";
+          "description", `String "Starting line number (alternative to pattern)";
+        ];
+        "line_end", `Assoc [
+          "type", `String "integer";
+          "description", `String "Ending line number (alternative to pattern)";
+        ];
+      ];
+      "required", `List [`String "filepath"];
+    ];
+  ];
 ]
 
 let text_result text =
@@ -213,6 +239,7 @@ let json_result j =
 (* State *)
 type state = {
   port : int;
+  web_port : int;
   project_dir : string;
   jsonl_dir : string;
   mutable collection_id : string option;
@@ -778,15 +805,140 @@ let handle_blame state args =
       "full_sha", `String sha;
     ] @ exp_fields)
   ) filtered in
-  (* Summary *)
+  (* Build URL to blame web UI *)
+  let blame_url =
+    if state.web_port > 0 then
+      let base = Printf.sprintf "http://localhost:%d/blame?file=%s"
+        state.web_port (Uri.pct_encode filepath) in
+      let with_pattern = match pattern with
+        | Some p -> base ^ "&pattern=" ^ Uri.pct_encode p
+        | None -> base
+      in
+      match line_start, line_end with
+      | Some s, Some e -> with_pattern ^ Printf.sprintf "&line_start=%d&line_end=%d" s e
+      | Some s, None -> with_pattern ^ Printf.sprintf "&line_start=%d" s
+      | None, Some e -> with_pattern ^ Printf.sprintf "&line_end=%d" e
+      | None, None -> with_pattern
+    else ""
+  in
   let exp_count = List.length sha_to_exp in
-  Lwt.return (json_result (`Assoc [
-    "filepath", `String filepath;
-    "total_lines", `Int (List.length filtered);
-    "unique_commits", `Int (List.length unique_shas);
-    "experiences_found", `Int exp_count;
-    "lines", `List lines_json;
-  ]))
+  if blame_url <> "" then
+    Lwt.return (text_result (Printf.sprintf
+      "%d lines, %d commits, %d experiences.\n\n%s"
+      (List.length filtered)
+      (List.length unique_shas)
+      exp_count
+      blame_url))
+  else
+    Lwt.return (json_result (`Assoc [
+      "filepath", `String filepath;
+      "total_lines", `Int (List.length filtered);
+      "unique_commits", `Int (List.length unique_shas);
+      "experiences_found", `Int exp_count;
+      "lines", `List lines_json;
+    ]))
+
+(* explain_change: blame + conversation replay in one shot *)
+let handle_explain_change state args =
+  let open Yojson.Safe.Util in
+  let filepath = args |> member "filepath" |> to_string in
+  let pattern = args |> member "pattern" |> to_string_option in
+  let line_start = args |> member "line_start" |> to_int_option in
+  let line_end = args |> member "line_end" |> to_int_option in
+  let line_range = match line_start, line_end with
+    | Some s, Some e -> Some (s, e)
+    | Some s, None -> Some (s, s)
+    | None, Some e -> Some (1, e)
+    | None, None -> None
+  in
+  (* Step 1: run blame *)
+  let* blame_lines = Git_ops.blame ~cwd:state.project_dir ?line_range
+    ~filepath () in
+  (* Filter by pattern if given *)
+  let filtered = match pattern with
+    | None -> blame_lines
+    | Some pat ->
+      let pat_lower = String.lowercase_ascii pat in
+      List.filter (fun (_sha, _ln, content) ->
+        let content_lower = String.lowercase_ascii content in
+        let rec find pos =
+          if pos + String.length pat_lower > String.length content_lower then false
+          else if String.sub content_lower pos (String.length pat_lower) = pat_lower then true
+          else find (pos + 1)
+        in
+        find 0
+      ) blame_lines
+  in
+  if filtered = [] then
+    Lwt.return (text_result (Printf.sprintf
+      "No lines matching '%s' found in %s"
+      (Option.value pattern ~default:"(all)") filepath))
+  else begin
+    (* Step 2: deduplicate SHAs and find experiences *)
+    let unique_shas = List.fold_left (fun acc (sha, _, _) ->
+      if List.mem sha acc then acc else sha :: acc
+    ) [] filtered |> List.rev in
+    let* collection_id = get_collection state in
+    let* all_with_summaries = Chromadb.list_all_with_summaries ~port:state.port
+      ~collection_id ~limit:1000 in
+    let sha_to_exp = List.filter_map (fun sha ->
+      match List.find_opt (fun ((e : experience), _) ->
+        sha_matches ~sha e
+      ) all_with_summaries with
+      | Some (e, summary) -> Some (sha, (e, summary))
+      | None -> None
+    ) unique_shas in
+    (* Step 3: build URL to the blame web UI *)
+    let blame_url =
+      if state.web_port > 0 then
+        let base = Printf.sprintf "http://localhost:%d/blame?file=%s"
+          state.web_port (Uri.pct_encode filepath) in
+        let with_pattern = match pattern with
+          | Some p -> base ^ "&pattern=" ^ Uri.pct_encode p
+          | None -> base
+        in
+        let with_lines = match line_start, line_end with
+          | Some s, Some e -> with_pattern ^ Printf.sprintf "&line_start=%d&line_end=%d" s e
+          | Some s, None -> with_pattern ^ Printf.sprintf "&line_start=%d" s
+          | None, Some e -> with_pattern ^ Printf.sprintf "&line_end=%d" e
+          | None, None -> with_pattern
+        in
+        with_lines
+      else ""
+    in
+    (* Step 4: brief summaries per experience *)
+    let seen_exp_ids = Hashtbl.create 8 in
+    let summaries = List.filter_map (fun (_sha, (exp, summary)) ->
+      if Hashtbl.mem seen_exp_ids exp.id then None
+      else begin
+        Hashtbl.add seen_exp_ids exp.id true;
+        Some (Printf.sprintf "- %s (commit %s): %s"
+          exp.label
+          (String.sub exp.id 0 (min 8 (String.length exp.id)))
+          (if summary <> "" then summary
+           else exp.intent))
+      end
+    ) sha_to_exp in
+    (* Build a concise text response with a clickable URL *)
+    let response = Buffer.create 256 in
+    Buffer.add_string response (Printf.sprintf
+      "Found %d lines matching '%s' in %s, from %d commit(s) with %d experience(s).\n\n"
+      (List.length filtered)
+      (Option.value pattern ~default:"(all)")
+      filepath
+      (List.length unique_shas)
+      (List.length summaries));
+    List.iter (fun s ->
+      Buffer.add_string response s;
+      Buffer.add_char response '\n'
+    ) summaries;
+    if blame_url <> "" then begin
+      Buffer.add_string response "\nView full conversation and blame details:\n";
+      Buffer.add_string response blame_url;
+      Buffer.add_char response '\n'
+    end;
+    Lwt.return (text_result (Buffer.contents response))
+  end
 
 let dispatch_tool state name args =
   match name with
@@ -801,6 +953,7 @@ let dispatch_tool state name args =
   | "search_by_file" -> handle_search_by_file state args
   | "search_by_sha" -> handle_search_by_sha state args
   | "blame" -> handle_blame state args
+  | "explain_change" -> handle_explain_change state args
   | _ -> Lwt.return (text_result (Printf.sprintf "Unknown tool: %s" name))
 
 (* JSON-RPC message handling *)
@@ -868,10 +1021,11 @@ let handle_message state (msg : Yojson.Safe.t) =
       "error", error;
     ])
 
-let create_state ~port ~project_dir =
+let create_state ~port ?(web_port=0) ~project_dir () =
   let jsonl_dir = Jsonl_reader.find_jsonl_dir ~project_dir in
   {
     port;
+    web_port;
     project_dir;
     jsonl_dir;
     collection_id = None;
@@ -1146,5 +1300,5 @@ let prune_before state ~cutoff_str =
   end
 
 let run ~port ~project_dir =
-  let state = create_state ~port ~project_dir in
+  let state = create_state ~port ~project_dir () in
   run_with_state state

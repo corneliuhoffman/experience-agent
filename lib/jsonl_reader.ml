@@ -382,6 +382,11 @@ let format_interaction ~filepath (interaction : interaction) =
              |> (fun j -> try to_list j with _ -> []) in
            List.iter (fun block ->
              match block |> member "type" |> to_string_option with
+             | Some "thinking" ->
+               let text = block |> member "thinking" |> to_string_option
+                 |> Option.value ~default:"" in
+               if String.length text > 0 then
+                 Buffer.add_string buf (Printf.sprintf "[Thinking]: %s\n\n" text)
              | Some "text" ->
                let text = block |> member "text" |> to_string_option
                  |> Option.value ~default:"" in

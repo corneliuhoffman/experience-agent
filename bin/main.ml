@@ -39,7 +39,7 @@ let () =
   in
   parse (List.tl args);
   let state = Experience_agent.Mcp_server.create_state
-    ~port:!port ~project_dir:!project_dir in
+    ~port:!port ~web_port:!web_port ~project_dir:!project_dir () in
   if !wipe then
     Lwt_main.run (Experience_agent.Mcp_server.wipe_db state)
   else if !import_session <> "" then

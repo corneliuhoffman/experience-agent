@@ -566,37 +566,124 @@ let blame_html = {|<!DOCTYPE html>
     padding: 8px 20px; font-size: 12px; color: #888;
     border-bottom: 1px solid #0f346033;
   }
-  .blame-view { flex: 1; overflow: auto; }
+  .split { display: flex; flex: 1; overflow: hidden; }
+  .blame-pane { flex: 1; overflow: auto; }
+  .conv-pane {
+    width: 0; overflow-y: auto; background: #16213e;
+    border-left: 1px solid #0f3460; transition: width 0.2s;
+  }
+  .conv-pane.open { width: 50%; min-width: 400px; }
+  .conv-header {
+    padding: 10px 16px; border-bottom: 1px solid #0f3460;
+    display: flex; align-items: center; justify-content: space-between;
+    position: sticky; top: 0; background: #16213e; z-index: 2;
+  }
+  .conv-header h3 { font-size: 13px; color: #e94560; }
+  .conv-header .close-btn {
+    background: none; border: none; color: #888; cursor: pointer;
+    font-size: 18px; line-height: 1;
+  }
+  .conv-header .close-btn:hover { color: #e94560; }
+  .conv-nav {
+    padding: 8px 16px; border-bottom: 1px solid #0f3460;
+    display: flex; align-items: center; gap: 8px;
+  }
+  .conv-nav button {
+    background: #0f3460; color: #e0e0e0; border: 1px solid #1a3a6e;
+    padding: 4px 10px; border-radius: 3px; cursor: pointer; font-size: 12px;
+  }
+  .conv-nav button:hover { background: #1a3a6e; }
+  .conv-nav button:disabled { opacity: 0.3; cursor: default; }
+  .conv-nav span { font-size: 12px; color: #888; }
+  .conv-body { padding: 16px; }
+  .conv-summary {
+    background: #12122a; border: 1px solid #0f3460; border-radius: 6px;
+    padding: 12px 16px; margin-bottom: 16px;
+  }
+  .conv-summary .label { font-size: 14px; color: #e94560; font-weight: 500; }
+  .conv-summary .intent { font-size: 12px; color: #aaa; margin-top: 4px; }
+  .conv-summary .summary { font-size: 12px; color: #d0d0d0; margin-top: 8px; line-height: 1.5; }
+  .conv-summary .sha { font-size: 10px; color: #555; font-family: monospace; margin-top: 6px; }
   table { width: 100%; border-collapse: collapse; font-size: 13px; }
   tr { border-bottom: 1px solid #0f346022; }
   tr:hover { background: #1a1a3e; }
   tr.group-start { border-top: 1px solid #0f346066; }
+  tr.active-exp { background: #0f346044; }
   td { padding: 1px 8px; vertical-align: top; white-space: nowrap; }
   .col-line { color: #555; text-align: right; width: 50px; user-select: none; }
   .col-sha {
     font-family: monospace; font-size: 11px; width: 72px; color: #888;
     cursor: pointer;
   }
-  .col-sha:hover { color: #e94560; text-decoration: underline; }
-  .col-sha a { color: inherit; text-decoration: none; }
-  .col-sha a:hover { color: #e94560; text-decoration: underline; }
+  .col-sha:hover { color: #e94560; }
   .col-code { white-space: pre; font-family: monospace; color: #d0d0d0; width: 100%; }
   .col-exp {
-    font-size: 11px; color: #50c878; max-width: 300px;
-    overflow: hidden; text-overflow: ellipsis;
+    font-size: 11px; color: #50c878; max-width: 240px;
+    overflow: hidden; text-overflow: ellipsis; cursor: pointer;
   }
-  .exp-tooltip {
-    display: none; position: fixed; background: #16213e; border: 1px solid #0f3460;
-    border-radius: 6px; padding: 12px 16px; max-width: 500px; z-index: 100;
-    box-shadow: 0 4px 20px rgba(0,0,0,0.5);
-  }
-  .exp-tooltip.visible { display: block; }
-  .exp-tooltip h4 { font-size: 13px; color: #e94560; margin-bottom: 6px; }
-  .exp-tooltip .intent { font-size: 12px; color: #aaa; margin-bottom: 8px; }
-  .exp-tooltip .summary { font-size: 12px; color: #d0d0d0; line-height: 1.5; }
+  .col-exp:hover { color: #a0f0c0; }
   .empty { display: flex; align-items: center; justify-content: center;
     height: 100%; color: #555; font-size: 15px; }
   .loading { color: #888; padding: 20px; font-size: 13px; }
+  /* Conversation message styles */
+  .msg-header {
+    text-align: center; color: #555; font-size: 12px; padding: 16px 0 8px;
+    letter-spacing: 1px; text-transform: uppercase;
+  }
+  .msg-meta {
+    font-size: 11px; color: #555; padding: 0 0 12px; font-family: monospace;
+  }
+  .msg-user {
+    background: #182840; border-left: 3px solid #4a9eff; padding: 10px 16px;
+    margin: 6px 0; border-radius: 0 4px 4px 0;
+  }
+  .msg-user pre, .msg-assistant pre, .msg-thinking pre {
+    white-space: pre-wrap; word-wrap: break-word; font-size: 13px;
+    line-height: 1.6; color: #d0d0d0; margin: 4px 0 0; font-family: inherit;
+  }
+  .msg-assistant {
+    background: #182e28; border-left: 3px solid #50c878; padding: 10px 16px;
+    margin: 6px 0; border-radius: 0 4px 4px 0;
+  }
+  .msg-thinking {
+    background: #2a1e38; border-left: 3px solid #c084fc; padding: 10px 16px;
+    margin: 6px 0; border-radius: 0 4px 4px 0;
+  }
+  .msg-thinking pre { color: #bba0d8; font-size: 12px; }
+  .msg-tool {
+    background: #24242e; border-left: 3px solid #e9a045; margin: 6px 0;
+    border-radius: 0 4px 4px 0;
+  }
+  .tool-toggle {
+    padding: 8px 16px; cursor: pointer; user-select: none;
+    display: flex; align-items: center; gap: 8px;
+  }
+  .tool-toggle:hover { background: #2e2e3a; }
+  .toggle-icon { font-size: 10px; color: #e9a045; width: 14px; display: inline-block; }
+  .tool-body { padding: 0 16px 10px; border-top: 1px solid #333; }
+  .tool-body pre {
+    white-space: pre-wrap; word-wrap: break-word; font-size: 12px;
+    line-height: 1.5; color: #aaa; margin: 8px 0; font-family: monospace;
+  }
+  .msg-result {
+    background: #1c1c26; padding: 8px 12px; border-radius: 4px; margin-top: 6px;
+  }
+  .msg-result pre {
+    white-space: pre-wrap; word-wrap: break-word; font-size: 12px;
+    line-height: 1.5; color: #999; margin: 4px 0 0; font-family: monospace;
+  }
+  .role-label {
+    font-size: 10px; font-weight: 700; text-transform: uppercase;
+    letter-spacing: 0.5px; margin-bottom: 2px; display: block;
+  }
+  .msg-user .role-label { color: #4a9eff; }
+  .msg-assistant .role-label { color: #50c878; }
+  .msg-thinking .role-label { color: #c084fc; }
+  .msg-tool .role-label { color: #e9a045; font-size: 12px; }
+  .msg-result .role-label { color: #777; font-size: 10px; }
+  .diff-header { color: #888; font-weight: bold; display: block; }
+  .diff-old { background: #3c1f1f; color: #e8a0a0; display: block; margin: 0; padding: 1px 6px; }
+  .diff-new { background: #1f3c1f; color: #a0e8a0; display: block; margin: 0; padding: 1px 6px; }
 </style>
 </head>
 <body>
@@ -615,19 +702,37 @@ let blame_html = {|<!DOCTYPE html>
   <button onclick="runBlame()">Blame</button>
 </div>
 <div class="stats" id="stats" style="display:none"></div>
-<div class="blame-view" id="viewer">
-  <div class="empty">Enter a file path and click Blame</div>
+<div class="split">
+  <div class="blame-pane" id="viewer">
+    <div class="empty">Enter a file path and click Blame</div>
+  </div>
+  <div class="conv-pane" id="conv-pane">
+    <div class="conv-header">
+      <h3 id="conv-title">Conversation</h3>
+      <button class="close-btn" onclick="closeConv()">&times;</button>
+    </div>
+    <div class="conv-nav" id="conv-nav" style="display:none">
+      <button id="btn-prev-int" onclick="prevInt()">Prev</button>
+      <button id="btn-next-int" onclick="nextInt()">Next</button>
+      <span id="conv-nav-info"></span>
+    </div>
+    <div class="conv-body" id="conv-body">
+      <div class="empty">Click an experience label to view the conversation</div>
+    </div>
+  </div>
 </div>
-<div class="exp-tooltip" id="tooltip"></div>
 <script>
-const tooltip = document.getElementById('tooltip');
-// SHA -> color mapping for visual grouping
 const shaColors = {};
 const palette = [
   '#e94560','#4a9eff','#50c878','#e9a045','#c084fc',
   '#f472b6','#38bdf8','#a3e635','#fb923c','#94a3b8',
 ];
 let colorIdx = 0;
+let blameData = null;
+let activeExpId = null;
+let convInteractions = 0;
+let convIdx = 0;
+
 function shaColor(sha) {
   if (!shaColors[sha]) {
     shaColors[sha] = palette[colorIdx % palette.length];
@@ -671,6 +776,7 @@ async function runBlame() {
 
   document.getElementById('viewer').innerHTML = '<div class="loading">Running blame...</div>';
   document.getElementById('stats').style.display = 'none';
+  closeConv();
 
   try {
     const resp = await fetch(url);
@@ -680,6 +786,7 @@ async function runBlame() {
         '<div class="empty">' + escapeHtml(data.error) + '</div>';
       return;
     }
+    blameData = data;
     renderBlame(data);
   } catch(e) {
     document.getElementById('viewer').innerHTML =
@@ -704,31 +811,21 @@ function renderBlame(data) {
   let prevSha = null;
   for (const line of lines) {
     const isNewGroup = line.full_sha !== prevSha;
-    const cls = isNewGroup ? ' class="group-start"' : '';
+    const cls = isNewGroup ? 'group-start' : '';
+    const expCls = (activeExpId && line.experience_id === activeExpId) ? ' active-exp' : '';
     const color = shaColor(line.sha);
     const hasExp = !!line.experience_id;
-    const shaCell = isNewGroup
-      ? (hasExp
-        ? '<a href="/?sha=' + encodeURIComponent(line.full_sha) + '">' + escapeHtml(line.sha) + '</a>'
-        : escapeHtml(line.sha))
-      : '';
-    const expCell = (isNewGroup && hasExp)
-      ? escapeHtml(line.experience_label || '')
-      : '';
+    const shaCell = isNewGroup ? escapeHtml(line.sha) : '';
+    const expLabel = (isNewGroup && hasExp) ? escapeHtml(line.experience_label || '') : '';
 
-    html += '<tr' + cls + '>'
+    html += '<tr class="' + cls + expCls + '">'
       + '<td class="col-line">' + line.line + '</td>'
-      + '<td class="col-sha" style="color:' + color + '"'
-      + (hasExp ? ' data-exp=\'' + escapeHtml(JSON.stringify({
-          label: line.experience_label || '',
-          intent: line.experience_intent || '',
-          summary: line.experience_summary || '',
-          id: line.experience_id || '',
-          sha: line.full_sha || ''
-        })) + '\'' : '')
-      + ' onmouseenter="showTooltip(event,this)" onmouseleave="hideTooltip()">'
-      + shaCell + '</td>'
-      + '<td class="col-exp">' + expCell + '</td>'
+      + '<td class="col-sha" style="color:' + color + '">' + shaCell + '</td>'
+      + '<td class="col-exp"'
+      + (hasExp ? ' onclick="openExp(\'' + escapeHtml(line.experience_id) + '\',\''
+        + escapeHtml(line.experience_label || '') + '\',\''
+        + escapeHtml(line.full_sha) + '\')"' : '')
+      + '>' + expLabel + '</td>'
       + '<td class="col-code">' + escapeHtml(line.content) + '</td>'
       + '</tr>';
     prevSha = line.full_sha;
@@ -737,36 +834,188 @@ function renderBlame(data) {
   document.getElementById('viewer').innerHTML = html;
 }
 
-function showTooltip(event, el) {
-  const raw = el.getAttribute('data-exp');
-  if (!raw) return;
-  let exp;
-  try { exp = JSON.parse(raw); } catch(e) { return; }
-  if (!exp.label) return;
-  let html = '<h4>' + escapeHtml(exp.label) + '</h4>';
-  if (exp.intent) html += '<div class="intent">' + escapeHtml(exp.intent) + '</div>';
-  if (exp.summary) html += '<div class="summary">' + escapeHtml(exp.summary) + '</div>';
-  html += '<div style="font-size:10px;color:#555;margin-top:8px;font-family:monospace">'
-    + escapeHtml(exp.sha) + '</div>';
-  tooltip.innerHTML = html;
-  tooltip.classList.add('visible');
-  positionTooltip(event);
+function closeConv() {
+  document.getElementById('conv-pane').classList.remove('open');
+  activeExpId = null;
+  if (blameData) renderBlame(blameData);
 }
 
-function positionTooltip(event) {
-  const x = event.clientX + 16;
-  const y = event.clientY + 8;
-  const w = tooltip.offsetWidth;
-  const h = tooltip.offsetHeight;
-  tooltip.style.left = (x + w > window.innerWidth ? event.clientX - w - 8 : x) + 'px';
-  tooltip.style.top = (y + h > window.innerHeight ? event.clientY - h - 8 : y) + 'px';
+async function openExp(expId, label, sha) {
+  activeExpId = expId;
+  if (blameData) renderBlame(blameData);
+  const pane = document.getElementById('conv-pane');
+  pane.classList.add('open');
+  document.getElementById('conv-title').textContent = label || 'Conversation';
+  document.getElementById('conv-body').innerHTML = '<div class="loading">Loading conversation...</div>';
+  document.getElementById('conv-nav').style.display = 'none';
+
+  try {
+    const data = await fetch('/api/experiences/' + encodeURIComponent(expId)).then(r => r.json());
+    if (!data.experience) {
+      document.getElementById('conv-body').innerHTML =
+        '<div class="empty">Experience not found</div>';
+      return;
+    }
+    const exp = data.experience;
+    convInteractions = data.interactions_count || 0;
+    convIdx = 0;
+
+    // Show summary header
+    let summaryHtml = '<div class="conv-summary">'
+      + '<div class="label">' + escapeHtml(exp.label) + '</div>'
+      + '<div class="intent">' + escapeHtml(exp.intent) + '</div>'
+      + '<div class="sha">' + escapeHtml(exp.id) + '</div>'
+      + '</div>';
+
+    if (convInteractions > 0) {
+      document.getElementById('conv-nav').style.display = 'flex';
+      document.getElementById('conv-body').innerHTML = summaryHtml
+        + '<div id="conv-content"><div class="loading">Loading interaction...</div></div>';
+      loadInteraction(0);
+    } else {
+      document.getElementById('conv-body').innerHTML = summaryHtml
+        + (exp.diff
+          ? '<div style="margin-top:12px"><pre style="font-size:12px;color:#aaa;white-space:pre-wrap">'
+            + formatDiff(exp.diff) + '</pre></div>'
+          : '<div class="empty" style="height:auto;padding:20px">No JSONL interactions available (commit-only experience)</div>');
+    }
+  } catch(e) {
+    document.getElementById('conv-body').innerHTML =
+      '<div class="empty">Error: ' + escapeHtml(e.message) + '</div>';
+  }
 }
 
-document.addEventListener('mousemove', e => {
-  if (tooltip.classList.contains('visible')) positionTooltip(e);
-});
+async function loadInteraction(idx) {
+  convIdx = idx;
+  updateConvNav();
+  const el = document.getElementById('conv-content');
+  if (!el) return;
+  el.innerHTML = '<div class="loading">Loading interaction ' + (idx + 1) + '...</div>';
+  try {
+    const data = await fetch('/api/interactions/' + encodeURIComponent(activeExpId) + '/' + idx)
+      .then(r => r.json());
+    el.innerHTML = formatConversation(data.formatted);
+  } catch(e) {
+    el.innerHTML = '<div class="empty">Error: ' + escapeHtml(e.message) + '</div>';
+  }
+}
 
-function hideTooltip() { tooltip.classList.remove('visible'); }
+function updateConvNav() {
+  document.getElementById('btn-prev-int').disabled = convIdx <= 0;
+  document.getElementById('btn-next-int').disabled = convIdx >= convInteractions - 1;
+  document.getElementById('conv-nav-info').textContent =
+    'Interaction ' + (convIdx + 1) + ' of ' + convInteractions;
+}
+
+function prevInt() { if (convIdx > 0) loadInteraction(convIdx - 1); }
+function nextInt() { if (convIdx < convInteractions - 1) loadInteraction(convIdx + 1); }
+
+function isMarker(line) {
+  return /^=== Interaction \d+ ===$/.test(line)
+    || line.startsWith('User: ')
+    || /^Branch: .* \| Time: /.test(line)
+    || line.startsWith('Assistant: ')
+    || line.startsWith('[Thinking]: ')
+    || /^\[Tool: .+\]$/.test(line)
+    || line.startsWith('[Result]: ');
+}
+
+function formatDiff(text) {
+  if (!text) return '';
+  return text.split('\n').map(line => {
+    if (line.startsWith('+++') || line.startsWith('---'))
+      return '<span class="diff-header">' + escapeHtml(line) + '</span>';
+    if (line.startsWith('+'))
+      return '<span class="diff-new">' + escapeHtml(line) + '</span>';
+    if (line.startsWith('-'))
+      return '<span class="diff-old">' + escapeHtml(line) + '</span>';
+    return escapeHtml(line) + '\n';
+  }).join('');
+}
+
+function formatConversation(text) {
+  var lines = text.split('\n');
+  var html = '';
+  var i = 0;
+  while (i < lines.length) {
+    var line = lines[i];
+    if (/^=== Interaction \d+ ===$/.test(line)) {
+      html += '<div class="msg-header">' + escapeHtml(line) + '</div>';
+      i++;
+    } else if (line.startsWith('User: ')) {
+      var blk = line.substring(6);
+      i++;
+      while (i < lines.length && !isMarker(lines[i])) { blk += '\n' + lines[i]; i++; }
+      html += '<div class="msg-user"><span class="role-label">User</span><pre>'
+            + escapeHtml(blk.replace(/\n+$/, '')) + '</pre></div>';
+    } else if (/^Branch: .* \| Time: /.test(line)) {
+      html += '<div class="msg-meta">' + escapeHtml(line) + '</div>';
+      i++;
+    } else if (line.startsWith('[Thinking]: ')) {
+      var blk = line.substring(12);
+      i++;
+      while (i < lines.length && !isMarker(lines[i])) { blk += '\n' + lines[i]; i++; }
+      var tid = 'think-' + Math.random().toString(36).substr(2, 9);
+      html += '<div class="msg-thinking">'
+        + '<div class="tool-toggle" onclick="toggleTool(\'' + tid + '\')">'
+        + '<span class="toggle-icon" id="icon-' + tid + '">&#9654;</span>'
+        + '<span class="role-label">Thinking</span></div>'
+        + '<div class="tool-body" id="' + tid + '" style="display:none">'
+        + '<pre>' + escapeHtml(blk.replace(/\n+$/, '')) + '</pre>'
+        + '</div></div>';
+    } else if (line.startsWith('Assistant: ')) {
+      var blk = line.substring(11);
+      i++;
+      while (i < lines.length && !isMarker(lines[i])) { blk += '\n' + lines[i]; i++; }
+      html += '<div class="msg-assistant"><span class="role-label">Assistant</span><pre>'
+            + escapeHtml(blk.replace(/\n+$/, '')) + '</pre></div>';
+    } else if (/^\[Tool: .+\]$/.test(line)) {
+      var name = line.match(/^\[Tool: (.+)\]$/)[1];
+      var detail = '';
+      i++;
+      while (i < lines.length && !isMarker(lines[i])) { detail += lines[i] + '\n'; i++; }
+      var result = '';
+      if (i < lines.length && lines[i].startsWith('[Result]: ')) {
+        result = lines[i].substring(10);
+        i++;
+        while (i < lines.length && !isMarker(lines[i])) { result += '\n' + lines[i]; i++; }
+      }
+      var tid = 'tool-' + Math.random().toString(36).substr(2, 9);
+      html += '<div class="msg-tool">'
+        + '<div class="tool-toggle" onclick="toggleTool(\'' + tid + '\')">'
+        + '<span class="toggle-icon" id="icon-' + tid + '">&#9654;</span>'
+        + '<span class="role-label">Tool: ' + escapeHtml(name) + '</span></div>'
+        + '<div class="tool-body" id="' + tid + '" style="display:none">';
+      if (detail.trim()) html += '<pre>' + escapeHtml(detail.replace(/\n+$/, '')) + '</pre>';
+      if (result.trim()) {
+        html += '<div class="msg-result"><span class="role-label">Result</span><pre>'
+              + escapeHtml(result.replace(/\n+$/, '')) + '</pre></div>';
+      }
+      html += '</div></div>';
+    } else if (line.startsWith('[Result]: ')) {
+      var blk = line.substring(10);
+      i++;
+      while (i < lines.length && !isMarker(lines[i])) { blk += '\n' + lines[i]; i++; }
+      html += '<div class="msg-result"><span class="role-label">Result</span><pre>'
+            + escapeHtml(blk.replace(/\n+$/, '')) + '</pre></div>';
+    } else {
+      i++;
+    }
+  }
+  return html;
+}
+
+function toggleTool(id) {
+  var body = document.getElementById(id);
+  var icon = document.getElementById('icon-' + id);
+  if (body.style.display === 'none') {
+    body.style.display = 'block';
+    icon.innerHTML = '&#9660;';
+  } else {
+    body.style.display = 'none';
+    icon.innerHTML = '&#9654;';
+  }
+}
 
 document.getElementById('filepath').addEventListener('keydown', e => {
   if (e.key === 'Enter') runBlame();
