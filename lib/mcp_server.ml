@@ -224,6 +224,20 @@ let tool_definitions = `List [
       "required", `List [`String "filepath"];
     ];
   ];
+  `Assoc [
+    "name", `String "init_experiences";
+    "description", `String "Initialize the experience database from git history. Walks all commits after a cutoff date, correlates them with Claude Code JSONL session logs using commit-interval partitioning, and indexes each commit as an experience with its conversation context. Wipes existing DB first for a clean slate.";
+    "inputSchema", `Assoc [
+      "type", `String "object";
+      "properties", `Assoc [
+        "cutoff_date", `Assoc [
+          "type", `String "string";
+          "description", `String "Only index commits after this date (format: MM/DD/YYYY)";
+        ];
+      ];
+      "required", `List [`String "cutoff_date"];
+    ];
+  ];
 ]
 
 let text_result text =
@@ -907,6 +921,180 @@ let handle_explain_change state args =
     Lwt.return (text_result (Buffer.contents response))
   end
 
+(* One-shot: wipe both collections *)
+let wipe_db state =
+  let project = project_name state in
+  let exp_name = project ^ "_experiences" in
+  let int_name = project ^ "_interactions" in
+  let* () = Lwt_io.eprintf "Deleting collection: %s\n" exp_name in
+  let* () =
+    Lwt.catch
+      (fun () -> Chromadb.delete_collection ~port:state.port ~name:exp_name)
+      (fun _exn -> Lwt_io.eprintf "  (collection did not exist)\n") in
+  let* () = Lwt_io.eprintf "Deleting collection: %s\n" int_name in
+  let* () =
+    Lwt.catch
+      (fun () -> Chromadb.delete_collection ~port:state.port ~name:int_name)
+      (fun _exn -> Lwt_io.eprintf "  (collection did not exist)\n") in
+  state.collection_id <- None;
+  state.interactions_collection_id <- None;
+  Lwt_io.eprintf "DB wiped for project: %s\n" project
+
+(* Parse MM/DD/YYYY date string to Unix float (midnight), fallback to 0.0 *)
+let parse_mmddyyyy s =
+  try
+    Scanf.sscanf s "%2d/%2d/%4d"
+      (fun mo d y ->
+        let tm = { Unix.tm_sec = 0; tm_min = 0; tm_hour = 0;
+                   tm_mday = d; tm_mon = mo - 1; tm_year = y - 1900;
+                   tm_wday = 0; tm_yday = 0; tm_isdst = false } in
+        let (t, _) = Unix.mktime tm in
+        t)
+  with _ -> 0.0
+
+(* Parse ISO 8601 timestamp string to Unix float, fallback to 0.0 *)
+let parse_timestamp_float s =
+  try
+    Scanf.sscanf s "%4d-%2d-%2dT%2d:%2d:%2d"
+      (fun y mo d h mi se ->
+        let tm = { Unix.tm_sec = se; tm_min = mi; tm_hour = h;
+                   tm_mday = d; tm_mon = mo - 1; tm_year = y - 1900;
+                   tm_wday = 0; tm_yday = 0; tm_isdst = false } in
+        let (t, _) = Unix.mktime tm in
+        t)
+  with _ -> 0.0
+
+(* MCP tool: init_experiences — commit-interval partitioning *)
+let handle_init_experiences state args =
+  let open Yojson.Safe.Util in
+  let cutoff_str = args |> member "cutoff_date" |> to_string_option
+    |> Option.value ~default:"" in
+  let cutoff_ts = parse_mmddyyyy cutoff_str in
+  if cutoff_ts = 0.0 then
+    Lwt.return (text_result (Printf.sprintf "Invalid cutoff_date: %s (use MM/DD/YYYY)" cutoff_str))
+  else begin
+    let* () = Lwt_io.eprintf "init_experiences: cutoff=%s (%.0f)\n%!" cutoff_str cutoff_ts in
+    (* 1. Wipe DB *)
+    let* () = wipe_db state in
+    let* collection_id = get_collection state in
+    let* int_collection_id = get_interactions_collection state in
+    (* 2. Open repo via Irmin *)
+    let* repo = Irmin_store.open_repo ~project_dir:state.project_dir in
+    let* () = Lwt_io.eprintf "Opened git repo via Irmin\n%!" in
+    (* 3. Walk all commits after cutoff, oldest-first *)
+    let* all_commits = Irmin_store.walk_all_commits ~repo ~since:cutoff_ts in
+    let* () = Lwt_io.eprintf "Found %d commits since %s\n%!"
+      (List.length all_commits) cutoff_str in
+    (* 4. Load all JSONL sessions and collect all turns with branch + timestamp *)
+    let sessions = Jsonl_reader.list_sessions ~jsonl_dir:state.jsonl_dir in
+    let all_turns = List.concat_map (fun path ->
+      let session_id = Jsonl_reader.session_id_of_path path in
+      let interactions = Jsonl_reader.parse_interactions ~filepath:path in
+      List.map (fun (i : interaction) ->
+        let ts = parse_timestamp_float i.timestamp in
+        (ts, i.branch, session_id, path, i)
+      ) interactions
+    ) sessions in
+    (* Sort turns by timestamp *)
+    let all_turns = List.sort (fun (t1, _, _, _, _) (t2, _, _, _, _) ->
+      Float.compare t1 t2
+    ) all_turns in
+    let* () = Lwt_io.eprintf "Loaded %d turns from %d sessions\n%!"
+      (List.length all_turns) (List.length sessions) in
+    (* 5. For each commit, gather turns in the interval (prev_ts, commit_ts] *)
+    let indexed = ref 0 in
+    let failed = ref 0 in
+    let total = List.length all_commits in
+    let prev_ts = ref cutoff_ts in
+    let* () = Lwt_list.iter_s (fun (sha, _commit) ->
+      Lwt.catch (fun () ->
+        let* exp_opt = Irmin_store.experience_of_commit ~repo ~sha in
+        match exp_opt with
+        | None ->
+          let* () = Lwt_io.eprintf "  SKIP %s: could not parse\n%!" sha in
+          Lwt.return_unit
+        | Some exp ->
+          let lower = !prev_ts in
+          let upper = exp.timestamp in
+          prev_ts := upper;
+          (* Gather turns where lower < turn_ts <= upper *)
+          let grouped = List.filter (fun (ts, _, _, _, _) ->
+            ts > lower && ts <= upper
+          ) all_turns in
+          (* Determine branch from matching turns *)
+          let branch = match grouped with
+            | [] -> ""
+            | _ ->
+              let branches = List.filter_map (fun (_, b, _, _, _) ->
+                if b <> "" then Some b else None
+              ) grouped in
+              (match branches with b :: _ -> b | [] -> "")
+          in
+          (* Fallback branch via git CLI if no turns matched *)
+          let* branch = if branch = "" then
+            Lwt.catch
+              (fun () -> Git_ops.current_branch ~cwd:state.project_dir)
+              (fun _ -> Lwt.return "main")
+          else Lwt.return branch in
+          let exp = { exp with branch } in
+          (* Build conversation text *)
+          let conversation = match grouped with
+            | [] ->
+              (* No matching turns — commit-only experience *)
+              Printf.sprintf "Commit %s: %s\n\nChanged files: %s\n\nDiff:\n%s"
+                sha exp.commit_message
+                (String.concat ", " exp.files_changed)
+                (if String.length exp.diff > 5000
+                 then String.sub exp.diff 0 5000 ^ "\n... (truncated)"
+                 else exp.diff)
+            | turns ->
+              let parts = List.map (fun (_, _, _sid, filepath, i) ->
+                Jsonl_reader.summarizable_text ~filepath i
+              ) turns in
+              String.concat "\n---\n" parts
+          in
+          (* Enrich experience with session/uuid info from turns *)
+          let exp = match grouped with
+            | [] -> exp
+            | (_, _, session_id, _, _) :: _ ->
+              let uuids = List.map (fun (_, _, _, _, (i : interaction)) ->
+                i.user_uuid
+              ) grouped in
+              { exp with session_id; interaction_uuids = uuids }
+          in
+          (* Save experience *)
+          let* () = Chromadb.save_experience ~port:state.port ~collection_id
+            exp ~full_conversation:conversation in
+          (* Save per-interaction embeddings *)
+          let* () = Lwt_list.iter_s (fun (_, _, _, _, (i : interaction)) ->
+            Chromadb.save_interaction ~port:state.port
+              ~collection_id:int_collection_id
+              ~experience_id:sha
+              ~interaction_index:i.index
+              ~user_text:i.user_text
+              ~assistant_summary:i.assistant_summary
+              ~user_uuid:i.user_uuid
+              ~timestamp:i.timestamp
+          ) grouped in
+          incr indexed;
+          let turn_tag = if grouped <> [] then
+            Printf.sprintf " [+%d turns]" (List.length grouped)
+          else "" in
+          Lwt_io.eprintf "  [%d/%d] %s: %s%s\n%!"
+            !indexed total
+            (String.sub sha 0 (min 8 (String.length sha)))
+            exp.label turn_tag
+      ) (fun exn ->
+        incr failed;
+        Lwt_io.eprintf "  FAILED %s: %s\n%!" sha (Printexc.to_string exn)
+      )
+    ) all_commits in
+    let msg = Printf.sprintf "init_experiences complete: %d indexed, %d failed out of %d commits"
+      !indexed !failed total in
+    let* () = Lwt_io.eprintf "%s\n%!" msg in
+    Lwt.return (text_result msg)
+  end
+
 let dispatch_tool state name args =
   match name with
   | "save_experience" -> handle_save_experience state args
@@ -921,6 +1109,7 @@ let dispatch_tool state name args =
   | "search_by_sha" -> handle_search_by_sha state args
   | "blame" -> handle_blame state args
   | "explain_change" -> handle_explain_change state args
+  | "init_experiences" -> handle_init_experiences state args
   | _ -> Lwt.return (text_result (Printf.sprintf "Unknown tool: %s" name))
 
 (* JSON-RPC message handling *)
@@ -1035,37 +1224,6 @@ let run_with_state state =
       end
   in
   loop ()
-
-(* One-shot: wipe both collections *)
-let wipe_db state =
-  let project = project_name state in
-  let exp_name = project ^ "_experiences" in
-  let int_name = project ^ "_interactions" in
-  let* () = Lwt_io.eprintf "Deleting collection: %s\n" exp_name in
-  let* () =
-    Lwt.catch
-      (fun () -> Chromadb.delete_collection ~port:state.port ~name:exp_name)
-      (fun _exn -> Lwt_io.eprintf "  (collection did not exist)\n") in
-  let* () = Lwt_io.eprintf "Deleting collection: %s\n" int_name in
-  let* () =
-    Lwt.catch
-      (fun () -> Chromadb.delete_collection ~port:state.port ~name:int_name)
-      (fun _exn -> Lwt_io.eprintf "  (collection did not exist)\n") in
-  state.collection_id <- None;
-  state.interactions_collection_id <- None;
-  Lwt_io.eprintf "DB wiped for project: %s\n" project
-
-(* Parse ISO 8601 timestamp string to Unix float, fallback to 0.0 *)
-let parse_timestamp_float s =
-  try
-    Scanf.sscanf s "%4d-%2d-%2dT%2d:%2d:%2d"
-      (fun y mo d h mi se ->
-        let tm = { Unix.tm_sec = se; tm_min = mi; tm_hour = h;
-                   tm_mday = d; tm_mon = mo - 1; tm_year = y - 1900;
-                   tm_wday = 0; tm_yday = 0; tm_isdst = false } in
-        let (t, _) = Unix.mktime tm in
-        t)
-  with _ -> 0.0
 
 (* One-shot: import a session's interactions as individual experiences *)
 let import_session state ~session_id =
