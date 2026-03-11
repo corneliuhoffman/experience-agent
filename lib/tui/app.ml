@@ -53,6 +53,8 @@ type git_state = {
   commit_idx : int;
   file_idx : int;
   diff_preview : string;
+  linked_conv : (string * string * int * string) option;
+    (* (session_id, user_text, turn_idx, timestamp) — conversation that produced current commit *)
 }
 
 type history_state = {
@@ -73,7 +75,7 @@ type history_state = {
 let empty_git_state = {
   branches = []; current_branch = ""; commits = []; files = [];
   focus = Branches; branch_idx = 0; commit_idx = 0; file_idx = 0;
-  diff_preview = "";
+  diff_preview = ""; linked_conv = None;
 }
 
 let empty_history_state = {
@@ -738,17 +740,36 @@ let draw_git_files_and_diff ctx state =
         ("  " ^ file)
     end
   ) g.files;
-  (* Diff preview below files *)
-  if file_height < size.rows then begin
-    draw_str ctx file_height 0
+  (* Linked conversation hint *)
+  let conv_row = file_height in
+  let conv_height = match g.linked_conv with Some _ -> 1 | None -> 0 in
+  (match g.linked_conv with
+   | Some (_sid, user_text, _idx, _ts) ->
+     let max_len = max 1 (size.cols - 22) in
+     let label = if String.length user_text > max_len
+       then String.sub user_text 0 max_len ^ "..."
+       else user_text in
+     let hint = Printf.sprintf " Conv: \"%s\"" label in
+     if conv_row < size.rows then
+       draw_str ctx conv_row 0
+         ~style:LTerm_style.{ none with foreground = Some c_highlight;
+                                         background = Some c_input_bg;
+                                         bold = Some true }
+         (Printf.sprintf "%s%s" hint
+            (String.make (max 0 (size.cols - String.length hint)) ' '))
+   | None -> ());
+  (* Diff preview below files + conv hint *)
+  let diff_start = conv_row + conv_height in
+  if diff_start < size.rows then begin
+    draw_str ctx diff_start 0
       ~style:LTerm_style.{ none with background = Some c_status_bg;
                                       foreground = Some c_highlight; bold = Some true }
       (Printf.sprintf " Diff %s" (String.make (max 0 (size.cols - 6)) ' '));
     let lines = String.split_on_char '\n' g.diff_preview in
-    let vh = max 0 (size.rows - file_height - 1) in
+    let vh = max 0 (size.rows - diff_start - 1) in
     List.iteri (fun i line ->
       if i < vh then begin
-        let row = file_height + 1 + i in
+        let row = diff_start + 1 + i in
         if row < size.rows then
           let fg, bg = if String.length line > 0 then match line.[0] with
             | '+' -> (c_diff_add_fg, c_diff_add_bg)
@@ -1075,7 +1096,20 @@ let load_git_data ~cwd =
     | [] -> Lwt.return [] in
   Lwt.return { branches; current_branch = cur; commits; files;
                focus = Branches; branch_idx = 0; commit_idx = 0; file_idx = 0;
-               diff_preview }
+               diff_preview; linked_conv = None }
+
+(* Query ChromaDB for the conversation that produced a commit *)
+let query_linked_conv ~port ~project ~sha =
+  Lwt.catch (fun () ->
+    let* coll_id =
+      Urme_search.Chromadb.ensure_interactions_collection ~port ~project in
+    let* results =
+      Urme_search.Chromadb.find_interactions_by_commit ~port ~collection_id:coll_id ~sha in
+    match results with
+    | (session_id, user_text, idx, ts) :: _ ->
+      Lwt.return_some (session_id, user_text, idx, ts)
+    | [] -> Lwt.return_none)
+  (fun _ -> Lwt.return_none)
 
 let switch_to_git mvar =
   let* s = Lwt_mvar.take mvar in
@@ -1204,7 +1238,35 @@ let session_turns filepath =
   close_in ic;
   List.rev !turns
 
-(* Index all session JSONL files into ChromaDB — per-turn granularity *)
+(* Score a candidate commit against an interaction's written content.
+   Uses 3 signals: timestamp proximity, blame overlap, diff content overlap. *)
+let score_commit ~cwd ~t_start ~t_end ~blame_shas ~written_lines
+    (sha, commit_ts, _msg) =
+  let ts_score = if commit_ts >= t_start && commit_ts < t_end then 0.3 else 0.0 in
+  let blame_score =
+    if List.exists (fun s -> s = sha || (String.length s >= 7 && String.length sha >= 7
+        && String.sub s 0 7 = String.sub sha 0 7)) blame_shas
+    then 0.3 else 0.0 in
+  (* Diff content overlap *)
+  let* diff_score =
+    if written_lines = [] then Lwt.return 0.0
+    else
+      Lwt.catch (fun () ->
+        let* diff = Urme_git.Ops.commit_diff ~cwd ~sha in
+        let added = String.split_on_char '\n' diff
+          |> List.filter (fun l -> String.length l > 0 && l.[0] = '+'
+                                   && not (String.length l > 3 && String.sub l 0 3 = "+++"))
+          |> List.map (fun l -> String.trim (String.sub l 1 (String.length l - 1))) in
+        let matches = List.fold_left (fun acc wl ->
+          if List.exists (fun al -> al = String.trim wl) added then acc + 1 else acc
+        ) 0 written_lines in
+        let total = List.length written_lines in
+        Lwt.return (if total > 0 then 0.4 *. (Float.of_int matches /. Float.of_int total) else 0.0)
+      ) (fun _exn -> Lwt.return 0.0)
+  in
+  Lwt.return (ts_score +. blame_score +. diff_score)
+
+(* Index all session JSONL files into ChromaDB — incremental with git correlation *)
 let index_sessions mvar =
   let* () = update mvar (fun s ->
     { s with status_extra = "Starting services..." }) in
@@ -1216,54 +1278,158 @@ let index_sessions mvar =
       let port = s_val.config.chromadb_port in
       let ollama_url = s_val.config.ollama_url in
       let project = Filename.basename s_val.project_dir in
+      let cwd = s_val.project_dir in
       let* () = ensure_services mvar ~chromadb_port:port ~ollama_url
-          ~project_dir:s_val.project_dir in
+          ~project_dir:cwd in
+      (* Walk git log --all once *)
+      let* () = update mvar (fun s -> { s with status_extra = "Walking git log..." }) in
+      redraw mvar;
+      let* all_commits = Lwt.catch
+        (fun () -> Urme_git.Ops.walk_log ~cwd ~max_count:5000 ())
+        (fun _exn -> Lwt.return []) in
+      (* Build sha → (timestamp, message) map *)
+      let commit_map = Hashtbl.create (List.length all_commits) in
+      List.iter (fun (sha, ts, msg) -> Hashtbl.replace commit_map sha (ts, msg)) all_commits;
       let* () = update mvar (fun s -> { s with status_extra = "Indexing turns..." }) in
       redraw mvar;
       let* collection_id =
         Urme_search.Chromadb.ensure_interactions_collection ~port ~project in
       let jsonl_dir = Urme_search.Jsonl_reader.find_jsonl_dir
-          ~project_dir:s_val.project_dir in
+          ~project_dir:cwd in
       let sessions = Urme_search.Jsonl_reader.list_sessions ~jsonl_dir in
       let total = List.length sessions in
-      let total_turns = ref 0 in
+      let stats = ref (0, 0, 0) in (* turns_indexed, turns_skipped, commits_matched *)
       let session_num = ref 0 in
       let* () = Lwt_list.iter_s (fun filepath ->
         incr session_num;
         let session_id = Filename.basename filepath |> Filename.chop_extension in
-        let turns = session_turns filepath in
-        if turns = [] then Lwt.return_unit
+        let interactions = Urme_search.Jsonl_reader.parse_interactions ~filepath in
+        if interactions = [] then Lwt.return_unit
         else begin
-          let stat = Unix.stat filepath in
-          let ts = Printf.sprintf "%.0f" stat.Unix.st_mtime in
           let* () = update mvar (fun s ->
+            let (ti, ts, cm) = !stats in
             { s with status_extra =
-                Printf.sprintf "Session %d/%d (%d turns so far)"
-                  !session_num total !total_turns }) in
+                Printf.sprintf "Session %d/%d (%d indexed, %d skipped, %d commits)"
+                  !session_num total ti ts cm }) in
           redraw mvar;
-          Lwt_list.iteri_s (fun i (user_text, assistant_text) ->
-            if String.length user_text < 5 then Lwt.return_unit
+          let n = List.length interactions in
+          let interactions_arr = Array.of_list interactions in
+          Lwt_list.iteri_s (fun i (interaction : Urme_core.Types.interaction) ->
+            if String.length interaction.user_text < 5 then Lwt.return_unit
             else begin
-              incr total_turns;
-              let assistant_summary =
-                if String.length assistant_text > 500
-                then String.sub assistant_text 0 500 ^ "..."
-                else assistant_text in
-              Lwt.catch (fun () ->
-                Urme_search.Chromadb.save_interaction ~port ~collection_id
-                  ~experience_id:session_id ~interaction_index:i
-                  ~user_text ~assistant_summary
-                  ~user_uuid:(Printf.sprintf "%s_%d" session_id i)
-                  ~timestamp:ts
-              ) (fun _exn -> Lwt.return_unit)
+              let id = Printf.sprintf "%s_%d" session_id i in
+              (* Check if already indexed *)
+              let* existing = Lwt.catch (fun () ->
+                Urme_search.Chromadb.get_interaction_meta ~port ~collection_id ~id
+              ) (fun _exn -> Lwt.return_none) in
+              let has_git = match existing with
+                | Some meta ->
+                  let open Yojson.Safe.Util in
+                  (try let cs = meta |> member "commit_shas" |> to_string in
+                       String.length cs > 0
+                   with _ -> false)
+                | None -> false in
+              let exists = existing <> None in
+              if exists && has_git then begin
+                (* Already indexed with git info — skip *)
+                let (ti, ts, cm) = !stats in stats := (ti, ts + 1, cm);
+                Lwt.return_unit
+              end else begin
+                (* Compute git correlation *)
+                let t_start = Urme_core.Types.iso8601_to_epoch interaction.timestamp in
+                let t_end =
+                  if i + 1 < n then
+                    Urme_core.Types.iso8601_to_epoch interactions_arr.(i + 1).timestamp
+                  else
+                    (try let stat = Unix.stat filepath in stat.Unix.st_mtime
+                     with _ -> t_start +. 3600.0) in
+                let written_content =
+                  Urme_search.Jsonl_reader.written_content_for_interaction
+                    ~filepath interaction in
+                let all_written_lines = List.concat_map snd written_content in
+                (* Blame signal: collect SHAs from blame on touched files *)
+                let* blame_shas =
+                  let files = List.map fst written_content in
+                  let files_capped = if List.length files > 20
+                    then List.filteri (fun i _ -> i < 20) files else files in
+                  Lwt_list.fold_left_s (fun acc fp ->
+                    if Sys.file_exists fp then
+                      Lwt.catch (fun () ->
+                        let* blame_result = Urme_git.Ops.blame ~cwd ~filepath:fp () in
+                        let shas = List.map (fun (sha, _, _) -> sha) blame_result
+                          |> List.sort_uniq String.compare in
+                        Lwt.return (shas @ acc)
+                      ) (fun _exn -> Lwt.return acc)
+                    else Lwt.return acc
+                  ) [] files_capped in
+                let blame_shas = List.sort_uniq String.compare blame_shas in
+                (* Candidate commits: timestamp window ∪ blame SHAs *)
+                let time_candidates = List.filter (fun (_, ts, _) ->
+                  ts >= t_start && ts < t_end) all_commits in
+                let blame_candidates = List.filter_map (fun sha ->
+                  match Hashtbl.find_opt commit_map sha with
+                  | Some (ts, msg) -> Some (sha, ts, msg)
+                  | None -> None
+                ) blame_shas in
+                let candidates_all = time_candidates @ blame_candidates
+                  |> List.sort_uniq (fun (a, _, _) (b, _, _) -> String.compare a b) in
+                let candidates = if List.length candidates_all > 20
+                  then List.filteri (fun i _ -> i < 20) candidates_all
+                  else candidates_all in
+                (* Score each candidate *)
+                let* scored = Lwt_list.map_s (fun c ->
+                  let* s = score_commit ~cwd ~t_start ~t_end ~blame_shas
+                      ~written_lines:all_written_lines c in
+                  let (sha, _, _) = c in
+                  Lwt.return (sha, s)
+                ) candidates in
+                let matched = scored
+                  |> List.filter (fun (_, s) -> s >= 0.3)
+                  |> List.sort (fun (_, a) (_, b) -> Float.compare b a)
+                  |> List.map fst in
+                let matched_capped = if List.length matched > 5
+                  then List.filteri (fun i _ -> i < 5) matched else matched in
+                (* Get combined diff for matched commits *)
+                let* commit_diff =
+                  if matched_capped = [] then Lwt.return ""
+                  else begin
+                    let* diffs = Lwt_list.map_s (fun sha ->
+                      Lwt.catch (fun () -> Urme_git.Ops.commit_diff ~cwd ~sha)
+                        (fun _exn -> Lwt.return "")
+                    ) matched_capped in
+                    Lwt.return (String.concat "\n" diffs)
+                  end in
+                let (ti, ts, cm) = !stats in
+                stats := (ti + 1, ts, cm + List.length matched_capped);
+                if exists then
+                  (* Exists but no git info — update *)
+                  Lwt.catch (fun () ->
+                    if matched_capped <> [] then
+                      Urme_search.Chromadb.update_interaction_git ~port ~collection_id
+                        ~id ~commit_shas:matched_capped ~commit_diff
+                    else Lwt.return_unit
+                  ) (fun _exn -> Lwt.return_unit)
+                else
+                  (* New interaction — save with git info *)
+                  Lwt.catch (fun () ->
+                    Urme_search.Chromadb.save_interaction ~port ~collection_id
+                      ~experience_id:session_id ~interaction_index:i
+                      ~user_text:interaction.user_text
+                      ~assistant_summary:interaction.assistant_summary
+                      ~user_uuid:interaction.user_uuid
+                      ~timestamp:interaction.timestamp
+                      ~commit_shas:matched_capped ~commit_diff ()
+                  ) (fun _exn -> Lwt.return_unit)
+              end
             end
-          ) turns
+          ) interactions
         end
       ) sessions in
+      let (ti, ts, cm) = !stats in
       let* () = update mvar (fun s ->
         { s with status_extra =
-            Printf.sprintf "Indexed %d turns from %d sessions"
-              !total_turns total }) in
+            Printf.sprintf "Done: %d indexed, %d skipped, %d commits matched (%d sessions)"
+              ti ts cm total }) in
       redraw mvar; Lwt.return_unit
     ) (fun exn ->
       let* () = update mvar (fun s ->
@@ -1624,7 +1790,7 @@ let index_previous_turn s =
                ~experience_id:sid ~interaction_index:idx
                ~user_text ~assistant_summary
                ~user_uuid:(Printf.sprintf "%s_%d" sid idx)
-               ~timestamp:ts
+               ~timestamp:ts ()
          ) (fun _exn -> Lwt.return_unit))
      | _ -> ())
   | None -> ()
@@ -1950,28 +2116,72 @@ let run ~config ~project_dir () =
             | (sha, _, _) :: _ ->
               Lwt.catch (fun () -> Urme_git.Ops.commit_changed_files ~cwd:s.project_dir ~sha) (fun _ -> Lwt.return [])
             | [] -> Lwt.return [] in
+          let port = s.config.chromadb_port in
+          let project = Filename.basename s.project_dir in
+          let* linked = match commits with
+            | (sha, _, _) :: _ -> query_linked_conv ~port ~project ~sha
+            | [] -> Lwt.return_none in
           Lwt_mvar.put mvar { s with git = { g with commits; commit_idx = 0;
                                                      files; file_idx = 0; diff_preview;
-                                                     focus = Commits } }
+                                                     focus = Commits; linked_conv = linked } }
         | Commits ->
-          (* Load diff and files for selected commit *)
+          (* Load diff and files for selected commit, query linked conversation *)
           (match List.nth_opt g.commits g.commit_idx with
            | Some (sha, _, _) ->
              let* diff = Lwt.catch
                (fun () -> Urme_git.Ops.commit_diff ~cwd:s.project_dir ~sha) (fun _ -> Lwt.return "") in
              let* files = Lwt.catch
                (fun () -> Urme_git.Ops.commit_changed_files ~cwd:s.project_dir ~sha) (fun _ -> Lwt.return []) in
-             Lwt_mvar.put mvar { s with git = { g with diff_preview = diff; files; file_idx = 0 } }
+             let port = s.config.chromadb_port in
+             let project = Filename.basename s.project_dir in
+             let* linked = query_linked_conv ~port ~project ~sha in
+             Lwt_mvar.put mvar { s with git = { g with diff_preview = diff; files;
+                                                        file_idx = 0; linked_conv = linked } }
            | None -> Lwt_mvar.put mvar s)
         | Files ->
-          (* Show file-specific diff *)
-          (match List.nth_opt g.commits g.commit_idx, List.nth_opt g.files g.file_idx with
-           | Some (sha, _, _), Some file ->
-             let* diff = Lwt.catch
-               (fun () -> Urme_git.Ops.run_git ~cwd:s.project_dir
-                 ["diff"; sha ^ "^"; sha; "--"; file]) (fun _ -> Lwt.return "") in
-             Lwt_mvar.put mvar { s with git = { g with diff_preview = diff } }
-           | _ -> Lwt_mvar.put mvar s)
+          (* Query linked conversation for current commit, then navigate *)
+          let current_sha = match List.nth_opt g.commits g.commit_idx with
+            | Some (sha, _, _) -> Some sha | None -> None in
+          let* linked = match current_sha with
+            | Some sha ->
+              (* Try cached first, else query ChromaDB *)
+              (match g.linked_conv with
+               | Some _ as cached -> Lwt.return cached
+               | None ->
+                 let port = s.config.chromadb_port in
+                 let project = Filename.basename s.project_dir in
+                 query_linked_conv ~port ~project ~sha)
+            | None -> Lwt.return_none in
+          (match linked with
+           | Some (session_id, _user_text, turn_idx, _ts) ->
+             let jsonl_dir = Urme_search.Jsonl_reader.find_jsonl_dir
+                 ~project_dir:s.project_dir in
+             let path = Filename.concat jsonl_dir (session_id ^ ".jsonl") in
+             if Sys.file_exists path then
+               let turns = split_into_turns (load_session_entries path) in
+               let ti = min turn_idx (max 0 (List.length turns - 1)) in
+               Lwt_mvar.put mvar { s with
+                 mode = History;
+                 history = { s.history with
+                   showing_results = false;
+                   turns; turn_idx = ti; hist_scroll = 0;
+                   return_mode = Git };
+                 status_extra = Printf.sprintf "Session: %s turn %d"
+                   session_id (ti + 1) }
+             else
+               Lwt_mvar.put mvar { s with
+                 status_extra = Printf.sprintf "Session %s not found" session_id }
+           | None ->
+             (* No linked conversation — show file-specific diff *)
+             (match current_sha, List.nth_opt g.files g.file_idx with
+              | Some sha, Some file ->
+                let* diff = Lwt.catch
+                  (fun () -> Urme_git.Ops.run_git ~cwd:s.project_dir
+                    ["diff"; sha ^ "^"; sha; "--"; file]) (fun _ -> Lwt.return "") in
+                Lwt_mvar.put mvar { s with
+                  git = { g with diff_preview = diff; linked_conv = None };
+                  status_extra = "No linked conversation found" }
+              | _ -> Lwt_mvar.put mvar s))
       in
       redraw mvar; loop ()
 

@@ -1,3 +1,22 @@
+(* Parse ISO 8601 "2026-03-11T10:52:44.616Z" → Unix epoch float *)
+let iso8601_to_epoch s =
+  try
+    Scanf.sscanf s "%4d-%2d-%2dT%2d:%2d:%f"
+      (fun y mo d h mi sec ->
+        let dim = [|31;28;31;30;31;30;31;31;30;31;30;31|] in
+        let leap yr = (yr mod 4 = 0 && yr mod 100 <> 0) || yr mod 400 = 0 in
+        let rec yd acc yr =
+          if yr <= 1970 then acc
+          else yd (acc + if leap (yr - 1) then 366 else 365) (yr - 1) in
+        let md = ref 0 in
+        for m = 0 to mo - 2 do
+          md := !md + dim.(m);
+          if m = 1 && leap y then md := !md + 1
+        done;
+        Float.of_int (((yd 0 y + !md + d - 1) * 86400) + (h * 3600) + (mi * 60))
+        +. sec)
+  with _ -> 0.0
+
 (* An interaction: user message + all responses until next user message *)
 (* Main JSONL is linear — simple line-range segmentation *)
 type interaction = {

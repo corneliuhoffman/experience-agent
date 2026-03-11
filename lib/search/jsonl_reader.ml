@@ -124,6 +124,82 @@ let extract_tool_files (json : Yojson.Safe.t) =
     ) blocks
   | _ -> []
 
+(* Extract written content from Edit/Write tool calls in assistant messages.
+   Returns (filepath, written_lines) list — the actual text Claude authored. *)
+let extract_written_content (json : Yojson.Safe.t) =
+  let open Yojson.Safe.Util in
+  let typ = json |> member "type" |> to_string_option in
+  match typ with
+  | Some "assistant" ->
+    let blocks = json |> member "message" |> member "content"
+      |> (fun j -> try to_list j with _ -> []) in
+    List.filter_map (fun block ->
+      match block |> member "type" |> to_string_option with
+      | Some "tool_use" ->
+        let name = block |> member "name" |> to_string_option
+          |> Option.value ~default:"" in
+        let input = block |> member "input" in
+        (match name with
+         | "Edit" ->
+           let fp = input |> member "file_path" |> to_string_option in
+           let ns = input |> member "new_string" |> to_string_option in
+           (match fp, ns with
+            | Some f, Some s ->
+              let lines = String.split_on_char '\n' s
+                |> List.filter (fun l -> String.trim l <> "") in
+              if lines <> [] then Some (f, lines) else None
+            | _ -> None)
+         | "Write" ->
+           let fp = input |> member "file_path" |> to_string_option in
+           let content = input |> member "content" |> to_string_option in
+           (match fp, content with
+            | Some f, Some s ->
+              (* For Write, take first+last 20 non-empty lines as fingerprint *)
+              let lines = String.split_on_char '\n' s
+                |> List.filter (fun l -> String.trim l <> "") in
+              let n = List.length lines in
+              let sample = if n <= 40 then lines
+                else
+                  let first = List.filteri (fun i _ -> i < 20) lines in
+                  let last = List.filteri (fun i _ -> i >= n - 20) lines in
+                  first @ last in
+              if sample <> [] then Some (f, sample) else None
+            | _ -> None)
+         | _ -> None)
+      | _ -> None
+    ) blocks
+  | _ -> []
+
+(* Read all lines from a file — defined early for use in written_content_for_interaction *)
+let read_all_lines_early filepath =
+  let ic = open_in filepath in
+  let lines = ref [] in
+  (try while true do
+    lines := input_line ic :: !lines
+  done with End_of_file -> ());
+  close_in ic;
+  List.rev !lines
+
+(* Collect all written content for an interaction's JSONL line range *)
+let written_content_for_interaction ~filepath (interaction : Urme_core.Types.interaction) =
+  let lines = read_all_lines_early filepath in
+  let result = ref [] in
+  List.iteri (fun i line ->
+    if i >= interaction.line_start && i <= interaction.line_end then
+      match (try Some (Yojson.Safe.from_string line) with _ -> None) with
+      | Some json ->
+        let wc = extract_written_content json in
+        result := wc @ !result
+      | None -> ()
+  ) lines;
+  (* Merge entries for the same filepath *)
+  let tbl = Hashtbl.create 8 in
+  List.iter (fun (fp, lines) ->
+    let existing = try Hashtbl.find tbl fp with Not_found -> [] in
+    Hashtbl.replace tbl fp (existing @ lines)
+  ) !result;
+  Hashtbl.fold (fun fp lines acc -> (fp, lines) :: acc) tbl []
+
 (* Extract agentId from tool_result messages (for subagent linking) *)
 let extract_agent_ids (json : Yojson.Safe.t) =
   let open Yojson.Safe.Util in
