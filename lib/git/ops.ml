@@ -149,8 +149,9 @@ let commit_changed_files ~cwd ~sha =
         (fun _exn -> Lwt.return []))
 
 (* Walk git log — returns list of (sha, timestamp, message) *)
-let walk_log ~cwd ?(since="") ?(max_count=1000) () =
+let walk_log ~cwd ?(since="") ?(max_count=1000) ?(all=false) () =
   let args = ["log"; "--format=%H%n%at%n%s%n---"] @
+    (if all then ["--all"] else []) @
     (if since <> "" then ["--since=" ^ since] else []) @
     ["--max-count=" ^ string_of_int max_count] in
   let* output = Lwt.catch

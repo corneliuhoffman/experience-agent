@@ -186,6 +186,10 @@ let default_run project_dir _chromadb_port =
 
 let () =
   Printexc.record_backtrace true;
+  (* Use libev (kqueue on macOS) instead of select() to avoid
+     EINVAL when file descriptors exceed FD_SETSIZE (1024). *)
+  (try Lwt_engine.set (new Lwt_engine.libev ())
+   with Lwt_sys.Not_available _ -> ());
   let doc = "OCaml CLI orchestration layer for Claude + GitHub" in
   let info = Cmd.info "urme" ~doc ~version:"0.1.0" in
   let default = Term.(const default_run $ project_dir $ chromadb_port) in

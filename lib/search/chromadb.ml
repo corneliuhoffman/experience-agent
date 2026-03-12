@@ -321,17 +321,15 @@ let get_interaction_meta ~port ~collection_id ~id =
    The document text is "User: <question>\nAssistant: <summary truncated to 500 chars>" *)
 let save_interaction ~port ~collection_id ~experience_id ~interaction_index
     ~user_text ~assistant_summary ~user_uuid ~timestamp
-    ?(commit_shas=[]) ?(commit_diff="") () =
+    ?(git_info="") () =
   let summary_trunc =
     if String.length assistant_summary <= 500 then assistant_summary
     else String.sub assistant_summary 0 500 ^ "..." in
   let document = Printf.sprintf "User: %s\nAssistant: %s" user_text summary_trunc in
   let* embedding = embed_text document in
   let id = Printf.sprintf "%s_%d" experience_id interaction_index in
-  let git_fields = if commit_shas <> [] then [
-    "commit_shas", `String (String.concat "," commit_shas);
-    "commit_diff", `String (if String.length commit_diff <= 5000 then commit_diff
-                            else String.sub commit_diff 0 5000 ^ "\n...(truncated)");
+  let git_fields = if git_info <> "" then [
+    "git_info", `String git_info;
   ] else [] in
   let metadata = `Assoc ([
     "experience_id", `String experience_id;
@@ -351,12 +349,10 @@ let save_interaction ~port ~collection_id ~experience_id ~interaction_index
     ~path:(Printf.sprintf "/collections/%s/add" collection_id) ~body in
   ()
 
-(* Update git info on an existing interaction *)
-let update_interaction_git ~port ~collection_id ~id ~commit_shas ~commit_diff =
+(* Update git_info JSON on an existing interaction *)
+let update_interaction_git_info ~port ~collection_id ~id ~git_info =
   let updates = [
-    "commit_shas", `String (String.concat "," commit_shas);
-    "commit_diff", `String (if String.length commit_diff <= 5000 then commit_diff
-                            else String.sub commit_diff 0 5000 ^ "\n...(truncated)");
+    "git_info", `String git_info;
   ] in
   update_metadata ~port ~collection_id ~id ~updates
 
@@ -431,35 +427,38 @@ let search_all_interactions ~port ~collection_id ~query ~n =
           |> Option.value ~default:0 in
         (session_id, user_text, doc, interaction_index, timestamp, distance))
 
-(* Reverse lookup: find interactions linked to a commit SHA.
-   ChromaDB where filter doesn't support $contains on strings,
-   so we fetch all interactions with metadata and filter locally. *)
-let find_interactions_by_commit ~port ~collection_id ~sha =
-  let body = `Assoc [
-    "include", `List [`String "metadatas"];
-    "limit", `Int 10000;
-  ] in
-  let* resp = http_post ~port
-    ~path:(Printf.sprintf "/collections/%s/get" collection_id) ~body in
-  let open Yojson.Safe.Util in
-  let metadatas = resp |> member "metadatas" |> safe_to_list in
-  let results = List.filter_map (fun meta ->
-    let shas_csv = meta |> member "commit_shas" |> to_string_option
-      |> Option.value ~default:"" in
-    let shas = String.split_on_char ',' shas_csv in
-    if List.exists (fun s -> s = sha) shas then
-      let session_id = meta |> member "experience_id" |> to_string_option
+(* Fetch all interactions that have non-empty git_info, paged.
+   Returns list of (id, git_info_string, experience_id, interaction_index). *)
+let get_all_with_git_info ~port ~collection_id =
+  let rec fetch_page ~offset ~acc =
+    let body = `Assoc [
+      "include", `List [`String "metadatas"];
+      "limit", `Int 500;
+      "offset", `Int offset;
+    ] in
+    let* resp = http_post ~port
+      ~path:(Printf.sprintf "/collections/%s/get" collection_id) ~body in
+    let open Yojson.Safe.Util in
+    let ids = resp |> member "ids" |> safe_to_list |> List.map to_string in
+    let metadatas = resp |> member "metadatas" |> safe_to_list in
+    let found = List.filter_map (fun (id, meta) ->
+      let gi = meta |> member "git_info" |> to_string_option
         |> Option.value ~default:"" in
-      let user_text = meta |> member "user_text" |> to_string_option
-        |> Option.value ~default:"" in
-      let interaction_index = meta |> member "interaction_index" |> to_int_option
-        |> Option.value ~default:0 in
-      let timestamp = meta |> member "timestamp" |> to_string_option
-        |> Option.value ~default:"" in
-      Some (session_id, user_text, interaction_index, timestamp)
-    else None
-  ) metadatas in
-  Lwt.return results
+      if gi <> "" then
+        let session_id = meta |> member "experience_id" |> to_string_option
+          |> Option.value ~default:"" in
+        let idx = meta |> member "interaction_index" |> to_int_option
+          |> Option.value ~default:0 in
+        Some (id, gi, session_id, idx)
+      else None
+    ) (List.combine ids metadatas) in
+    let acc = acc @ found in
+    if List.length ids < 500 then
+      Lwt.return acc
+    else
+      fetch_page ~offset:(offset + 500) ~acc
+  in
+  fetch_page ~offset:0 ~acc:[]
 
 (* Delete all interaction documents for an experience *)
 let delete_interactions ~port ~collection_id ~experience_id =

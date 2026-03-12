@@ -12,6 +12,8 @@ depends: [
   "irmin-git" {>= "3.6"}
   "cmdliner" {>= "1.2"}
   "lambda-term" {>= "3.3"}
+  "patch" {>= "3.1"}
+  "conf-libev"
 ]
 build: [
   ["dune" "build" "-p" name "-j" jobs]
