@@ -28,6 +28,18 @@ let iter_workers ~n f items =
   in
   Lwt.join (List.init n (fun _ -> worker ()))
 
+let iteri_workers ~n f items =
+  let q = Queue.create () in
+  List.iteri (fun i x -> Queue.push (i, x) q) items;
+  let worker () =
+    let rec loop () =
+      match Queue.take_opt q with
+      | None -> Lwt.return_unit
+      | Some (i, item) -> let* () = f i item in loop ()
+    in loop ()
+  in
+  Lwt.join (List.init n (fun _ -> worker ()))
+
 (* Sort file paths by size descending — biggest first for better parallelism *)
 let sort_by_size_desc paths =
   let with_size = List.filter_map (fun p ->
@@ -1314,8 +1326,8 @@ let update_git_links ~project_dir ~port ~collection_id mvar =
     (* Phase 2: Re-link or wipe stale references *)
     let p_phase2 =
       let live_diff_index : (string * string, string * string) Hashtbl.t = Hashtbl.create 256 in
-      let* () = Lwt_list.iter_p (fun (sha, _ts, files) ->
-        Lwt_list.iter_p (fun file ->
+      let* () = iter_workers ~n:16 (fun (sha, _ts, files) ->
+        iter_workers ~n:8 (fun file ->
           let file_base = Filename.basename file in
           let* diff = Lwt.catch (fun () ->
             Urme_git.Ops.run_git ~cwd ["diff"; sha ^ "^"; sha; "--"; file]
@@ -1327,7 +1339,7 @@ let update_git_links ~project_dir ~port ~collection_id mvar =
           Lwt.return_unit
         ) files
       ) commits_with_files in
-      let* () = Lwt_list.iter_p (fun (id, gi_str, _session_id, _idx) ->
+      let* () = iter_workers ~n:64 (fun (id, gi_str, _session_id, _idx) ->
         let tbl = parse_git_info gi_str in
         let changed = ref false in
         Hashtbl.iter (fun edit_key value ->
@@ -1457,24 +1469,26 @@ let update_git_links ~project_dir ~port ~collection_id mvar =
         ) turns;
         !edits
       in
-      (* Sort sessions biggest-first, round-robin distribute across domains *)
+      (* Sort sessions biggest-first, process in parallel pthreads via
+         Lwt_preemptive.detach — unlike Domain.spawn, this doesn't
+         poison Unix.fork. *)
       let sorted_sessions = sort_by_size_desc sessions in
-      let n_domains = min (max 1 (Domain.recommended_domain_count () - 1))
-                          (List.length sorted_sessions) in
-      let all_edits =
-        if n_domains = 0 then []
-        else begin
-          let buckets = Array.init n_domains (fun _ -> ref []) in
-          List.iteri (fun i s ->
-            let bucket = buckets.(i mod n_domains) in
-            bucket := s :: !bucket
-          ) sorted_sessions;
-          let domains = Array.to_list buckets |> List.map (fun bucket ->
-            Domain.spawn (fun () ->
-              List.concat_map process_session !bucket)
-          ) in
-          List.concat_map Domain.join domains
-        end in
+      let q = Queue.create () in
+      List.iter (fun s -> Queue.push s q) sorted_sessions;
+      let results = ref [] in
+      let worker () =
+        let rec loop () =
+          match Queue.take_opt q with
+          | None -> Lwt.return_unit
+          | Some session ->
+            let* edits = Lwt_preemptive.detach process_session session in
+            results := edits :: !results;
+            loop ()
+        in loop ()
+      in
+      let n = min 8 (Queue.length q) in
+      let* () = Lwt.join (List.init n (fun _ -> worker ())) in
+      let all_edits = List.concat !results in
       n_edits := List.length all_edits;
       let sorted_edits = List.sort (fun a b ->
         Float.compare b.timestamp a.timestamp) all_edits in
@@ -1493,14 +1507,14 @@ let update_git_links ~project_dir ~port ~collection_id mvar =
     let gi_updates : (string, (string * (string * string) option) list) Hashtbl.t =
       Hashtbl.create 256 in
     let links : (string * string, git_conv_link list) Hashtbl.t = Hashtbl.create 256 in
-    let* () = Lwt_list.iter_p (fun (sha, commit_ts, files) ->
+    let* () = iter_workers ~n:16 (fun (sha, commit_ts, files) ->
       let* parent_shas = Lwt.catch (fun () ->
         let+ (_msg, _author, _date, parents) =
           Urme_store.Project_store.commit_info ~repo ~sha in
         parents
       ) (fun _ -> Lwt.return []) in
       let parent_sha = match parent_shas with p :: _ -> p | [] -> "" in
-      Lwt_list.iter_p (fun file ->
+      iter_workers ~n:8 (fun file ->
         let file_base = Filename.basename file in
         let* file_after = Lwt.catch (fun () ->
           Urme_store.Project_store.read_blob ~repo ~sha ~path:file
@@ -1590,7 +1604,7 @@ let update_git_links ~project_dir ~port ~collection_id mvar =
     let p_persist =
       let update_list = Hashtbl.fold (fun iid entries acc ->
         (iid, entries) :: acc) gi_updates [] in
-      Lwt_list.iter_p (fun (iid, entries) ->
+      iter_workers ~n:64 (fun (iid, entries) ->
         let* existing_meta = Lwt.catch (fun () ->
           Urme_search.Chromadb.get_interaction_meta ~port ~collection_id ~id:iid
         ) (fun _ -> Lwt.return_none) in
@@ -1646,15 +1660,16 @@ let update_git_links ~project_dir ~port ~collection_id mvar =
 (* ---------- Mode switching helpers ---------- *)
 
 let load_git_data ~cwd =
+  let errs = ref [] in
   let p_branches = Lwt.catch
     (fun () -> Urme_git.Ops.run_git ~cwd ["branch"; "--list"; "--no-color"])
-    (fun _ -> Lwt.return "") in
+    (fun exn -> errs := ("branches: " ^ Printexc.to_string exn) :: !errs; Lwt.return "") in
   let p_cur = Lwt.catch
     (fun () -> Urme_git.Ops.current_branch ~cwd)
-    (fun _ -> Lwt.return "") in
+    (fun exn -> errs := ("cur_branch: " ^ Printexc.to_string exn) :: !errs; Lwt.return "") in
   let p_commits = Lwt.catch
     (fun () -> Urme_git.Ops.walk_log ~cwd ~max_count:200 ())
-    (fun _ -> Lwt.return []) in
+    (fun exn -> errs := ("commits: " ^ Printexc.to_string exn) :: !errs; Lwt.return []) in
   let* branches_raw = p_branches
   and* cur = p_cur
   and* commits = p_commits in
@@ -1675,20 +1690,36 @@ let load_git_data ~cwd =
     | [] -> Lwt.return [] in
   let* diff_preview = p_diff
   and* files = p_files in
-  Lwt.return { branches; current_branch = cur; commits; files;
+  let debug = Printf.sprintf "cwd=%s branches=%d commits=%d files=%d errs=[%s]"
+    cwd (List.length branches) (List.length commits) (List.length files)
+    (String.concat "; " !errs) in
+  Lwt.return ({ branches; current_branch = cur; commits; files;
                focus = Branches; branch_idx = 0; commit_idx = 0; file_idx = 0;
                link_idx = 0; diff_preview; diff_scroll_git = 0;
                file_diff_filter = None; git_links = Hashtbl.create 0;
-               link_candidates = [] }
+               link_candidates = [] }, debug)
+
+let log_debug msg =
+  let oc = open_out_gen [Open_append; Open_creat] 0o644 "/tmp/urme_debug.log" in
+  Printf.fprintf oc "[%s] %s\n" (string_of_float (Unix.gettimeofday ())) msg;
+  close_out oc
 
 let switch_to_git mvar =
+  log_debug "switch_to_git: taking mvar...";
   let* s = Lwt_mvar.take mvar in
+  log_debug (Printf.sprintf "switch_to_git: got mvar, project_dir=%s" s.project_dir);
   let* () = Lwt_mvar.put mvar { s with status_extra = "Loading git data..." } in
   redraw mvar;
+  log_debug "switch_to_git: taking mvar again...";
   let* s = Lwt_mvar.take mvar in
-  let* git = load_git_data ~cwd:s.project_dir in
+  log_debug "switch_to_git: loading git data...";
+  let* (git, debug) = load_git_data ~cwd:s.project_dir in
+  log_debug (Printf.sprintf "switch_to_git: %s" debug);
   let git = { git with git_links = s.git.git_links } in
-  let* () = Lwt_mvar.put mvar { s with mode = Git; git; status_extra = "Git browser" } in
+  let status = if git.branches = [] then
+    Printf.sprintf "Git: no branches! %s" debug
+  else "Git browser" in
+  let* () = Lwt_mvar.put mvar { s with mode = Git; git; status_extra = status } in
   redraw mvar; Lwt.return_unit
 
 (* Check if a service is reachable *)
@@ -1860,7 +1891,7 @@ let index_sessions mvar =
                       !indexed_count total ti ts cm }) in
               redraw mvar; Lwt.return_unit
             end else Lwt.return_unit in
-          Lwt_list.iteri_p (fun i (interaction : Urme_core.Types.interaction) ->
+          iteri_workers ~n:8 (fun i (interaction : Urme_core.Types.interaction) ->
             if String.length interaction.user_text < 5 then Lwt.return_unit
             else begin
               let id = Printf.sprintf "%s_%d" session_id i in
