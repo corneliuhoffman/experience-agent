@@ -111,7 +111,8 @@ let () =
                 current := content_before
               end
             ) reversed;
-            let result = !current in
+            let result = if !current = content_before then !current
+              else d.result in
             let fb = Filename.basename file in
             if result = content_before then begin
               Printf.printf "  PASS  %s %s (%d edits)\n%!" short fb (List.length matched);

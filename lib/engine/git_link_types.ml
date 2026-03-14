@@ -39,6 +39,7 @@ type decomposition = {
   commit_sha : string;
   file : string;
   items : provenance list;
+  result : string;
 }
 
 type git_info = {
