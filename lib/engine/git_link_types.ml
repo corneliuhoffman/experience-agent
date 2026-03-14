@@ -5,6 +5,7 @@ type edit = {
   file_base : string;
   new_string : string;
   old_string : string;        (* empty for Write *)
+  replace_all : bool;         (* Edit with replace_all=true *)
   timestamp : float;
   session_id : string;
   interaction_index : int;
@@ -49,8 +50,9 @@ type git_info = {
 
 (* --- Helpers --- *)
 
-let make_edit_key ~file_base ~new_string =
-  Printf.sprintf "%s:%s" file_base (Digest.string new_string |> Digest.to_hex)
+let make_edit_key ~file_base ~old_string ~new_string =
+  let combined = old_string ^ "\x00" ^ new_string in
+  Printf.sprintf "%s:%s" file_base (Digest.string combined |> Digest.to_hex)
 
 let diff_hash_of_string s = Digest.string s |> Digest.to_hex
 

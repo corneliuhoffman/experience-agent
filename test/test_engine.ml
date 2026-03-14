@@ -68,13 +68,41 @@ let () =
             List.iter (fun (edit : edit) ->
               let cc = !current in
               if edit.old_string <> "" then begin
-                match find_substring edit.new_string cc with
-                | Some pos ->
-                  let ns_len = String.length edit.new_string in
+                if edit.replace_all then begin
+                  (* replace_all: undo ALL occurrences, back to front *)
+                  let ns = edit.new_string in
+                  let ns_len = String.length ns in
                   let cc_len = String.length cc in
-                  current := String.sub cc 0 pos ^ edit.old_string ^
-                    String.sub cc (pos + ns_len) (cc_len - pos - ns_len)
-                | None -> ()
+                  let positions = ref [] in
+                  let search_from = ref 0 in
+                  (try while !search_from <= cc_len - ns_len do
+                    match find_substring ns (String.sub cc !search_from (cc_len - !search_from)) with
+                    | Some rel_pos ->
+                      positions := (!search_from + rel_pos) :: !positions;
+                      search_from := !search_from + rel_pos + 1
+                    | None -> search_from := cc_len + 1
+                  done with _ -> ());
+                  (* positions is in reverse order — replace back to front *)
+                  List.iter (fun pos ->
+                    let c = !current in
+                    let c_len = String.length c in
+                    current := String.sub c 0 pos ^ edit.old_string ^
+                      String.sub c (pos + ns_len) (c_len - pos - ns_len)
+                  ) !positions
+                end else begin
+                  (* Single replace: find best position *)
+                  let ns = edit.new_string in
+                  let ns_len = String.length ns in
+                  let cc_len = String.length cc in
+                  match find_substring ns cc with
+                  | Some pos ->
+                    current := String.sub cc 0 pos ^ edit.old_string ^
+                      String.sub cc (pos + ns_len) (cc_len - pos - ns_len)
+                  | None -> ()
+                end
+              end else if edit.new_string <> "" then begin
+                (* Write operation — undo by restoring content_before *)
+                current := content_before
               end
             ) reversed;
             let result = !current in
@@ -86,6 +114,44 @@ let () =
               let residual = abs (String.length result - String.length content_before) in
               Printf.printf "  FAIL  %s %s (%d edits, residual %d)\n%!"
                 short fb (List.length matched) residual;
+              (* Diagnostic: show which edits were matched *)
+              if true then begin
+                Printf.printf "    -- Matched edits (oldest first):\n%!";
+                List.iter (fun (e : edit) ->
+                  let os = if String.length e.old_string > 60
+                    then String.sub e.old_string 0 60 ^ "..."
+                    else e.old_string in
+                  let ns = if String.length e.new_string > 60
+                    then String.sub e.new_string 0 60 ^ "..."
+                    else e.new_string in
+                  let os = String.split_on_char '\n' os |> String.concat "\\n" in
+                  let ns = String.split_on_char '\n' ns |> String.concat "\\n" in
+                  Printf.printf "      [%s] old=%S new=%S\n%!" e.edit_key os ns
+                ) matched;
+                (* Show diff between result and content_before *)
+                let rlen = String.length result in
+                let blen = String.length content_before in
+                Printf.printf "    -- result len=%d, expected len=%d\n%!" rlen blen;
+                (* Find first divergence *)
+                let min_len = min rlen blen in
+                let first_diff = ref min_len in
+                for i = 0 to min_len - 1 do
+                  if !first_diff = min_len && result.[i] <> content_before.[i] then
+                    first_diff := i
+                done;
+                if !first_diff < min_len then begin
+                  let ctx_start = max 0 (!first_diff - 40) in
+                  let ctx_end = min min_len (!first_diff + 40) in
+                  let got = String.sub result ctx_start (ctx_end - ctx_start) in
+                  let exp = String.sub content_before ctx_start (ctx_end - ctx_start) in
+                  let got = String.split_on_char '\n' got |> String.concat "\\n" in
+                  let exp = String.split_on_char '\n' exp |> String.concat "\\n" in
+                  Printf.printf "    -- First diff at char %d:\n%!" !first_diff;
+                  Printf.printf "       GOT: %S\n%!" got;
+                  Printf.printf "       EXP: %S\n%!" exp
+                end else if rlen <> blen then
+                  Printf.printf "    -- Content matches up to char %d, then lengths differ\n%!" min_len
+              end;
               incr n_fail
             end;
             Lwt.return_unit

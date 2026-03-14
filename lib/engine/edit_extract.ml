@@ -87,10 +87,14 @@ let edits_of_session ~filepath =
                   | "Edit" -> input |> member "old_string" |> to_string_option
                     |> Option.value ~default:""
                   | _ -> "" in
+                let replace_all = match name with
+                  | "Edit" -> input |> member "replace_all" |> to_bool_option
+                    |> Option.value ~default:false
+                  | _ -> false in
                 if new_string <> "" then begin
-                  let ek = make_edit_key ~file_base ~new_string in
+                  let ek = make_edit_key ~file_base ~old_string ~new_string in
                   edits := { edit_key = ek; file_base; new_string; old_string;
-                             timestamp = ts; session_id;
+                             replace_all; timestamp = ts; session_id;
                              interaction_index = !current_iidx;
                              turn_idx = !current_iidx; entry_idx;
                              git_branch = !current_branch } :: !edits
