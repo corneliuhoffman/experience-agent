@@ -1,0 +1,4 @@
+(library
+ (name urme_mcp)
+ (libraries urme_core urme_git urme_store urme_search urme_engine
+            lwt lwt.unix yojson domainslib))

@@ -1,4 +1,4 @@
 (executable
  (name main)
  (public_name urme)
- (libraries urme_core urme_git urme_store urme_search urme_claude urme_engine urme_tui cmdliner))
+ (libraries urme_core urme_git urme_store urme_search urme_claude urme_engine urme_tui urme_mcp cmdliner))

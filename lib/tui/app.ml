@@ -347,6 +347,7 @@ let c_input_bg = lc _theme.input_bg
 let c_highlight = lc _theme.highlight
 let c_thinking = lc _theme.thinking
 let c_tool_name = lc _theme.tool_name
+let c_selection_bg = lc _theme.selection_bg
 let c_tool_result = lc _theme.tool_result
 let c_error = lc _theme.error
 let c_diff_add_fg = lc _theme.diff_add_fg
@@ -939,7 +940,7 @@ let draw_git_left_panels ctx state =
   let link_items = List.map (fun (link : git_conv_link) ->
     let sid = if String.length link.session_id > 4
       then String.sub link.session_id 0 4 else link.session_id in
-    (Printf.sprintf " %s t%d e%d" sid link.turn_idx link.entry_idx, false, false)
+    (Printf.sprintf " %s t%d e%d" sid (link.turn_idx + 1) link.entry_idx, false, false)
   ) g.link_candidates in
   let panels = [
     ("Branches", g.focus = Branches, branch_items, g.branch_idx);
@@ -1069,7 +1070,7 @@ let draw_history_results ctx state =
         let selected = i = h.result_idx in
         let marker = if selected then ">" else " " in
         let fg = if selected then c_highlight else c_fg in
-        let bg = if selected then c_status_bg else c_bg in
+        let bg = if selected then c_selection_bg else c_bg in
         let label = if user_text = "" then "(no text)" else
           let max_len = size.cols - 14 in
           if String.length user_text > max_len
@@ -1123,8 +1124,12 @@ let draw_history_content ctx state =
           | Some path -> Filename.basename path |> Filename.chop_extension
           | None -> "?" in
         let short_id = if String.length sid > 8 then String.sub sid 0 8 else sid in
-        Printf.sprintf " Session %s  Turn %d/%d  (session %d/%d)"
-          short_id (h.turn_idx + 1) n_turns (h.session_idx + 1) n_sessions in
+        let result_info = if h.search_results <> [] && not h.showing_results then
+          Printf.sprintf "  [result %d/%d, b=list, S-arrows=jump]"
+            (h.result_idx + 1) (List.length h.search_results)
+        else "" in
+        Printf.sprintf " Session %s  Turn %d/%d  (session %d/%d)%s"
+          short_id (h.turn_idx + 1) n_turns (h.session_idx + 1) n_sessions result_info in
     draw_str ctx 0 0
       ~style:LTerm_style.{ none with background = Some c_status_bg;
                                       foreground = Some c_highlight; bold = Some true }
@@ -1200,7 +1205,20 @@ let draw_input_line ctx input_row size state =
           (summarize_tool_input p.tool_name p.tool_input)
       | None -> if state.streaming then "..." else "> ")
     | Git -> " Tab/S-Tab=panel j/k=nav Enter=select [/]=scroll h=history Esc=back "
-    | History -> " <-/->step  /=search  i=index  Up/Down=scroll  q=exit " in
+    | History ->
+      let h = state.history in
+      if h.showing_results && h.return_mode = Git then
+        " Up/Down=select  Enter=view  Esc=back to git "
+      else if h.showing_results then
+        " Up/Down=select  Enter=view  /=new search  Esc=close "
+      else if h.search_active then
+        " type query...  Enter=search  Esc=cancel "
+      else if h.return_mode = Git && h.search_results <> [] then
+        " <-/->step  S-<-/S->=prev/next link  b=back to list  Esc=git  Up/Down=scroll "
+      else if h.search_results <> [] then
+        " <-/->step  S-<-/S->=prev/next result  b=back to list  /=search  q=exit "
+      else
+        " <-/->step  /=search  i=index  Up/Down=scroll  q=exit " in
   draw_str ctx input_row 0 ~style:ist
     (Printf.sprintf "%s%s%s" prompt state.input_text
        (String.make (max 0 (size.LTerm_geom.cols - String.length state.input_text
@@ -1412,15 +1430,39 @@ let switch_to_git mvar =
   redraw mvar;
   let* s = Lwt_mvar.take mvar in
   let* (git, debug) = load_git_data ~cwd:s.project_dir in
-  (* If in-memory git_links are empty, rebuild from ChromaDB *)
+  (* If in-memory git_links are empty, start ChromaDB if needed and load *)
   let* git_links =
     if Hashtbl.length s.git.git_links > 0 then
       Lwt.return s.git.git_links
     else begin
+      let port = s.config.chromadb_port in
+      let* () = Lwt_mvar.put mvar { s with status_extra = "Starting ChromaDB..." } in
+      redraw mvar;
+      let start_chroma () =
+        let chroma_dir = Filename.concat s.project_dir "chroma" in
+        (try Unix.mkdir chroma_dir 0o755 with Unix.Unix_error (Unix.EEXIST, _, _) -> ());
+        ignore (Sys.command (Printf.sprintf
+          "chroma run --port %d --path %s > /tmp/chromadb.log 2>&1 &" port chroma_dir));
+        let rec wait n =
+          if n <= 0 then Lwt.return_unit
+          else Lwt.catch (fun () ->
+            let uri = Uri.of_string (Printf.sprintf "http://[::1]:%d/api/v2/heartbeat" port) in
+            let* _resp, body = Cohttp_lwt_unix.Client.get uri in
+            let* _ = Cohttp_lwt.Body.to_string body in
+            Lwt.return_unit
+          ) (fun _ -> let* () = Lwt_unix.sleep 1.0 in wait (n - 1))
+        in wait 10
+      in
+      let* () = Lwt.catch (fun () ->
+        let uri = Uri.of_string (Printf.sprintf "http://[::1]:%d/api/v2/heartbeat" port) in
+        let* _resp, body = Cohttp_lwt_unix.Client.get uri in
+        let* _ = Cohttp_lwt.Body.to_string body in
+        Lwt.return_unit
+      ) (fun _ -> start_chroma ()) in
+      let* s = Lwt_mvar.take mvar in
       let* () = Lwt_mvar.put mvar { s with status_extra = "Loading git links..." } in
       redraw mvar;
-      let* links = load_git_links_from_chroma
-          ~port:s.config.chromadb_port
+      let* links = load_git_links_from_chroma ~port
           ~project:(Filename.basename s.project_dir) in
       let* s = Lwt_mvar.take mvar in
       ignore s; Lwt.return links
@@ -1597,7 +1639,8 @@ let index_sessions mvar =
               incr n_new;
               pending := (id, session_id, i,
                 interaction.user_text, interaction.assistant_summary,
-                interaction.user_uuid, interaction.timestamp) :: !pending
+                interaction.user_uuid, interaction.timestamp,
+                interaction.files_changed) :: !pending
             end
           ) interactions
         end
@@ -1628,7 +1671,12 @@ let index_sessions mvar =
         redraw mvar;
         Lwt.catch (fun () ->
           Urme_search.Chromadb.save_interactions_batch ~port ~collection_id batch
-        ) (fun _exn -> Lwt.return_unit)
+        ) (fun exn ->
+          let oc = open_out_gen [Open_append; Open_creat] 0o644 "/tmp/urme_debug.log" in
+          Printf.fprintf oc "[%.2f] Batch %d FAILED: %s\n%!" (Unix.gettimeofday ()) !batch_i
+            (Printexc.to_string exn);
+          close_out oc;
+          Lwt.return_unit)
       ) all_batches in
       (* Find sessions with interactions missing git_info *)
       let* all_ids =
@@ -2201,6 +2249,61 @@ let run ~config ~project_dir () =
     Unix._exit 0
   in
 
+  (* Navigate to result ri in the search_results list (works for both search and git links) *)
+  let jump_to_result s ri =
+    let h = s.history in
+    match List.nth_opt h.search_results ri with
+    | Some (session_id, user_text, _doc, _turn_idx, _ts, _dist) ->
+      let jsonl_dir = Urme_search.Jsonl_reader.find_jsonl_dir
+          ~project_dir:s.project_dir in
+      let path = Filename.concat jsonl_dir (session_id ^ ".jsonl") in
+      let new_si = let target = session_id ^ ".jsonl" in
+        let rec find i = function
+          | [] -> h.session_idx | p :: rest ->
+            if Filename.basename p = target then i else find (i+1) rest
+        in find 0 h.sessions in
+      if not (Sys.file_exists path) then s
+      else if h.return_mode = Git then
+        (* Git link: interaction-aligned turns + turn_idx *)
+        let turns = split_into_interaction_turns ~filepath:path in
+        let ti = min (max 0 (_turn_idx - 1)) (max 0 (List.length turns - 1)) in
+        let scroll_pos = match List.nth_opt turns ti,
+          List.nth_opt s.git.link_candidates ri with
+          | Some entries, Some link ->
+            let ec = ref 0 in let pos = ref 0 in let found = ref false in
+            List.iteri (fun i e -> if not !found then match e with
+              | Tool_use_block { tool_name; _ }
+                when tool_name = "Edit" || tool_name = "Write" ->
+                if !ec = link.entry_idx then (pos := i; found := true); incr ec
+              | _ -> ()) entries; !pos
+          | _ -> 0 in
+        { s with history = { h with result_idx = ri; session_idx = new_si;
+                                     showing_results = false;
+                                     turns; turn_idx = ti; hist_scroll = scroll_pos };
+                 git = { s.git with link_idx = ri };
+                 status_extra = Printf.sprintf "Link %d/%d"
+                   (ri + 1) (List.length h.search_results) }
+      else
+        (* Search result: match by user text *)
+        let turns = split_into_turns (load_session_entries path) in
+        let needle = String.trim user_text in
+        let ti = let rec f i = function
+          | [] -> min _turn_idx (max 0 (List.length turns - 1))
+          | turn :: rest ->
+            if List.exists (fun e -> match e with
+              | User_msg t -> let t = String.trim t in
+                (needle <> "" && String.length t >= String.length needle &&
+                 String.sub t 0 (String.length needle) = needle) || t = needle
+              | _ -> false) turn then i else f (i+1) rest
+          in f 0 turns in
+        { s with history = { h with result_idx = ri; session_idx = new_si;
+                                     showing_results = false;
+                                     turns; turn_idx = ti; hist_scroll = 0 };
+                 status_extra = Printf.sprintf "Result %d/%d"
+                   (ri + 1) (List.length h.search_results) }
+    | None -> s
+  in
+
   let rec loop () =
     let* event = LTerm_ui.wait ui in
     match event with
@@ -2420,15 +2523,55 @@ let run ~config ~project_dir () =
         { s with git = { g with diff_scroll_git = min (max 0 (n - 1)) (g.diff_scroll_git + 1) } }) in
       redraw mvar; loop ()
 
-    (* h: switch to history *)
+    (* h: switch to history — if file has links, show them as a navigable list *)
     | LTerm_event.Key { code = LTerm_key.Char ch; control = false; _ }
       when Uchar.to_int ch = Char.code 'h'
         && (match peek mvar with Some s -> s.mode = Git | None -> false) ->
-      let* () = switch_to_history mvar in loop ()
+      let has_file_links = match peek mvar with
+        | Some s ->
+          let g = s.git in
+          (match List.nth_opt g.commits g.commit_idx, List.nth_opt g.files g.file_idx with
+           | Some (sha, _, _), Some file ->
+             (match Hashtbl.find_opt g.git_links (sha, Filename.basename file) with
+              | Some (_ :: _) -> true | _ -> false)
+           | _ -> false)
+        | None -> false in
+      if has_file_links then begin
+        let* () = update mvar (fun s ->
+          let g = s.git in
+          let links = match List.nth_opt g.commits g.commit_idx, List.nth_opt g.files g.file_idx with
+            | Some (sha, _, _), Some file ->
+              (match Hashtbl.find_opt g.git_links (sha, Filename.basename file) with
+               | Some l -> l | None -> [])
+            | _ -> [] in
+          (* Convert links to search_results format *)
+          let results = List.mapi (fun i (link : git_conv_link) ->
+            let label = Printf.sprintf "t%d e%d %s"
+              link.turn_idx link.entry_idx link.edit_key in
+            (link.session_id, label, "", link.turn_idx, "", Float.of_int i)
+          ) links in
+          let jsonl_dir = Urme_search.Jsonl_reader.find_jsonl_dir
+              ~project_dir:s.project_dir in
+          let sessions = Urme_search.Jsonl_reader.list_sessions ~jsonl_dir in
+          { s with mode = History;
+                   history = { sessions; session_idx = 0;
+                               turns = []; turn_idx = 0; hist_scroll = 0;
+                               return_mode = Git;
+                               search_active = false; search_query = "";
+                               search_results = results; result_idx = 0;
+                               showing_results = true };
+                   git = { g with link_candidates = links; link_idx = 0 };
+                   status_extra = Printf.sprintf "%d links" (List.length links) }) in
+        redraw mvar; loop ()
+      end else begin
+        let* () = switch_to_history mvar in loop ()
+      end
 
     (* Enter: context-dependent activate *)
     | LTerm_event.Key { code = LTerm_key.Enter; _ }
-      when (match peek mvar with Some s -> s.mode = Git | None -> false) ->
+      when (match peek mvar with Some s -> s.mode = Git | None ->
+        let oc = open_out_gen [Open_append;Open_creat] 0o644 "/tmp/urme_key.log" in
+        Printf.fprintf oc "Enter: peek=None (mvar taken?)\n%!"; close_out oc; false) ->
       let* s = Lwt_mvar.take mvar in
       let g = s.git in
       let* () = match g.focus with
@@ -2508,6 +2651,7 @@ let run ~config ~project_dir () =
                (* Use interaction-aligned turns to match edit_extract's counting
                   (only String user messages start turns, not tool-result text) *)
                let turns = split_into_interaction_turns ~filepath:path in
+               (* turn_idx is 1-based from edit_extract; turns list is 0-indexed *)
                (* turn_idx is 1-based from edit_extract; turns list is 0-indexed *)
                let ti = min (max 0 (link.turn_idx - 1)) (max 0 (List.length turns - 1)) in
                let new_session_idx =
@@ -2602,62 +2746,21 @@ let run ~config ~project_dir () =
       when (match peek mvar with
             | Some s -> s.mode = History && s.history.showing_results | _ -> false) ->
       let* () = update mvar (fun s ->
-        { s with history = { s.history with showing_results = false; result_idx = 0 };
-                 status_extra = "History" }) in
+        if s.history.return_mode = Git then
+          (* Back to Git mode *)
+          { s with mode = Git; status_extra = "Git";
+                   history = { s.history with showing_results = false; result_idx = 0;
+                               search_results = [] } }
+        else
+          { s with history = { s.history with showing_results = false; result_idx = 0 };
+                   status_extra = "History" }) in
       redraw mvar; loop ()
 
     | LTerm_event.Key { code = LTerm_key.Enter; _ }
       when (match peek mvar with
             | Some s -> s.mode = History && s.history.showing_results | _ -> false) ->
-      (* Load selected result's session and jump to matching turn *)
       let* () = update mvar (fun s ->
-        let h = s.history in
-        match List.nth_opt h.search_results h.result_idx with
-        | Some (session_id, user_text, _doc, _turn_idx, _ts, _dist) ->
-          let jsonl_dir = Urme_search.Jsonl_reader.find_jsonl_dir
-              ~project_dir:s.project_dir in
-          let path = Filename.concat jsonl_dir (session_id ^ ".jsonl") in
-          (* Find session_idx matching this session_id *)
-          let new_session_idx =
-            let target = session_id ^ ".jsonl" in
-            let rec find i = function
-              | [] -> h.session_idx
-              | p :: rest ->
-                if Filename.basename p = target then i else find (i + 1) rest
-            in find 0 h.sessions in
-          if Sys.file_exists path then
-            let turns = split_into_turns (load_session_entries path) in
-            (* Find turn by matching user text content instead of index *)
-            let needle = String.trim user_text in
-            let ti =
-              let rec find_turn i = function
-                | [] -> min _turn_idx (max 0 (List.length turns - 1))
-                | turn :: rest ->
-                  let has_match = List.exists (fun e ->
-                    match e with
-                    | User_msg t ->
-                      let t = String.trim t in
-                      (* Match if user_text is a prefix (it may be truncated) *)
-                      (needle <> "" && String.length t >= String.length needle &&
-                       String.sub t 0 (String.length needle) = needle)
-                      || t = needle
-                    | _ -> false) turn in
-                  if has_match then i
-                  else find_turn (i + 1) rest
-              in find_turn 0 turns in
-            { s with history = { h with showing_results = false;
-                                         session_idx = new_session_idx;
-                                         turns; turn_idx = ti; hist_scroll = 0 };
-                     status_extra = Printf.sprintf "Session: %s turn %d"
-                       session_id (ti + 1) }
-          else
-            { s with history = { h with showing_results = false;
-                                         turns = [[System_info
-                                           (Printf.sprintf "Session %s not found"
-                                              session_id)]];
-                                         turn_idx = 0; hist_scroll = 0 };
-                     status_extra = "Session not found" }
-        | None -> s) in
+        jump_to_result s s.history.result_idx) in
       redraw mvar; loop ()
 
     | LTerm_event.Key { code = LTerm_key.Up; _ }
@@ -2745,6 +2848,42 @@ let run ~config ~project_dir () =
                 (Printexc.to_string exn) }) in
           redraw mvar; Lwt.return_unit));
       loop ()
+
+    (* Shift+Left/Right: jump to prev/next result (search or git link) *)
+    | LTerm_event.Key { code = LTerm_key.Left; shift = true; _ }
+      when (match peek mvar with
+            | Some s -> s.mode = History && s.history.search_results <> []
+                        && not s.history.showing_results | _ -> false) ->
+      let* () = update mvar (fun s ->
+        let ri = max 0 (s.history.result_idx - 1) in
+        if ri = s.history.result_idx then s
+        else jump_to_result s ri) in
+      redraw mvar; loop ()
+
+    | LTerm_event.Key { code = LTerm_key.Right; shift = true; _ }
+      when (match peek mvar with
+            | Some s -> s.mode = History && s.history.search_results <> []
+                        && not s.history.showing_results | _ -> false) ->
+      let* () = update mvar (fun s ->
+        let max_ri = max 0 (List.length s.history.search_results - 1) in
+        let ri = min max_ri (s.history.result_idx + 1) in
+        if ri = s.history.result_idx then s
+        else jump_to_result s ri) in
+      redraw mvar; loop ()
+
+    (* b: back to results list *)
+    | LTerm_event.Key { code = LTerm_key.Char c; control = false; _ }
+      when (match peek mvar with
+            | Some s -> s.mode = History && s.history.search_results <> []
+                        && not s.history.showing_results | _ -> false)
+        && (is_char c 'b') ->
+      let* () = update mvar (fun s ->
+        let label = if s.history.return_mode = Git then
+          Printf.sprintf "%d links" (List.length s.history.search_results)
+        else Printf.sprintf "Search: \"%s\"" s.history.search_query in
+        { s with history = { s.history with showing_results = true };
+                 status_extra = label }) in
+      redraw mvar; loop ()
 
     | LTerm_event.Key { code = LTerm_key.Left; _ }
       when (match peek mvar with Some s -> s.mode = History | None -> false) ->

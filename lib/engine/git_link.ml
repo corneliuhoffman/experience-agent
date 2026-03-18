@@ -310,8 +310,10 @@ let update_index ~project_dir ~port ~collection_id
             let record_match (edit : edit) =
               incr n_matched;
               Hashtbl.replace matched_unique edit.edit_key ();
+              (* interaction_index is 1-based from edit_extract;
+                 ChromaDB IDs are 0-based from parse_interactions *)
               let iid = Printf.sprintf "%s_%d" edit.session_id
-                edit.interaction_index in
+                (edit.interaction_index - 1) in
               let existing = match Hashtbl.find_opt gi_updates iid with
                 | Some l -> l | None -> [] in
               Hashtbl.replace gi_updates iid

@@ -10,6 +10,31 @@ let base_url port =
 
 let ollama_url = "http://127.0.0.1:11434"
 
+(* Strip invalid UTF-8 bytes to prevent ChromaDB JSON parse errors *)
+let sanitize s =
+  let buf = Buffer.create (String.length s) in
+  let len = String.length s in
+  let i = ref 0 in
+  while !i < len do
+    let c = Char.code s.[!i] in
+    if c < 0x80 then (Buffer.add_char buf s.[!i]; incr i)
+    else if c < 0xC0 then (Buffer.add_char buf '?'; incr i)
+    else if c < 0xE0 then
+      (if !i+1 < len && Char.code s.[!i+1] >= 0x80 && Char.code s.[!i+1] < 0xC0
+       then (Buffer.add_string buf (String.sub s !i 2); i := !i+2)
+       else (Buffer.add_char buf '?'; incr i))
+    else if c < 0xF0 then
+      (if !i+2 < len && Char.code s.[!i+1] >= 0x80 && Char.code s.[!i+2] >= 0x80
+       then (Buffer.add_string buf (String.sub s !i 3); i := !i+3)
+       else (Buffer.add_char buf '?'; incr i))
+    else if c < 0xF8 then
+      (if !i+3 < len && Char.code s.[!i+1] >= 0x80 && Char.code s.[!i+2] >= 0x80 && Char.code s.[!i+3] >= 0x80
+       then (Buffer.add_string buf (String.sub s !i 4); i := !i+4)
+       else (Buffer.add_char buf '?'; incr i))
+    else (Buffer.add_char buf '?'; incr i)
+  done;
+  Buffer.contents buf
+
 let safe_to_list j =
   match j with
   | `List l -> l
@@ -110,6 +135,16 @@ let embed_text text =
   let chunks = chunk_text ~max_chars:2000 text in
   let* embeddings = Lwt_list.map_s embed_single chunks in
   Lwt.return (average_embeddings embeddings)
+
+(* Embed semantic chunks — each chunk is a meaningful unit, embedded separately and averaged *)
+let embed_chunks chunks =
+  let non_empty = List.filter (fun s -> String.trim s <> "") chunks in
+  if non_empty = [] then embed_text ""
+  else
+    (* Each chunk may still be >2000 chars, so sub-chunk if needed *)
+    let all_sub = List.concat_map (chunk_text ~max_chars:2000) non_empty in
+    let* embeddings = Lwt_list.map_s embed_single all_sub in
+    Lwt.return (average_embeddings embeddings)
 
 (* Batch embed multiple texts at once via Ollama *)
 let embed_texts texts =
@@ -337,15 +372,18 @@ let get_interaction_meta ~port ~collection_id ~id =
     Lwt.return_some meta
 
 (* Save a single interaction document into the interactions collection.
-   The document text is "User: <question>\nAssistant: <summary truncated to 500 chars>" *)
+   Embeds semantic chunks (user text, assistant texts, files) separately and averages. *)
 let save_interaction ~port ~collection_id ~experience_id ~interaction_index
-    ~user_text ~assistant_summary ~user_uuid ~timestamp
+    ~user_text ~assistant_summary ?(files_changed=[]) ~user_uuid ~timestamp
     ?(git_info="") () =
-  let summary_trunc =
-    if String.length assistant_summary <= 500 then assistant_summary
-    else String.sub assistant_summary 0 500 ^ "..." in
-  let document = Printf.sprintf "User: %s\nAssistant: %s" user_text summary_trunc in
-  let* embedding = embed_text document in
+  let files_str = if files_changed = [] then ""
+    else "Files: " ^ String.concat ", " (List.map Filename.basename files_changed) in
+  (* Semantic chunks: user question, files, each assistant paragraph *)
+  let assistant_chunks = String.split_on_char '\n' assistant_summary
+    |> List.filter (fun s -> String.trim s <> "") in
+  let chunks = [user_text; files_str] @ assistant_chunks in
+  let document = String.concat "\n" (List.filter (fun s -> s <> "") chunks) in
+  let* embedding = embed_chunks chunks in
   let id = Printf.sprintf "%s_%d" experience_id interaction_index in
   let git_fields = if git_info <> "" then [
     "git_info", `String git_info;
@@ -354,8 +392,7 @@ let save_interaction ~port ~collection_id ~experience_id ~interaction_index
     "experience_id", `String experience_id;
     "interaction_index", `Int interaction_index;
     "user_uuid", `String user_uuid;
-    "user_text", `String (if String.length user_text <= 200 then user_text
-                          else String.sub user_text 0 200 ^ "...");
+    "user_text", `String (sanitize user_text);
     "timestamp", `String timestamp;
   ] @ git_fields) in
   let body = `Assoc [
@@ -368,27 +405,27 @@ let save_interaction ~port ~collection_id ~experience_id ~interaction_index
     ~path:(Printf.sprintf "/collections/%s/add" collection_id) ~body in
   ()
 
-(* Batch-save multiple interactions in one Ollama + one ChromaDB call.
+(* Batch-save multiple interactions with semantic chunk embeddings.
    items: list of (id, experience_id, interaction_index, user_text,
-                   assistant_summary, user_uuid, timestamp) *)
+                   assistant_summary, user_uuid, timestamp, files_changed) *)
 let save_interactions_batch ~port ~collection_id items =
   if items = [] then Lwt.return_unit
   else
-    let documents = List.map (fun (_id, _eid, _idx, user_text, assistant_summary, _uuid, _ts) ->
-      let summary_trunc =
-        if String.length assistant_summary <= 500 then assistant_summary
-        else String.sub assistant_summary 0 500 ^ "..." in
-      Printf.sprintf "User: %s\nAssistant: %s" user_text summary_trunc
-    ) items in
+    (* Build full documents with files, then batch-embed *)
+    let documents = List.map
+      (fun (_id, _eid, _idx, user_text, assistant_summary, _uuid, _ts, files_changed) ->
+        let files_str = if files_changed = [] then ""
+          else "\nFiles: " ^ String.concat ", " (List.map Filename.basename files_changed) in
+        sanitize (Printf.sprintf "User: %s%s\n%s" user_text files_str assistant_summary)
+      ) items in
     let* embeddings = embed_texts documents in
-    let ids = List.map (fun (id, _, _, _, _, _, _) -> `String id) items in
-    let metadatas = List.map (fun (_id, eid, idx, user_text, _summary, uuid, ts) ->
+    let ids = List.map (fun (id, _, _, _, _, _, _, _) -> `String id) items in
+    let metadatas = List.map (fun (_id, eid, idx, user_text, _summary, uuid, ts, _files) ->
       `Assoc [
         "experience_id", `String eid;
         "interaction_index", `Int idx;
         "user_uuid", `String uuid;
-        "user_text", `String (if String.length user_text <= 200 then user_text
-                              else String.sub user_text 0 200 ^ "...");
+        "user_text", `String (sanitize user_text);
         "timestamp", `String ts;
       ]
     ) items in
@@ -401,9 +438,20 @@ let save_interactions_batch ~port ~collection_id items =
       "embeddings", `List emb_json;
       "metadatas", `List metadatas;
     ] in
-    let+ _resp = http_post ~port
+    let+ resp = http_post ~port
       ~path:(Printf.sprintf "/collections/%s/add" collection_id) ~body in
-    ()
+    let open Yojson.Safe.Util in
+    (match resp |> member "error" |> to_string_option with
+     | Some err ->
+       let oc = open_out_gen [Open_append; Open_creat] 0o644 "/tmp/urme_debug.log" in
+       let n = List.length items in
+       let first_id = match items with (id,_,_,_,_,_,_,_)::_ -> id | [] -> "?" in
+       let msg = resp |> member "message" |> to_string_option
+         |> Option.value ~default:"" in
+       Printf.fprintf oc "[%.2f] ChromaDB add FAILED (%d items, first=%s): %s: %s\n%!"
+         (Unix.gettimeofday ()) n first_id err msg;
+       close_out oc
+     | None -> ())
 
 (* Update git_info JSON on an existing interaction *)
 let update_interaction_git_info ~port ~collection_id ~id ~git_info =
@@ -443,16 +491,16 @@ let search_interactions ~port ~collection_id ~experience_id ~query ~n =
           |> Option.value ~default:"" in
         (idx, user_uuid, distance))
 
-(* Search all interactions across all sessions *)
-let search_all_interactions ~port ~collection_id ~query ~n =
-  let* embedding = embed_text query in
-  let body = `Assoc [
-    "query_embeddings", `List [`List (List.map (fun f -> `Float f) embedding)];
-    "n_results", `Int n;
-    "include", `List [`String "documents"; `String "metadatas"; `String "distances"];
-  ] in
-  let+ resp = http_post ~port
-    ~path:(Printf.sprintf "/collections/%s/query" collection_id) ~body in
+(* Extract file-like tokens from query for text search *)
+let extract_file_tokens query =
+  String.split_on_char ' ' query
+  |> List.filter_map (fun w ->
+    let w = String.trim w in
+    if String.contains w '.' && String.length w > 2 then Some w
+    else None)
+
+(* Parse ChromaDB query response into result tuples *)
+let parse_query_results resp =
   let open Yojson.Safe.Util in
   let ids_outer = resp |> member "ids" |> safe_to_list in
   match ids_outer with
@@ -472,7 +520,7 @@ let search_all_interactions ~port ~collection_id ~query ~n =
         List.map2 (fun (a,b) (c,d) -> (a,b,c,d))
           (List.combine a b) (List.combine c d) in
       combine4 ids distances metadatas documents
-      |> List.map (fun (_id, distance, meta, doc) ->
+      |> List.map (fun (id, distance, meta, doc) ->
         let session_id = meta |> member "experience_id" |> to_string_option
           |> Option.value ~default:"" in
         let user_text = meta |> member "user_text" |> to_string_option
@@ -481,7 +529,71 @@ let search_all_interactions ~port ~collection_id ~query ~n =
           |> Option.value ~default:"" in
         let interaction_index = meta |> member "interaction_index" |> to_int_option
           |> Option.value ~default:0 in
-        (session_id, user_text, doc, interaction_index, timestamp, distance))
+        (id, session_id, user_text, doc, interaction_index, timestamp, distance))
+
+(* Search all interactions: vector search + text search for file names, merged and deduped *)
+let search_all_interactions ~port ~collection_id ~query ~n =
+  let* embedding = embed_text query in
+  (* 1. Vector similarity search *)
+  let vector_body = `Assoc [
+    "query_embeddings", `List [`List (List.map (fun f -> `Float f) embedding)];
+    "n_results", `Int (n * 2);
+    "include", `List [`String "documents"; `String "metadatas"; `String "distances"];
+  ] in
+  let p_vector = http_post ~port
+    ~path:(Printf.sprintf "/collections/%s/query" collection_id) ~body:vector_body in
+  (* 2. Text search for file tokens (if query mentions files) *)
+  let file_tokens = extract_file_tokens query in
+  let p_text = if file_tokens = [] then Lwt.return []
+    else
+      (* Search for each file token via where_document $contains *)
+      Lwt_list.map_s (fun tok ->
+        let body = `Assoc [
+          "query_embeddings", `List [`List (List.map (fun f -> `Float f) embedding)];
+          "n_results", `Int n;
+          "where_document", `Assoc ["$contains", `String tok];
+          "include", `List [`String "documents"; `String "metadatas"; `String "distances"];
+        ] in
+        Lwt.catch (fun () ->
+          let+ resp = http_post ~port
+            ~path:(Printf.sprintf "/collections/%s/query" collection_id) ~body in
+          parse_query_results resp
+        ) (fun _ -> Lwt.return [])
+      ) file_tokens in
+  let* vector_resp = p_vector
+  and* text_results = p_text in
+  let vector_results = parse_query_results vector_resp in
+  let text_results_flat = List.concat text_results in
+  (* Merge: text matches get a distance bonus (lower = better) *)
+  let text_ids = Hashtbl.create 32 in
+  List.iter (fun (id, _, _, _, _, _, _) ->
+    Hashtbl.replace text_ids id ()
+  ) text_results_flat;
+  let boosted = List.map (fun (id, sid, ut, doc, idx, ts, dist) ->
+    let bonus = if Hashtbl.mem text_ids id then 0.8 else 0.0 in
+    (sid, ut, doc, idx, ts, dist -. bonus)
+  ) vector_results in
+  (* Add text-only results not in vector results *)
+  let vector_id_set = Hashtbl.create 64 in
+  List.iter (fun (id, _, _, _, _, _, _) ->
+    Hashtbl.replace vector_id_set id ()
+  ) vector_results;
+  let text_only = List.filter_map (fun (id, sid, ut, doc, idx, ts, dist) ->
+    if Hashtbl.mem vector_id_set id then None
+    else Some (sid, ut, doc, idx, ts, dist -. 0.5)
+  ) text_results_flat in
+  let all = boosted @ text_only in
+  (* Dedupe by session_id+interaction_index, keep best score *)
+  let seen = Hashtbl.create 64 in
+  let deduped = List.filter (fun (sid, _, _, idx, _, dist) ->
+    let key = Printf.sprintf "%s_%d" sid idx in
+    match Hashtbl.find_opt seen key with
+    | Some prev_dist when prev_dist <= dist -> false
+    | _ -> Hashtbl.replace seen key dist; true
+  ) all in
+  let sorted = List.sort (fun (_, _, _, _, _, a) (_, _, _, _, _, b) ->
+    Float.compare a b) deduped in
+  Lwt.return (List.filteri (fun i _ -> i < n) sorted)
 
 (* Fetch all interactions that have non-empty git_info, paged.
    Returns list of (id, git_info_string, experience_id, interaction_index). *)

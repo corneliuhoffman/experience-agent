@@ -178,6 +178,15 @@ let prune_cmd =
   Cmd.v (Cmd.info "prune" ~doc:"Remove old experiences")
     Term.(const run $ date $ project_dir $ chromadb_port)
 
+(* --- Subcommand: serve (MCP server) --- *)
+
+let serve_cmd =
+  let run project_dir chromadb_port =
+    Lwt_main.run (Urme_mcp.Server.run ~port:chromadb_port ~project_dir)
+  in
+  Cmd.v (Cmd.info "serve" ~doc:"Run MCP server over stdio (JSON-RPC 2.0)")
+    Term.(const run $ project_dir $ chromadb_port)
+
 (* --- Default command: launch TUI --- *)
 
 let default_run project_dir _chromadb_port =
@@ -193,11 +202,11 @@ let () =
   (try Lwt_engine.set (new Lwt_engine.libev ())
    with Lwt_sys.Not_available _ -> ());
   let doc = "OCaml CLI orchestration layer for Claude + GitHub" in
-  let info = Cmd.info "urme" ~doc ~version:"0.1.0" in
+  let info = Cmd.info "urme" ~doc ~version:"0.2.0" in
   let default = Term.(const default_run $ project_dir $ chromadb_port) in
   let cmd = Cmd.group ~default info [
     ask_cmd; search_cmd; init_cmd; history_cmd;
     blame_cmd; explain_cmd; save_cmd; replay_cmd;
-    pr_cmd; diff_cmd; wipe_cmd; prune_cmd;
+    pr_cmd; diff_cmd; wipe_cmd; prune_cmd; serve_cmd;
   ] in
   exit (Cmd.eval cmd)
