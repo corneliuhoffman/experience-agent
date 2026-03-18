@@ -1,4 +1,4 @@
-# Experience Agent
+# Experience Agents
 
 OCaml MCP server that gives Claude Code persistent experience memory — save, search, replay, and undo past work across sessions.
 
@@ -20,12 +20,6 @@ make build   # build and copy binary to bin/experience-agent
 make clean   # remove build artifacts
 ```
 
-## Quick Start
-
-```
-./scripts/start.sh   # check prerequisites, install if needed, start services
-./scripts/stop.sh    # stop Ollama and ChromaDB
-```
 
 `start.sh` will:
 1. Check for Ollama and ChromaDB, offer to install if missing (supports macOS/apt/dnf/pacman)

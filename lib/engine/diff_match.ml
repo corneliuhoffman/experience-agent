@@ -91,32 +91,29 @@ let match_edits ~content_before ~content_after ~commit_ts ~file_base ~branch_fil
       let cc = !current in
       match find_substring edit.new_string cc with
       | None ->
-        (* new_string not in current — human may have edited.
-           Only try merge-file if old_string is in content_before
-           (confirms this edit belongs to this commit). *)
-        if false then begin ignore edit;
+        (* new_string not in current — human may have edited Claude's output.
+           Check if old_string is in content_before to confirm this edit
+           belongs to this commit, then find what replaced new_string. *)
+        if find_substring edit.old_string content_before <> None then begin
+          (* This edit belongs to this commit but human modified the result.
+             Try to find old_string in current — if it's there, the human
+             reverted Claude's change. *)
           let cc = !current in
-          let tmpdir = Filename.temp_dir "urme" "m3" in
-          let wf name s =
-            let p = Filename.concat tmpdir name in
-            let oc = open_out p in output_string oc s; close_out oc; p in
-          let cur_f = wf "cur" cc in
-          let base_f = wf "base" content_after in
-          let other_f = wf "other" content_before in
-          let rc = Sys.command (Printf.sprintf "git merge-file %s %s %s 2>/dev/null"
-            (Filename.quote cur_f) (Filename.quote base_f) (Filename.quote other_f)) in
-          let ic = open_in cur_f in let n = in_channel_length ic in
-          let b = Bytes.create n in really_input ic b 0 n; close_in ic;
-          let applied = Bytes.to_string b in
-          ignore (Sys.command (Printf.sprintf "rm -rf %s" (Filename.quote tmpdir)));
-          if rc = 0 && applied <> cc then begin
-            current := applied;
+          match find_substring edit.old_string cc with
+          | Some pos ->
+            (* old_string is still in current — human reverted this edit.
+               Record as human edit with the original content. *)
+            let context_start = max 0 (pos - 20) in
+            let context_end = min (String.length cc) (pos + String.length edit.old_string + 20) in
+            let human_text = String.sub cc context_start (context_end - context_start) in
             matched := edit :: !matched;
-            warnings := (Printf.sprintf "HUMAN %s: merge-file ok"
+            warnings := (Printf.sprintf "HUMAN %s: human kept original (reverted Claude)"
+              edit.edit_key) :: !warnings;
+            ignore human_text
+          | None ->
+            (* Neither old_string nor new_string in current — human rewrote this section *)
+            warnings := (Printf.sprintf "HUMAN %s: human rewrote this section"
               edit.edit_key) :: !warnings
-          end else
-            warnings := (Printf.sprintf "MISS %s: merge-file rc=%d"
-              edit.edit_key rc) :: !warnings
         end else
           warnings := (Printf.sprintf "MISS %s: old_string not in content_before"
             edit.edit_key) :: !warnings

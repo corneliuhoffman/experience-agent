@@ -290,6 +290,7 @@ let update_index ~project_dir ~port ~collection_id
     let gi_updates : (string, (string * git_info option) list) Hashtbl.t =
       Hashtbl.create 256 in
     let links : (string * string, link list) Hashtbl.t = Hashtbl.create 256 in
+    let human_edits : (string * string, bool) Hashtbl.t = Hashtbl.create 256 in
     let* () = lwt_iter ~n:(ncpu * 2) (fun (sha, commit_ts, files) ->
       let relevant_files = List.filter (fun f ->
         Hashtbl.mem edit_file_bases (Filename.basename f)) files in
@@ -338,7 +339,11 @@ let update_index ~project_dir ~port ~collection_id
               else if edit.old_string <> "" then begin
                 let cc = !current_content in
                 match find_substring edit.new_string cc with
-                | None -> ()
+                | None ->
+                  (* Claude's new_string not found — human may have modified it *)
+                  if find_substring edit.old_string cc <> None then
+                    (* old_string still there: human reverted/modified Claude's edit *)
+                    Hashtbl.replace human_edits (sha, file_base) true
                 | Some pos ->
                   let ns_len = String.length edit.new_string in
                   let cc_len = String.length cc in
@@ -362,6 +367,9 @@ let update_index ~project_dir ~port ~collection_id
                 stop := true
               end
             ) candidates;
+            (* If content wasn't fully undone, human also edited this file *)
+            if !current_content <> "" && !current_content <> content_after then
+              Hashtbl.replace human_edits (sha, file_base) true;
             Lwt.return_unit
         end
       ) relevant_files
@@ -426,9 +434,9 @@ let update_index ~project_dir ~port ~collection_id
       ) tbl
     ) fresh_gis;
 
-    Lwt.return (links, !n_edits, Hashtbl.length matched_unique,
+    Lwt.return (links, human_edits, !n_edits, Hashtbl.length matched_unique,
                 !n_commits, !n_relinked)
   ) (fun exn ->
     let _ = Printexc.to_string exn in
-    Lwt.return (Hashtbl.create 0, !n_edits, Hashtbl.length matched_unique,
-                !n_commits, !n_relinked))
+    Lwt.return (Hashtbl.create 0, Hashtbl.create 0, !n_edits,
+                Hashtbl.length matched_unique, !n_commits, !n_relinked))

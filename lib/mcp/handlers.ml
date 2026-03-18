@@ -91,6 +91,16 @@ let rec provenance_to_json = function
       | DirectEdit _ -> Some (provenance_to_json p) | _ -> None) provs in
     `Assoc ["type", `String "incoming_merge";
             "branch", `String branch; "items", `List items]
+  | HumanEdit (e, human_text) ->
+    `Assoc [
+      "type", `String "human_edit";
+      "edit_key", `String e.edit_key;
+      "file", `String e.file_base;
+      "claude_new_string", `String (if String.length e.new_string > 200
+        then String.sub e.new_string 0 200 ^ "..." else e.new_string);
+      "human_version", `String (if String.length human_text > 200
+        then String.sub human_text 0 200 ^ "..." else human_text);
+    ]
   | ConflictChoice _ -> `Assoc ["type", `String "conflict_choice"]
   | ConflictResolution _ -> `Assoc ["type", `String "conflict_resolution"]
   | Unexplained msg -> `Assoc ["type", `String "unexplained"; "message", `String msg]

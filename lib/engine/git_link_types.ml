@@ -30,6 +30,7 @@ type conflict_resolution =
 
 type provenance =
   | DirectEdit of edit
+  | HumanEdit of edit * string  (* Claude's edit + what human changed it to *)
   | Incoming of provenance list * string
   | ConflictChoice of conflict_resolution
   | ConflictResolution of edit

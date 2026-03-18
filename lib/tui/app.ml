@@ -105,6 +105,8 @@ type git_state = {
   file_diff_filter : string option;
   git_links : (string * string, git_conv_link list) Hashtbl.t;
     (* (commit_sha, file_basename) → links, multiple edits may map to same commit+file *)
+  human_edits : (string * string, bool) Hashtbl.t;
+    (* (commit_sha, file_basename) → true if human also edited *)
   link_candidates : git_conv_link list;
 }
 
@@ -128,7 +130,7 @@ let empty_git_state = {
   focus = Branches; branch_idx = 0; commit_idx = 0; file_idx = 0;
   link_idx = 0; diff_preview = ""; diff_scroll_git = 0;
   file_diff_filter = None; git_links = Hashtbl.create 0;
-  link_candidates = [];
+  human_edits = Hashtbl.create 0; link_candidates = [];
 }
 
 let empty_history_state = {
@@ -856,9 +858,9 @@ let draw_git_panel ctx ~row_start ~height ~title ~focused ~items ~sel_idx ~width
         let row = row_start + 1 + vi in
         let selected = focused && i = sel_idx in
         let fg = if selected then c_highlight
-                 else if is_dim then c_separator
-                 else if is_current then c_assistant
-                 else c_fg in
+                 else if is_dim then c_separator  (* no data *)
+                 else if is_current then c_user    (* human edited *)
+                 else c_fg in                      (* claude only *)
         let bg = if selected then c_status_bg else c_bg in
         let label_trunc = if String.length label > width - 1
           then String.sub label 0 (width - 1) else label in
@@ -935,7 +937,10 @@ let draw_git_left_panels ctx state =
   let file_items = List.map (fun f ->
     let fb = Filename.basename f in
     let has_links = Hashtbl.mem g.git_links (cur_sha, fb) in
-    ("  " ^ f, false, not has_links)
+    let has_human = Hashtbl.mem g.human_edits (cur_sha, fb) in
+    (* no Claude links = human edit; has_human = Claude + human mixed *)
+    let is_human = not has_links || has_human in
+    ("  " ^ f, is_human, false)
   ) g.files in
   let sorted_links = List.sort (fun (a : git_conv_link) (b : git_conv_link) ->
     let c = Int.compare a.turn_idx b.turn_idx in
@@ -1393,6 +1398,7 @@ let load_git_data ~cwd =
                focus = Branches; branch_idx = 0; commit_idx = 0; file_idx = 0;
                link_idx = 0; diff_preview; diff_scroll_git = 0;
                file_diff_filter = None; git_links = Hashtbl.create 0;
+               human_edits = Hashtbl.create 0;
                link_candidates = [] }, debug)
 
 (* Rebuild in-memory git_links from ChromaDB's git_info metadata *)
@@ -1716,12 +1722,12 @@ let index_sessions mvar =
               Printf.sprintf "Git links: scanning %d sessions (%d new)..."
                 n_scan !n_new }) in
         redraw mvar;
-        let* (git_links, gl_edits, gl_matched, _gl_commits, _gl_relinked) =
+        let* (git_links, human_edits, gl_edits, gl_matched, _gl_commits, _gl_relinked) =
           update_git_links ~project_dir:cwd ~port ~collection_id
             ~sessions_filter:sids mvar in
         let n_links = Hashtbl.length git_links in
         let* () = update mvar (fun s ->
-          { s with git = { s.git with git_links };
+          { s with git = { s.git with git_links; human_edits };
                    status_extra =
               Printf.sprintf "Done: %d new, %d scanned | %d edits, %d matched, %d links"
                 !n_new n_scan gl_edits gl_matched n_links }) in
