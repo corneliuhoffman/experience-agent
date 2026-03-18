@@ -192,6 +192,8 @@ let match_edits ~content_before ~content_after ~commit_ts ~file_base ~branch_fil
         let sample = String.sub ns 0 (min 100 (String.length ns)) in
         match find_substring sample cc with
         | Some _ ->
+          (* Write matched — supersedes all older edits *)
+          current := content_before;
           matched := edit :: !matched
         | None ->
           warnings := (Printf.sprintf "MISS %s: Write content not in current"

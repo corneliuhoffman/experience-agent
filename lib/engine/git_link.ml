@@ -270,11 +270,12 @@ let update_index ~project_dir ~port ~collection_id
     and* sorted_edits = p_phase3 in
 
     (* Phase 4: Commit-centric matching *)
+    (* Index edits by file_base, preserving newest-first order *)
     let edit_index = Hashtbl.create 256 in
     List.iter (fun e ->
       let existing = match Hashtbl.find_opt edit_index e.file_base with
         | Some l -> l | None -> [] in
-      Hashtbl.replace edit_index e.file_base (e :: existing)
+      Hashtbl.replace edit_index e.file_base (existing @ [e])
     ) sorted_edits;
     let edit_file_bases = Hashtbl.create (Hashtbl.length edit_index) in
     Hashtbl.iter (fun fb _ -> Hashtbl.replace edit_file_bases fb ()) edit_index;
@@ -331,8 +332,10 @@ let update_index ~project_dir ~port ~collection_id
                 | Some l -> l | None -> [] in
               Hashtbl.replace links lk (el @ [lnk])
             in
+            let stop = ref false in
             List.iter (fun edit ->
-              if edit.old_string <> "" then begin
+              if !stop then ()
+              else if edit.old_string <> "" then begin
                 let cc = !current_content in
                 match find_substring edit.new_string cc with
                 | None -> ()
@@ -353,14 +356,10 @@ let update_index ~project_dir ~port ~collection_id
                    | None ->
                      current_content := undone; record_match edit)
               end else if edit.new_string <> "" then begin
-                let ns = edit.new_string in
-                let cc = !current_content in
-                let check_len = min (String.length ns) (String.length cc) in
-                if check_len > 20 then
-                  let sample = String.sub ns 0 (min 100 (String.length ns)) in
-                  match find_substring sample cc with
-                  | Some _ -> record_match edit
-                  | None -> ()
+                (* Write = full file replacement. Record it and stop —
+                   everything older is superseded *)
+                record_match edit;
+                stop := true
               end
             ) candidates;
             Lwt.return_unit

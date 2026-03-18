@@ -937,11 +937,15 @@ let draw_git_left_panels ctx state =
     let has_links = Hashtbl.mem g.git_links (cur_sha, fb) in
     ("  " ^ f, false, not has_links)
   ) g.files in
+  let sorted_links = List.sort (fun (a : git_conv_link) (b : git_conv_link) ->
+    let c = Int.compare a.turn_idx b.turn_idx in
+    if c <> 0 then c else Int.compare a.entry_idx b.entry_idx
+  ) g.link_candidates in
   let link_items = List.map (fun (link : git_conv_link) ->
     let sid = if String.length link.session_id > 4
       then String.sub link.session_id 0 4 else link.session_id in
     (Printf.sprintf " %s t%d e%d" sid (link.turn_idx + 1) link.entry_idx, false, false)
-  ) g.link_candidates in
+  ) sorted_links in
   let panels = [
     ("Branches", g.focus = Branches, branch_items, g.branch_idx);
     ("Commits", g.focus = Commits, commit_items, g.commit_idx);
@@ -2547,7 +2551,7 @@ let run ~config ~project_dir () =
           (* Convert links to search_results format *)
           let results = List.mapi (fun i (link : git_conv_link) ->
             let label = Printf.sprintf "t%d e%d %s"
-              link.turn_idx link.entry_idx link.edit_key in
+              (link.turn_idx + 1) link.entry_idx link.edit_key in
             (link.session_id, label, "", link.turn_idx, "", Float.of_int i)
           ) links in
           let jsonl_dir = Urme_search.Jsonl_reader.find_jsonl_dir
