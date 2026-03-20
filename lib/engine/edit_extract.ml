@@ -50,12 +50,18 @@ let edits_of_session ~filepath =
       | Some "user" ->
         let content = json |> member "message" |> member "content" in
         (match content with
-         | `String _ ->
-           incr current_iidx;
-           edit_in_turn := 0;
-           let branch = json |> member "gitBranch" |> to_string_option
-             |> Option.value ~default:"" in
-           if branch <> "" then current_branch := branch
+         | `String s ->
+           (* Skip internal noise to match split_into_interaction_turns *)
+           let s = String.trim s in
+           let is_noise = s = "" ||
+             (String.length s > 0 && s.[0] = '<') in
+           if not is_noise then begin
+             incr current_iidx;
+             edit_in_turn := 0;
+             let branch = json |> member "gitBranch" |> to_string_option
+               |> Option.value ~default:"" in
+             if branch <> "" then current_branch := branch
+           end
          | _ -> ())
       | Some "assistant" ->
         let ts_str = json |> member "timestamp" |> to_string_option

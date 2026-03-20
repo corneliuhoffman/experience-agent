@@ -960,7 +960,7 @@ let draw_git_left_panels ctx state =
       let sid = if String.length link.session_id > 4
         then String.sub link.session_id 0 4 else link.session_id in
       let marker = if is_human_mod then "H" else " " in
-      (Printf.sprintf "%s%s t%d e%d" marker sid (link.turn_idx + 1) link.entry_idx,
+      (Printf.sprintf "%s%s t%d e%d" marker sid link.turn_idx link.entry_idx,
        is_human, false)
   ) sorted_links in
   let panels = [
@@ -2276,6 +2276,49 @@ let run ~config ~project_dir () =
     let h = s.history in
     match List.nth_opt h.search_results ri with
     | Some (session_id, user_text, _doc, _turn_idx, _ts, _dist) ->
+      (* Check if this is a human edit link *)
+      let is_human_link = match List.nth_opt s.git.link_candidates ri with
+        | Some link ->
+          let ek = link.edit_key in
+          (String.length ek > 6 && String.sub ek (String.length ek - 6) 6 = ":human") ||
+          (String.length ek > 11 && String.sub ek (String.length ek - 11) 11 = ":human-only")
+        | None -> false in
+      if is_human_link && session_id = "" then
+        (* Purely human edit (no Claude session) — show info *)
+        let link_opt = List.nth_opt s.git.link_candidates ri in
+        let commit_sha = match link_opt with Some l -> l.commit_sha | None -> "" in
+        let file = match link_opt with Some l -> l.file | None -> "" in
+        let short = if String.length commit_sha > 7
+          then String.sub commit_sha 0 7 else commit_sha in
+        let info = Printf.sprintf "Human edit to %s in commit %s\n\nThis change was made directly by the user, not by Claude." file short in
+        { s with history = { h with showing_results = false; result_idx = ri;
+                                     turns = [[System_info info]];
+                                     turn_idx = 0; hist_scroll = 0 };
+                 status_extra = Printf.sprintf "Human edit: %s (%s)" file short }
+      else if is_human_link then
+        (* Human modification of a Claude edit — show Claude's turn with a note *)
+        let jsonl_dir = Urme_search.Jsonl_reader.find_jsonl_dir
+            ~project_dir:s.project_dir in
+        let path = Filename.concat jsonl_dir (session_id ^ ".jsonl") in
+        if Sys.file_exists path then
+          let turns = split_into_interaction_turns ~filepath:path in
+          let ti = min (max 0 (_turn_idx - 1)) (max 0 (List.length turns - 1)) in
+          let note = System_info "^ Human modified this Claude edit before committing" in
+          let turns = List.mapi (fun i t ->
+            if i = ti then t @ [note] else t) turns in
+          let new_si = let target = session_id ^ ".jsonl" in
+            let rec find i = function
+              | [] -> h.session_idx | p :: rest ->
+                if Filename.basename p = target then i else find (i+1) rest
+            in find 0 h.sessions in
+          { s with history = { h with result_idx = ri; session_idx = new_si;
+                                       showing_results = false;
+                                       turns; turn_idx = ti; hist_scroll = 0 };
+                   git = { s.git with link_idx = ri };
+                   status_extra = Printf.sprintf "Human edit of Claude t%d"
+                     _turn_idx }
+        else s
+      else
       let jsonl_dir = Urme_search.Jsonl_reader.find_jsonl_dir
           ~project_dir:s.project_dir in
       let path = Filename.concat jsonl_dir (session_id ^ ".jsonl") in
@@ -2561,15 +2604,19 @@ let run ~config ~project_dir () =
       if has_file_links then begin
         let* () = update mvar (fun s ->
           let g = s.git in
-          let links = match List.nth_opt g.commits g.commit_idx, List.nth_opt g.files g.file_idx with
+          let links_unsorted = match List.nth_opt g.commits g.commit_idx, List.nth_opt g.files g.file_idx with
             | Some (sha, _, _), Some file ->
               (match Hashtbl.find_opt g.git_links (sha, Filename.basename file) with
                | Some l -> l | None -> [])
             | _ -> [] in
+          let links = List.sort (fun (a : git_conv_link) (b : git_conv_link) ->
+            let c = Int.compare a.turn_idx b.turn_idx in
+            if c <> 0 then c else Int.compare a.entry_idx b.entry_idx
+          ) links_unsorted in
           (* Convert links to search_results format *)
           let results = List.mapi (fun i (link : git_conv_link) ->
             let label = Printf.sprintf "t%d e%d %s"
-              (link.turn_idx + 1) link.entry_idx link.edit_key in
+              link.turn_idx link.entry_idx link.edit_key in
             (link.session_id, label, "", link.turn_idx, "", Float.of_int i)
           ) links in
           let jsonl_dir = Urme_search.Jsonl_reader.find_jsonl_dir
