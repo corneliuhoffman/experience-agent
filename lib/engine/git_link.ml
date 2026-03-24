@@ -291,6 +291,7 @@ let update_index ~project_dir ~port ~collection_id
       Hashtbl.create 256 in
     let links : (string * string, link list) Hashtbl.t = Hashtbl.create 256 in
     let human_edits : (string * string, bool) Hashtbl.t = Hashtbl.create 256 in
+    let human_diffs : (string * string, string) Hashtbl.t = Hashtbl.create 64 in
     let* branch_label = Branch_topo.label_commits ~cwd:project_dir in
     (* Process commits oldest-first; consume matched edits so they
        don't re-match on later commits *)
@@ -334,7 +335,7 @@ let update_index ~project_dir ~port ~collection_id
                 | Some l -> l | None -> [] in
               if not (List.exists (fun (l : link) -> l.edit_key = edit.edit_key) el) then
                 Hashtbl.replace links lk (el @ [lnk])
-            | HumanEdit (edit, _desc) ->
+            | HumanEdit (edit, _diff_text) ->
               Hashtbl.replace human_edits (sha, file_base) true;
               let lnk = { commit_sha = sha; file = file_base;
                           session_id = edit.session_id;
@@ -354,7 +355,6 @@ let update_index ~project_dir ~port ~collection_id
           (* If no Claude edits matched but file changed, it's purely human *)
           if not !has_claude then begin
             Hashtbl.replace human_edits (sha, file_base) true;
-            (* Create a placeholder link so the file is accessible *)
             let lk = (sha, file_base) in
             if not (Hashtbl.mem links lk) then
               let lnk = { commit_sha = sha; file = file_base;
@@ -362,7 +362,48 @@ let update_index ~project_dir ~port ~collection_id
                           edit_key = file_base ^ ":human-only" } in
               Hashtbl.replace links lk [lnk]
           end;
-          Lwt.return_unit
+          (* Compute human-only diff: apply Claude edits to content_before
+             to get "Claude's version", then diff against content_after *)
+          if Hashtbl.mem human_edits (sha, file_base) then begin
+            (* Run decompose_diff with ALL edits to properly undo Claude's
+               changes, then diff(content_before, full_result) = human only *)
+            let* d_full = Diff_match.decompose_diff ~sha ~file
+                ~branch_label ~edits:sorted_edits ~cwd:project_dir ~repo in
+            let* content_before = Lwt.catch (fun () ->
+              let* parents_str = Urme_git.Ops.run_git ~cwd:project_dir
+                ["log"; "-1"; "--format=%P"; sha] in
+              match String.split_on_char ' ' (String.trim parents_str)
+                |> List.filter (fun s -> s <> "") with
+              | parent :: _ ->
+                Lwt.catch (fun () ->
+                  let+ c = Urme_store.Project_store.read_blob ~repo ~sha:parent ~path:file in
+                  Option.value c ~default:""
+                ) (fun _ -> Lwt.return "")
+              | [] -> Lwt.return ""
+            ) (fun _ -> Lwt.return "") in
+            let human_patch = Patch.diff
+              (Some (file_base, content_before))
+              (Some (file_base, d_full.result)) in
+            (match human_patch with
+             | Some patch when patch.Patch.hunks <> [] ->
+               let diff_lines = List.concat_map (fun (hunk : Patch.hunk) ->
+                 [Printf.sprintf "@@ -%d,%d +%d,%d @@"
+                    hunk.mine_start hunk.mine_len hunk.their_start hunk.their_len] @
+                 List.map (fun l -> "-" ^ l) hunk.mine @
+                 List.map (fun l -> "+" ^ l) hunk.their
+               ) patch.Patch.hunks in
+               log_debug (Printf.sprintf "Human diff for %s %s: %d hunks, %d lines"
+                 (String.sub sha 0 7) file_base
+                 (List.length patch.Patch.hunks) (List.length diff_lines));
+               Hashtbl.replace human_diffs (sha, file_base)
+                 (String.concat "\n" diff_lines)
+             | _ ->
+               log_debug (Printf.sprintf "No human diff for %s %s: result=%d content_before=%d"
+                 (String.sub sha 0 7) file_base
+                 (String.length d.result) (String.length content_before)));
+            Lwt.return_unit
+          end else
+            Lwt.return_unit
         end else begin
           (* No Claude edit candidates at all — purely human edit *)
           Hashtbl.replace human_edits (sha, file_base) true;
@@ -372,6 +413,13 @@ let update_index ~project_dir ~port ~collection_id
                         session_id = ""; turn_idx = 0; entry_idx = 0;
                         edit_key = file_base ^ ":human-only" } in
             Hashtbl.replace links lk [lnk]);
+          (* Get git diff for purely human files *)
+          let* diff = Lwt.catch (fun () ->
+            Urme_git.Ops.run_git ~cwd:project_dir
+              ["diff"; sha ^ "^"; sha; "--"; file]
+          ) (fun _ -> Lwt.return "") in
+          if diff <> "" then
+            Hashtbl.replace human_diffs (sha, file_base) diff;
           Lwt.return_unit
         end
       ) files
@@ -436,9 +484,9 @@ let update_index ~project_dir ~port ~collection_id
       ) tbl
     ) fresh_gis;
 
-    Lwt.return (links, human_edits, !n_edits, Hashtbl.length matched_unique,
+    Lwt.return (links, human_edits, human_diffs, !n_edits, Hashtbl.length matched_unique,
                 !n_commits, !n_relinked)
   ) (fun exn ->
     let _ = Printexc.to_string exn in
-    Lwt.return (Hashtbl.create 0, Hashtbl.create 0, !n_edits,
+    Lwt.return (Hashtbl.create 0, Hashtbl.create 0, Hashtbl.create 0, !n_edits,
                 Hashtbl.length matched_unique, !n_commits, !n_relinked))

@@ -98,13 +98,19 @@ let match_edits ~content_before ~content_after ~commit_ts ~file_base ~branch_fil
           let cc = !current in
           match find_substring edit.old_string cc with
           | Some _pos ->
-            (* old_string still in current — human reverted Claude's change *)
-            human_items := HumanEdit (edit, "human kept original") :: !human_items;
+            (* old_string still in current — human reverted Claude's change.
+               Diff: Claude wrote new_string, human kept old_string *)
+            let diff = Printf.sprintf "--- Claude wrote ---\n%s\n--- Human kept ---\n%s"
+              edit.new_string edit.old_string in
+            human_items := HumanEdit (edit, diff) :: !human_items;
             warnings := (Printf.sprintf "HUMAN %s: human kept original (reverted Claude)"
               edit.edit_key) :: !warnings
           | None ->
-            (* Neither old_string nor new_string — human rewrote this section *)
-            human_items := HumanEdit (edit, "human rewrote") :: !human_items;
+            (* Neither old_string nor new_string — human rewrote this section.
+               We know what Claude intended but not what human wrote *)
+            let diff = Printf.sprintf "--- Claude wrote ---\n%s\n--- Human rewrote (content in commit differs) ---"
+              edit.new_string in
+            human_items := HumanEdit (edit, diff) :: !human_items;
             warnings := (Printf.sprintf "HUMAN %s: human rewrote this section"
               edit.edit_key) :: !warnings
         end else

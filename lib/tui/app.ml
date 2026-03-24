@@ -107,6 +107,8 @@ type git_state = {
     (* (commit_sha, file_basename) → links, multiple edits may map to same commit+file *)
   human_edits : (string * string, bool) Hashtbl.t;
     (* (commit_sha, file_basename) → true if human also edited *)
+  human_diffs : (string * string, string) Hashtbl.t;
+    (* (commit_sha, file_basename) → human-only diff text *)
   link_candidates : git_conv_link list;
 }
 
@@ -130,7 +132,7 @@ let empty_git_state = {
   focus = Branches; branch_idx = 0; commit_idx = 0; file_idx = 0;
   link_idx = 0; diff_preview = ""; diff_scroll_git = 0;
   file_diff_filter = None; git_links = Hashtbl.create 0;
-  human_edits = Hashtbl.create 0; link_candidates = [];
+  human_edits = Hashtbl.create 0; human_diffs = Hashtbl.create 0; link_candidates = [];
 }
 
 let empty_history_state = {
@@ -1410,7 +1412,7 @@ let load_git_data ~cwd =
                focus = Branches; branch_idx = 0; commit_idx = 0; file_idx = 0;
                link_idx = 0; diff_preview; diff_scroll_git = 0;
                file_diff_filter = None; git_links = Hashtbl.create 0;
-               human_edits = Hashtbl.create 0;
+               human_edits = Hashtbl.create 0; human_diffs = Hashtbl.create 0;
                link_candidates = [] }, debug)
 
 (* Rebuild in-memory git_links from ChromaDB's git_info metadata *)
@@ -1489,7 +1491,9 @@ let switch_to_git mvar =
       let* s = Lwt_mvar.take mvar in
       ignore s; Lwt.return links
     end in
-  let git = { git with git_links } in
+  let git = { git with git_links;
+              human_edits = s.git.human_edits;
+              human_diffs = s.git.human_diffs } in
   let status = if git.branches = [] then
     Printf.sprintf "Git: no branches! %s" debug
   else Printf.sprintf "Git browser (%d link keys)" (Hashtbl.length git_links) in
@@ -1734,12 +1738,12 @@ let index_sessions mvar =
               Printf.sprintf "Git links: scanning %d sessions (%d new)..."
                 n_scan !n_new }) in
         redraw mvar;
-        let* (git_links, human_edits, gl_edits, gl_matched, _gl_commits, _gl_relinked) =
+        let* (git_links, human_edits, human_diffs, gl_edits, gl_matched, _gl_commits, _gl_relinked) =
           update_git_links ~project_dir:cwd ~port ~collection_id
             ~sessions_filter:sids mvar in
         let n_links = Hashtbl.length git_links in
         let* () = update mvar (fun s ->
-          { s with git = { s.git with git_links; human_edits };
+          { s with git = { s.git with git_links; human_edits; human_diffs };
                    status_extra =
               Printf.sprintf "Done: %d new, %d scanned | %d edits, %d matched, %d links"
                 !n_new n_scan gl_edits gl_matched n_links }) in
@@ -2283,41 +2287,45 @@ let run ~config ~project_dir () =
           (String.length ek > 6 && String.sub ek (String.length ek - 6) 6 = ":human") ||
           (String.length ek > 11 && String.sub ek (String.length ek - 11) 11 = ":human-only")
         | None -> false in
-      if is_human_link && session_id = "" then
-        (* Purely human edit (no Claude session) — show info *)
+      if is_human_link then
         let link_opt = List.nth_opt s.git.link_candidates ri in
-        let commit_sha = match link_opt with Some l -> l.commit_sha | None -> "" in
         let file = match link_opt with Some l -> l.file | None -> "" in
+        let commit_sha = match link_opt with Some l -> l.commit_sha | None -> "" in
+        let diff_text = match Hashtbl.find_opt s.git.human_diffs (commit_sha, file) with
+          | Some d -> d
+          | None -> "No human-specific diff computed" in
         let short = if String.length commit_sha > 7
           then String.sub commit_sha 0 7 else commit_sha in
-        let info = Printf.sprintf "Human edit to %s in commit %s\n\nThis change was made directly by the user, not by Claude." file short in
-        { s with history = { h with showing_results = false; result_idx = ri;
-                                     turns = [[System_info info]];
-                                     turn_idx = 0; hist_scroll = 0 };
-                 status_extra = Printf.sprintf "Human edit: %s (%s)" file short }
-      else if is_human_link then
-        (* Human modification of a Claude edit — show Claude's turn with a note *)
-        let jsonl_dir = Urme_search.Jsonl_reader.find_jsonl_dir
-            ~project_dir:s.project_dir in
-        let path = Filename.concat jsonl_dir (session_id ^ ".jsonl") in
-        if Sys.file_exists path then
-          let turns = split_into_interaction_turns ~filepath:path in
-          let ti = min (max 0 (_turn_idx - 1)) (max 0 (List.length turns - 1)) in
-          let note = System_info "^ Human modified this Claude edit before committing" in
-          let turns = List.mapi (fun i t ->
-            if i = ti then t @ [note] else t) turns in
-          let new_si = let target = session_id ^ ".jsonl" in
-            let rec find i = function
-              | [] -> h.session_idx | p :: rest ->
-                if Filename.basename p = target then i else find (i+1) rest
-            in find 0 h.sessions in
-          { s with history = { h with result_idx = ri; session_idx = new_si;
-                                       showing_results = false;
-                                       turns; turn_idx = ti; hist_scroll = 0 };
-                   git = { s.git with link_idx = ri };
-                   status_extra = Printf.sprintf "Human edit of Claude t%d"
-                     _turn_idx }
-        else s
+        if session_id = "" then
+          (* Purely human — show diff only *)
+          { s with history = { h with showing_results = false; result_idx = ri;
+                                       turns = [[System_info (Printf.sprintf
+                                         "Human edit to %s in %s\n\n%s" file short diff_text)]];
+                                       turn_idx = 0; hist_scroll = 0 };
+                   status_extra = Printf.sprintf "Human edit: %s" file }
+        else
+          (* Human modification of Claude edit — show Claude's turn + diff *)
+          let jsonl_dir = Urme_search.Jsonl_reader.find_jsonl_dir
+              ~project_dir:s.project_dir in
+          let path = Filename.concat jsonl_dir (session_id ^ ".jsonl") in
+          if Sys.file_exists path then
+            let turns = split_into_interaction_turns ~filepath:path in
+            let ti = min (max 0 (_turn_idx - 1)) (max 0 (List.length turns - 1)) in
+            let note = System_info (Printf.sprintf
+              "--- Human modified this Claude edit ---\n%s" diff_text) in
+            let turns = List.mapi (fun i t ->
+              if i = ti then t @ [note] else t) turns in
+            let new_si = let target = session_id ^ ".jsonl" in
+              let rec find i = function
+                | [] -> h.session_idx | p :: rest ->
+                  if Filename.basename p = target then i else find (i+1) rest
+              in find 0 h.sessions in
+            { s with history = { h with result_idx = ri; session_idx = new_si;
+                                         showing_results = false;
+                                         turns; turn_idx = ti; hist_scroll = 0 };
+                     git = { s.git with link_idx = ri };
+                     status_extra = Printf.sprintf "Human edit: %s t%d" file _turn_idx }
+          else s
       else
       let jsonl_dir = Urme_search.Jsonl_reader.find_jsonl_dir
           ~project_dir:s.project_dir in
