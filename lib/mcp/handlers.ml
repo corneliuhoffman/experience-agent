@@ -197,18 +197,44 @@ let handle_explain_change st args =
   let open Yojson.Safe.Util in
   let sha = args |> member "commit_sha" |> to_string in
   let file_path = args |> member "file_path" |> to_string in
+  let file_base = Filename.basename file_path in
   let* edits = ensure_edits st in
   let* branch_label = ensure_branch_label st in
   let* repo = ensure_repo st in
   let* d = Urme_engine.Diff_match.decompose_diff ~sha ~file:file_path
       ~branch_label ~edits ~cwd:st.project_dir ~repo in
   let* diff = Lwt.catch (fun () ->
-    Urme_git.Ops.commit_diff ~cwd:st.project_dir ~sha
+    Urme_git.Ops.run_git ~cwd:st.project_dir
+      ["diff"; sha ^ "^"; sha; "--"; file_path]
   ) (fun _ -> Lwt.return "") in
   let n_claude = List.length (List.filter (fun item -> match item with
     | DirectEdit _ -> true | _ -> false) d.items) in
   let n_unexplained = List.length (List.filter (fun item -> match item with
     | Unexplained _ -> true | _ -> false) d.items) in
+  (* Also include ChromaDB links for this commit+file *)
+  let* collection_id = ensure_collection st in
+  let* all_gis = Urme_search.Chromadb.get_all_with_git_info
+      ~port:st.port ~collection_id in
+  let links = List.concat_map (fun (_id, gi_str, session_id, _idx, _ts) ->
+    let tbl = parse_git_info_json gi_str in
+    Hashtbl.fold (fun ek value acc ->
+      match value with
+      | Some gi when String.length gi.commit_sha >= String.length sha &&
+                     String.sub gi.commit_sha 0 (String.length sha) = sha ->
+        let fb = match String.split_on_char ':' ek with
+          | f :: _ -> f | [] -> "" in
+        if fb = file_base then
+          `Assoc [
+            "file", `String fb;
+            "session_id", `String session_id;
+            "turn_idx", `Int gi.turn_idx;
+            "entry_idx", `Int gi.entry_idx;
+            "edit_key", `String ek;
+          ] :: acc
+        else acc
+      | _ -> acc
+    ) tbl []
+  ) all_gis in
   Lwt.return (json_result (`Assoc [
     "commit_sha", `String sha;
     "file", `String file_path;
@@ -217,6 +243,7 @@ let handle_explain_change st args =
       then String.sub diff 0 5000 ^ "\n... (truncated)" else diff);
     "summary", `String (Printf.sprintf "%d Claude edits, %d unexplained"
       n_claude n_unexplained);
+    "links", `List links;
   ]))
 
 let handle_commit_links st args =
@@ -274,14 +301,35 @@ let handle_search_by_file st args =
     "results", `List items;
   ]))
 
+(* Push result to TUI via Unix socket (best-effort, fire-and-forget) *)
+let send_to_tui ~project_dir ~msg =
+  let socket_path = Urme_core.Paths.tui_socket_path ~project_dir in
+  if not (Sys.file_exists socket_path) then Lwt.return_unit
+  else
+    Lwt.catch (fun () ->
+      let socket = Lwt_unix.socket Unix.PF_UNIX Unix.SOCK_STREAM 0 in
+      let addr = Unix.ADDR_UNIX socket_path in
+      let* () = Lwt_unix.connect socket addr in
+      let oc = Lwt_io.of_fd ~mode:Lwt_io.Output socket in
+      let* () = Lwt_io.write_line oc (Yojson.Safe.to_string msg) in
+      let* () = Lwt_io.flush oc in
+      let ic = Lwt_io.of_fd ~mode:Lwt_io.Input socket in
+      let* _ack = Lwt_io.read_line ic in
+      Lwt_unix.close socket
+    ) (fun _exn -> Lwt.return_unit)
+
 (* Dispatch *)
 
 let dispatch st name args =
-  match name with
-  | "search_history" -> handle_search_history st args
-  | "file_history" -> handle_file_history st args
-  | "region_blame" -> handle_region_blame st args
-  | "explain_change" -> handle_explain_change st args
-  | "commit_links" -> handle_commit_links st args
-  | "search_by_file" -> handle_search_by_file st args
-  | _ -> Lwt.return (text_result (Printf.sprintf "Unknown tool: %s" name))
+  let* result = match name with
+    | "search_history" -> handle_search_history st args
+    | "file_history" -> handle_file_history st args
+    | "region_blame" -> handle_region_blame st args
+    | "explain_change" -> handle_explain_change st args
+    | "commit_links" -> handle_commit_links st args
+    | "search_by_file" -> handle_search_by_file st args
+    | _ -> Lwt.return (text_result (Printf.sprintf "Unknown tool: %s" name)) in
+  (* Push to TUI if running *)
+  let msg = `Assoc ["type", `String name; "result", result] in
+  Lwt.async (fun () -> send_to_tui ~project_dir:st.project_dir ~msg);
+  Lwt.return result

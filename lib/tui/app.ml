@@ -59,13 +59,8 @@ let sort_by_size_desc paths =
 
 (* ---------- Types ---------- *)
 
-type ui_mode = Conv | Git | History
+type ui_mode = Git | History
 
-type pending_approval = {
-  tool_name : string;
-  tool_input : Yojson.Safe.t;
-  resolve : bool -> unit;
-}
 
 type conv_entry =
   | User_msg of string
@@ -137,7 +132,7 @@ let empty_git_state = {
 
 let empty_history_state = {
   sessions = []; session_idx = 0; turns = []; turn_idx = 0;
-  hist_scroll = 0; return_mode = Conv;
+  hist_scroll = 0; return_mode = History;
   search_active = false; search_query = "";
   search_results = []; result_idx = 0; showing_results = false;
 }
@@ -196,25 +191,10 @@ let strip_xml_tags s =
 type command_info = { cmd : string; description : string }
 
 let builtin_commands = [
-  { cmd = "/agents";   description = "List running background agents" };
-  { cmd = "/clear";    description = "Clear conversation history" };
-  { cmd = "/compact";  description = "Compact context with optional focus" };
-  { cmd = "/context";  description = "Show context window usage" };
-  { cmd = "/copy";     description = "Copy last response to clipboard" };
-  { cmd = "/cost";     description = "Show token usage and cost" };
-  { cmd = "/diff";     description = "Show accumulated diffs" };
   { cmd = "/exit";     description = "Exit urme" };
-  { cmd = "/export";   description = "Export conversation as text" };
   { cmd = "/git";      description = "Open git browser" };
-  { cmd = "/help";     description = "Show available commands" };
-  { cmd = "/history";  description = "Browse past conversations (or /history <query> to search)" };
-  { cmd = "/login";    description = "Sign in to Anthropic account" };
-  { cmd = "/model";    description = "Show or switch model" };
-  { cmd = "/plan";     description = "Enter plan mode" };
-  { cmd = "/reset";    description = "Reset session (kill daemon)" };
-  { cmd = "/skills";   description = "List available skills" };
-  { cmd = "/status";   description = "Show session status" };
-  { cmd = "/verbose";  description = "Toggle thinking blocks" };
+  { cmd = "/history";  description = "Browse past conversations" };
+  { cmd = "/verbose";  description = "Toggle verbose mode" };
 ]
 
 (* Load custom commands from ~/.config/urme/commands.json
@@ -264,72 +244,37 @@ let filter_commands query =
 (* Fully immutable state record *)
 type state = {
   mode : ui_mode;
-  entries : conv_entry list;
   input_text : string;
-  scroll_offset : int;
-  active_pane : [`Conv | `Diff];
-  diff_text : string;
-  diff_scroll : int;
-  streaming : bool;
-  stream_text : string;
   config : Urme_core.Config.config;
   project_dir : string;
-  daemon : Urme_claude.Process.t option;
-  pending : pending_approval option;
-  perm_server : Permission_server.t option;
-  status_model : string;
-  context_tokens : int;
-  status_tokens_in : int;
-  status_tokens_out : int;
-  status_cost : float;
   status_extra : string;
-  tool_use_map : (string * string) list;
   verbose : bool;
   palette_open : bool;
   palette_selected : int;
   git : git_state;
   history : history_state;
-  message_count : int;
   usage : Urme_core.Usage.usage_data option;
   started_chroma : bool;
   started_ollama : bool;
+  tui_bridge : Tui_bridge.t option;
 }
 
 (* ---------- Helpers ---------- *)
 
-let find_bridge_binary () =
-  let make_abs p =
-    if Filename.is_relative p then Filename.concat (Sys.getcwd ()) p else p in
-  let candidates = [
-    Filename.concat (Filename.dirname Sys.executable_name) "urme-permission-bridge";
-    make_abs "_build/default/bin/bridge/permission_bridge.exe";
-  ] in
-  match List.find_opt Sys.file_exists candidates with
-  | Some path -> make_abs path
-  | None -> "urme-permission-bridge"
 
 let initial_state ~config ~project_dir = {
-  mode = Conv;
-  entries = []; input_text = ""; scroll_offset = 0;
-  active_pane = `Conv; diff_text = ""; diff_scroll = 0;
-  streaming = false; stream_text = "";
+  mode = History;
+  input_text = "";
   config; project_dir;
-  daemon = None; pending = None; perm_server = None;
-  status_model = ""; context_tokens = 0; status_tokens_in = 0; status_tokens_out = 0;
-  status_cost = 0.0; status_extra = "Ready";
-  tool_use_map = []; verbose = false;
+  status_extra = "Ready";
+  verbose = false;
   palette_open = false; palette_selected = 0;
   git = empty_git_state; history = empty_history_state;
-  message_count = 0; usage = None;
+  usage = None;
   started_chroma = false; started_ollama = false;
+  tui_bridge = None;
 }
 
-let append_diff s diff =
-  if diff = "" then s
-  else { s with
-    diff_text = (if s.diff_text = "" then diff else s.diff_text ^ "\n" ^ diff);
-    diff_scroll = 0;
-  }
 
 (* ---------- Terminal ref + redraw (forward-declared, filled in after render_screen) ---------- *)
 
@@ -414,108 +359,6 @@ let wrap_text text width =
         in
         split [] 0)
 
-(* ---------- Tool helpers ---------- *)
-
-let summarize_tool_input tool_name input =
-  let open Yojson.Safe.Util in
-  match tool_name with
-  | "Bash" ->
-    let cmd = (try input |> member "command" |> to_string with _ -> "?") in
-    if String.length cmd > 80 then String.sub cmd 0 77 ^ "..." else cmd
-  | "Edit" | "Write" | "Read" ->
-    (try input |> member "file_path" |> to_string with _ -> "?")
-  | _ -> ""
-
-(* Read a file into lines, returning [] on error *)
-let read_file_lines path =
-  try
-    let ic = open_in path in
-    let rec loop acc =
-      match input_line ic with
-      | line -> loop (line :: acc)
-      | exception End_of_file -> close_in ic; List.rev acc
-    in
-    loop []
-  with _ -> []
-
-(* Find the 0-based line index where needle starts in lines, or None *)
-let find_substring_start lines needle_lines =
-  let nl = List.length needle_lines in
-  if nl = 0 then Some 0
-  else
-    let arr = Array.of_list lines in
-    let narr = Array.of_list needle_lines in
-    let len = Array.length arr in
-    let rec search i =
-      if i + nl > len then None
-      else
-        let rec matches j =
-          if j >= nl then true
-          else arr.(i + j) = narr.(j) && matches (j + 1)
-        in
-        if matches 0 then Some i else search (i + 1)
-    in
-    search 0
-
-(* Produce a unified diff of the full file for an Edit operation *)
-let unified_diff_edit path old_s new_s =
-  let orig_lines = read_file_lines path in
-  let old_lines = String.split_on_char '\n' old_s in
-  let new_lines = String.split_on_char '\n' new_s in
-  let ctx = 3 in
-  let buf = Buffer.create 1024 in
-  Buffer.add_string buf (Printf.sprintf "--- %s\n+++ %s\n" path path);
-  match find_substring_start orig_lines old_lines with
-  | None ->
-    (* Fallback: just show old/new without file context *)
-    List.iter (fun l -> Buffer.add_string buf ("- " ^ l ^ "\n")) old_lines;
-    List.iter (fun l -> Buffer.add_string buf ("+ " ^ l ^ "\n")) new_lines;
-    Buffer.contents buf
-  | Some start_idx ->
-    let old_len = List.length old_lines in
-    let new_len = List.length new_lines in
-    let total = List.length orig_lines in
-    let ctx_start = max 0 (start_idx - ctx) in
-    let ctx_end = min total (start_idx + old_len + ctx) in
-    let old_hunk_len = ctx_end - ctx_start in
-    let new_hunk_len = old_hunk_len - old_len + new_len in
-    Buffer.add_string buf
-      (Printf.sprintf "@@ -%d,%d +%d,%d @@\n"
-         (ctx_start + 1) old_hunk_len (ctx_start + 1) new_hunk_len);
-    (* Context before *)
-    for i = ctx_start to start_idx - 1 do
-      Buffer.add_string buf (" " ^ List.nth orig_lines i ^ "\n")
-    done;
-    (* Removed lines *)
-    List.iter (fun l -> Buffer.add_string buf ("- " ^ l ^ "\n")) old_lines;
-    (* Added lines *)
-    List.iter (fun l -> Buffer.add_string buf ("+ " ^ l ^ "\n")) new_lines;
-    (* Context after *)
-    for i = start_idx + old_len to ctx_end - 1 do
-      Buffer.add_string buf (" " ^ List.nth orig_lines i ^ "\n")
-    done;
-    Buffer.contents buf
-
-let diff_of_tool_input tool_name input =
-  let open Yojson.Safe.Util in
-  match tool_name with
-  | "Edit" ->
-    let path = (try input |> member "file_path" |> to_string with _ -> "?") in
-    let old_s = (try input |> member "old_string" |> to_string with _ -> "") in
-    let new_s = (try input |> member "new_string" |> to_string with _ -> "") in
-    unified_diff_edit path old_s new_s
-  | "Write" ->
-    let path = (try input |> member "file_path" |> to_string with _ -> "?") in
-    let content = (try input |> member "content" |> to_string with _ -> "") in
-    let buf = Buffer.create 256 in
-    Buffer.add_string buf (Printf.sprintf "+++ %s (new file)\n" path);
-    List.iter (fun l -> Buffer.add_string buf ("+ " ^ l ^ "\n"))
-      (String.split_on_char '\n' content);
-    Buffer.contents buf
-  | "Bash" ->
-    Printf.sprintf "$ %s\n"
-      (try Yojson.Safe.Util.(input |> member "command" |> to_string) with _ -> "?")
-  | _ -> ""
 
 (* Parse a session JSONL file into conv_entry list *)
 let load_session_entries filepath =
@@ -578,9 +421,7 @@ let load_session_entries filepath =
              let tuid = block |> member "id" |> to_string_option
                         |> Option.value ~default:"" in
              let input = (try block |> member "input" with _ -> `Null) in
-             let inline_diff = match name with
-               | "Edit" | "Write" | "Bash" -> Some (diff_of_tool_input name input)
-               | _ -> None in
+             let inline_diff = None in
              entries := Tool_use_block { tool_name = name; tool_use_id = tuid;
                                          input; inline_diff; timestamp = ts } :: !entries
            | _ -> ()
@@ -664,9 +505,7 @@ let split_into_interaction_turns ~filepath =
              let tuid = block |> member "id" |> to_string_option
                         |> Option.value ~default:"" in
              let input = (try block |> member "input" with _ -> `Null) in
-             let inline_diff = match name with
-               | "Edit" | "Write" | "Bash" -> Some (diff_of_tool_input name input)
-               | _ -> None in
+             let inline_diff = None in
              current := Tool_use_block { tool_name = name; tool_use_id = tuid;
                                          input; inline_diff; timestamp = ts } :: !current
            | _ -> ()
@@ -715,9 +554,8 @@ let render_entry ~width ~verbose entry =
   | Thinking_block text ->
     if verbose then wrap_prefix "  [thinking] " c_thinking (wrap_text text (width - 14))
     else []
-  | Tool_use_block { tool_name; input; inline_diff; _ } ->
-    let header = Printf.sprintf "  [%s] %s" tool_name
-        (summarize_tool_input tool_name input) in
+  | Tool_use_block { tool_name; inline_diff; _ } ->
+    let header = Printf.sprintf "  [%s]" tool_name in
     let hdr = List.map (mk c_tool_name) (wrap_text header width) in
     let diff = match inline_diff with
       | None -> []
@@ -803,27 +641,12 @@ let bg_block w h =
 let render_status_bar state w =
   let sbg = Notty.A.(fg c_fg ++ bg c_status_bg) in
   let mode_tag = match state.mode with
-    | Conv -> "CONV" | Git -> "GIT" | History -> "HIST" in
-  let model = if state.status_model = "" then "urme" else state.status_model in
-  let ctx_str =
-    if state.context_tokens > 0 then
-      Printf.sprintf " %dk/200k" (state.context_tokens / 1000)
-    else "" in
-  let left = Printf.sprintf " [%s] %s%s" mode_tag model ctx_str in
+    | Git -> "GIT" | History -> "HIST" in
+  let left = Printf.sprintf " [%s] urme" mode_tag in
   let right_str = match state.config.plan, state.usage with
     | (Urme_core.Config.Pro | Urme_core.Config.Max), Some u ->
-      let usage_str = Urme_core.Usage.format_status_bar u in
-      if state.status_tokens_in > 0 || state.status_tokens_out > 0 then
-        Printf.sprintf "%dk in / %dk out | %s"
-          (state.status_tokens_in / 1000) (state.status_tokens_out / 1000)
-          usage_str
-      else usage_str
-    | _ ->
-      if state.status_tokens_in > 0 || state.status_tokens_out > 0 then
-        Printf.sprintf "%dk in / %dk out | $%.4f"
-          (state.status_tokens_in / 1000) (state.status_tokens_out / 1000)
-          state.status_cost
-      else ""
+      Urme_core.Usage.format_status_bar u
+    | _ -> ""
   in
   (* Build the bar: left portion (bold highlight), center (status_extra), right *)
   let left_attr = Notty.A.(fg c_highlight ++ bg c_status_bg ++ st bold) in
@@ -848,82 +671,6 @@ let render_status_bar state w =
   <|> char sbg ' ' remaining 1
 
 (* Render the conversation pane *)
-let render_conversation state w h =
-  let base_attr = Notty.A.(fg c_fg ++ bg c_bg) in
-  let title = if state.verbose then " Conversation [verbose]" else " Conversation" in
-  let title_attr = Notty.A.(fg c_highlight ++ bg c_status_bg ++ st bold) in
-  let title_row = mk_row ~attr:title_attr w title in
-  let content_h = max 0 (h - 1) in
-  let width = max 1 (w - 2) in
-  let all_lines =
-    List.concat_map (render_entry ~width ~verbose:state.verbose)
-      (List.rev state.entries) in
-  let all_lines =
-    if state.streaming && state.stream_text <> "" then
-      all_lines @ List.map (fun l -> { fg = c_assistant; bg = None; text = "  " ^ l })
-        (wrap_text state.stream_text width)
-    else all_lines in
-  let total = List.length all_lines in
-  let start = max 0 (total - content_h - state.scroll_offset) in
-  let visible = List.filteri (fun i _ -> i >= start && i < start + content_h) all_lines in
-  let rows = List.map (fun line ->
-    let attr = Notty.A.(fg line.fg ++ bg (match line.bg with Some b -> b | None -> c_bg)) in
-    mk_row ~attr w (" " ^ line.text)
-  ) visible in
-  let content_img = match rows with
-    | [] -> bg_block w content_h
-    | _ ->
-      let img = Notty.I.vcat rows in
-      let used = Notty.I.height img in
-      if used < content_h then
-        img <-> bg_block w (content_h - used)
-      else img in
-  (title_row <-> content_img) |> fun img ->
-    (* Crop to exactly h rows *)
-    if Notty.I.height img > h then Notty.I.vcrop 0 (Notty.I.height img - h) img
-    else if Notty.I.height img < h then img <-> bg_block w (h - Notty.I.height img)
-    else img |> fun final ->
-      final </> Notty.I.char base_attr ' ' w h
-
-(* Render the diff pane *)
-let render_diff state w h =
-  let base_attr = Notty.A.(fg c_fg ++ bg c_bg) in
-  let title_attr = Notty.A.(fg c_highlight ++ bg c_status_bg ++ st bold) in
-  let title_row = mk_row ~attr:title_attr w (Printf.sprintf " Diff %s" (String.make (max 0 (w - 6)) ' ')) in
-  let content_h = max 0 (h - 1) in
-  if state.diff_text = "" then
-    let empty_msg = mk_row ~attr:Notty.A.(fg c_border ++ bg c_bg) w "  (no diff)" in
-    let fill = bg_block w (max 0 (content_h - 1)) in
-    (title_row <-> empty_msg <-> fill)
-    |> fun img -> img </> Notty.I.char base_attr ' ' w h
-  else begin
-    let lines = String.split_on_char '\n' state.diff_text in
-    let vh = content_h in
-    let total = List.length lines in
-    let start = max 0 (total - vh - state.diff_scroll) in
-    let visible = List.filteri (fun i _ -> i >= start && i < start + vh) lines in
-    let rows = List.map (fun line ->
-      let fg_c, bg_c = if String.length line > 0 then match line.[0] with
-        | '+' -> (c_diff_add_fg, c_diff_add_bg)
-        | '-' -> (c_diff_del_fg, c_diff_del_bg)
-        | '@' -> (c_tool_name, c_bg)
-        | _ -> (c_fg, c_bg)
-      else (c_fg, c_bg) in
-      let attr = Notty.A.(fg fg_c ++ bg bg_c) in
-      mk_row ~attr w (" " ^ line)
-    ) visible in
-    let content_img = match rows with
-      | [] -> bg_block w content_h
-      | _ ->
-        let img = Notty.I.vcat rows in
-        let used = Notty.I.height img in
-        if used < content_h then
-          img <-> bg_block w (content_h - used)
-        else img in
-    (title_row <-> content_img)
-    |> fun img -> img </> Notty.I.char base_attr ' ' w h
-  end
-
 (* ---------- Git mode rendering ---------- *)
 
 let render_git_panel ~height ~title ~focused ~items ~sel_idx ~width =
@@ -1277,34 +1024,45 @@ let render_history_content state w h =
       title_row <-> content_img
   end
 
-(* Render the input line (1 row) *)
+(* Render the input line (1 row) with colored key hints *)
+(* Each hint is (key, description); rendered as key=highlight desc=dim sep=border *)
+let render_hint_bar hints w =
+  let key_attr = Notty.A.(fg c_highlight ++ bg c_input_bg ++ st bold) in
+  let desc_attr = Notty.A.(fg c_fg ++ bg c_input_bg) in
+  let sep_attr = Notty.A.(fg c_border ++ bg c_input_bg) in
+  let pad_attr = Notty.A.(fg c_fg ++ bg c_input_bg) in
+  let imgs = List.mapi (fun i (key, desc) ->
+    let sep = if i > 0 then Notty.I.string sep_attr " | " else Notty.I.string pad_attr " " in
+    let k = Notty.I.string key_attr key in
+    let d = Notty.I.string desc_attr (" " ^ desc) in
+    sep <|> k <|> d
+  ) hints in
+  let content = List.fold_left ( <|> ) Notty.I.empty imgs in
+  let used = Notty.I.width content in
+  let pad = max 0 (w - used) in
+  content <|> Notty.I.char pad_attr ' ' pad 1
+
 let render_input_line state w =
-  let ist = Notty.A.(fg c_fg ++ bg c_input_bg) in
-  let prompt = match state.mode with
-    | Conv -> (match state.pending with
-      | Some p ->
-        Printf.sprintf "[Y/N] Allow %s: %s? " p.tool_name
-          (summarize_tool_input p.tool_name p.tool_input)
-      | None -> if state.streaming then "..." else "> ")
-    | Git -> " Tab/S-Tab=panel j/k=nav Enter=select [/]=scroll h=history Esc=back "
+  let hints = match state.mode with
+    | Git ->
+      [("Tab", "panel"); ("j/k", "nav"); ("Enter", "select");
+       ("[/]", "scroll"); ("h", "history"); ("Esc", "back"); ("q", "quit")]
     | History ->
       let h = state.history in
       if h.showing_results && h.return_mode = Git then
-        " Up/Down=select  Enter=view  Esc=back to git "
+        [("\xe2\x86\x91\xe2\x86\x93", "select"); ("Enter", "view"); ("q", "quit")]
       else if h.showing_results then
-        " Up/Down=select  Enter=view  /=new search  Esc=close "
+        [("\xe2\x86\x91\xe2\x86\x93", "select"); ("Enter", "view"); ("q", "quit")]
       else if h.search_active then
-        " type query...  Enter=search  Esc=cancel "
+        [("type query...", ""); ("Enter", "search"); ("Esc", "cancel")]
       else if h.return_mode = Git && h.search_results <> [] then
-        " <-/->step  S-<-/S->=prev/next link  b=back to list  Esc=git  Up/Down=scroll "
+        [("\xe2\x86\x90/\xe2\x86\x92", "step"); ("S-arrows", "jump"); ("b", "list"); ("Esc", "git"); ("\xe2\x86\x91\xe2\x86\x93", "scroll")]
       else if h.search_results <> [] then
-        " <-/->step  S-<-/S->=prev/next result  b=back to list  /=search  q=exit "
+        [("\xe2\x86\x90/\xe2\x86\x92", "step"); ("S-arrows", "jump"); ("b", "list"); ("/", "search"); ("q", "quit")]
       else
-        " <-/->step  /=search  i=index  Up/Down=scroll  q=exit " in
-  let text = Printf.sprintf "%s%s" prompt state.input_text in
-  let pad_len = max 0 (w - String.length text) in
-  let full_text = text ^ String.make pad_len ' ' in
-  mk_row ~attr:ist w full_text
+        [("\xe2\x86\x90/\xe2\x86\x92", "step"); ("/", "search"); ("\xe2\x86\x91\xe2\x86\x93", "scroll"); ("g", "git"); ("i", "init"); ("u", "update"); ("q", "quit")]
+  in
+  render_hint_bar hints w
 
 (* Render the command palette overlay *)
 let render_palette state w h input_row =
@@ -1353,7 +1111,6 @@ let render_screen state w h =
   let input_row = h - 1 in
   let pane_height = max 1 (h - 2) in
   let content = match state.mode with
-    | Conv -> render_conversation state w pane_height
     | Git ->
       let left_w = max 1 (w / 4) in
       let right_w = max 1 (w - left_w - 1) in
@@ -1380,37 +1137,9 @@ let () =
         Lwt.catch (fun () ->
           let open Lwt.Syntax in
           let* () = Notty_lwt.Term.image term img in
-          (* Cursor *)
-          (match state.mode with
-           | Conv ->
-             let prompt_len = match state.pending with
-               | Some p -> String.length (Printf.sprintf "[Y/N] Allow %s: %s? " p.tool_name
-                   (summarize_tool_input p.tool_name p.tool_input))
-               | None -> if state.streaming then 3 else 2 in
-             Notty_lwt.Term.cursor term (Some (prompt_len + String.length state.input_text, h - 1))
-           | _ -> Notty_lwt.Term.cursor term None)
+          Notty_lwt.Term.cursor term None
         ) (fun _ -> Lwt.return_unit))
     | _ -> ()
-
-(* ---------- Daemon ---------- *)
-
-let ensure_daemon mvar =
-  let* s = Lwt_mvar.take mvar in
-  match s.daemon with
-  | Some d when Urme_claude.Process.is_running d ->
-    let* () = Lwt_mvar.put mvar s in
-    Lwt.return d
-  | _ ->
-    let bridge = find_bridge_binary () in
-    let sock = match s.perm_server with
-      | Some ps -> Some (Permission_server.path ps) | None -> None in
-    let opts = { Urme_claude.Process.default_opts with
-      permission_bridge_binary = Some bridge;
-      permission_socket_path = sock } in
-    let* d = Urme_claude.Process.spawn ~cwd:s.project_dir ~opts
-        ~binary:s.config.Urme_core.Config.claude_binary () in
-    let* () = Lwt_mvar.put mvar { s with daemon = Some d } in
-    Lwt.return d
 
 (* ---------- Commit-centric git <-> conversation link index ---------- *)
 
@@ -1617,64 +1346,6 @@ let ensure_services mvar ~chromadb_port ~ollama_url ~project_dir =
   Lwt.return_unit
 
 (* Extract individual turns (user_text, assistant_text) from a session JSONL *)
-let session_turns filepath =
-  let turns = ref [] in
-  let current_user = ref "" in
-  let assistant_buf = Buffer.create 1024 in
-  let flush_turn () =
-    if !current_user <> "" && Buffer.length assistant_buf > 0 then
-      turns := (!current_user, Buffer.contents assistant_buf) :: !turns;
-    current_user := "";
-    Buffer.clear assistant_buf in
-  let ic = open_in filepath in
-  (try while true do
-    let line = input_line ic in
-    (try
-      let json = Yojson.Safe.from_string line in
-      let open Yojson.Safe.Util in
-      let typ = json |> member "type" |> to_string_option
-                |> Option.value ~default:"" in
-      (match typ with
-       | "user" ->
-         flush_turn ();
-         let content = json |> member "message" |> member "content" in
-         (match content with
-          | `String s ->
-            if not (is_internal_noise s) then
-              current_user := (strip_xml_tags s)
-          | `List items ->
-            List.iter (fun item ->
-              match item |> member "type" |> to_string_option with
-              | Some "text" ->
-                let t = item |> member "text" |> to_string_option
-                        |> Option.value ~default:"" in
-                if t <> "" && not (is_internal_noise t) then
-                  current_user := (strip_xml_tags t)
-              | _ -> ()
-            ) items
-          | _ -> ())
-       | "assistant" ->
-         let blocks = json |> member "message" |> member "content"
-           |> (fun j -> try to_list j with _ -> []) in
-         List.iter (fun block ->
-           match block |> member "type" |> to_string_option with
-           | Some "text" ->
-             let t = block |> member "text" |> to_string_option
-                     |> Option.value ~default:"" in
-             if t <> "" then begin
-               if Buffer.length assistant_buf > 0 then
-                 Buffer.add_char assistant_buf '\n';
-               Buffer.add_string assistant_buf t
-             end
-           | _ -> ()
-         ) blocks
-       | _ -> ())
-     with _ -> ())
-  done with End_of_file -> ());
-  flush_turn ();
-  close_in ic;
-  List.rev !turns
-
 (* Index all session JSONL files into ChromaDB — incremental with git correlation *)
 let index_sessions mvar =
   let* () = update mvar (fun s ->
@@ -1690,7 +1361,7 @@ let index_sessions mvar =
       let cwd = s_val.project_dir in
       let* () = ensure_services mvar ~chromadb_port:port ~ollama_url
           ~project_dir:cwd in
-      let* () = update mvar (fun s -> { s with status_extra = "Checking index..." }) in
+      let* () = update mvar (fun s -> { s with status_extra = "Updating index..." }) in
       redraw mvar;
       let* collection_id =
         Urme_search.Chromadb.ensure_interactions_collection ~port ~project in
@@ -1867,244 +1538,6 @@ let switch_to_history mvar =
              status_extra = Printf.sprintf "History (%d sessions)" n }) in
   redraw mvar; Lwt.return_unit
 
-(* ---------- Slash commands ---------- *)
-
-let handle_command mvar cmd =
-  let parts = String.split_on_char ' ' cmd in
-  let name = List.hd parts in
-  let _args = List.tl parts in
-  let args_str = String.concat " " _args in
-  match name with
-  | "/clear" | "/new" ->
-    let* () = update mvar (fun s ->
-      { s with entries = []; diff_text = ""; diff_scroll = 0;
-               scroll_offset = 0; stream_text = "";
-               status_extra = "Cleared." }) in
-    redraw mvar; Lwt.return true
-
-  | "/reset" | "/clearall" ->
-    let* s = Lwt_mvar.take mvar in
-    (match s.daemon with Some d -> Urme_claude.Process.kill d | None -> ());
-    let* () = Lwt_mvar.put mvar
-      { s with entries = []; diff_text = ""; diff_scroll = 0;
-               scroll_offset = 0; stream_text = ""; daemon = None;
-               tool_use_map = []; status_tokens_in = 0;
-               status_tokens_out = 0; status_cost = 0.0;
-               status_extra = "Session reset." } in
-    redraw mvar; Lwt.return true
-
-  | "/verbose" | "/v" ->
-    let* () = update mvar (fun s ->
-      { s with verbose = not s.verbose;
-               status_extra = if s.verbose then "Verbose off" else "Verbose on" }) in
-    redraw mvar; Lwt.return true
-
-  | "/compact" ->
-    let* s = Lwt_mvar.take mvar in
-    (match s.daemon with
-     | Some d when Urme_claude.Process.is_running d ->
-       let msg = if args_str <> "" then
-         Printf.sprintf "Compact the conversation, focusing on: %s" args_str
-       else "Summarize our conversation so far to free up context" in
-       let* () = Lwt_mvar.put mvar { s with status_extra = "Compacting..." } in
-       let* () = Urme_claude.Process.send d ~text:msg in
-       redraw mvar; Lwt.return true
-     | _ ->
-       let* () = Lwt_mvar.put mvar { s with status_extra = "No active session" } in
-       redraw mvar; Lwt.return true)
-
-  | "/cost" ->
-    let* () = update mvar (fun s ->
-      let usage_str = match s.config.plan, s.usage with
-        | (Urme_core.Config.Pro | Urme_core.Config.Max), Some u ->
-          Urme_core.Usage.format_detailed u
-        | _ ->
-          Printf.sprintf "Cost: $%.4f" s.status_cost
-      in
-      let info = Printf.sprintf
-        "Tokens in: %d (%dk) | Tokens out: %d (%dk)\n%s"
-        s.status_tokens_in (s.status_tokens_in / 1000)
-        s.status_tokens_out (s.status_tokens_out / 1000)
-        usage_str in
-      { s with entries = System_info info :: s.entries }) in
-    redraw mvar; Lwt.return true
-
-  | "/diff" ->
-    let* () = update mvar (fun s ->
-      { s with active_pane = `Diff; diff_scroll = 0 }) in
-    redraw mvar; Lwt.return true
-
-  | "/model" ->
-    if args_str <> "" then begin
-      (* Switch model by passing to daemon *)
-      let* s = Lwt_mvar.take mvar in
-      match s.daemon with
-      | Some d when Urme_claude.Process.is_running d ->
-        let* () = Lwt_mvar.put mvar
-          { s with status_extra = Printf.sprintf "Model: %s" args_str } in
-        let* () = Urme_claude.Process.send d
-          ~text:(Printf.sprintf "Please switch to model %s" args_str) in
-        redraw mvar; Lwt.return true
-      | _ ->
-        let* () = Lwt_mvar.put mvar
-          { s with status_extra = "No active session"; status_model = args_str } in
-        redraw mvar; Lwt.return true
-    end else begin
-      let* () = update mvar (fun s ->
-        let info = Printf.sprintf "Current model: %s"
-          (if s.status_model = "" then "(not connected)" else s.status_model) in
-        { s with entries = System_info info :: s.entries }) in
-      redraw mvar; Lwt.return true
-    end
-
-  | "/plan" ->
-    let* s = Lwt_mvar.take mvar in
-    (match s.daemon with
-     | Some d when Urme_claude.Process.is_running d ->
-       let* () = Lwt_mvar.put mvar
-         { s with status_extra = "Plan mode..." } in
-       let* () = Urme_claude.Process.send d
-         ~text:"Enter plan mode. Before making any changes, outline your plan and wait for my approval." in
-       redraw mvar; Lwt.return true
-     | _ ->
-       let* () = Lwt_mvar.put mvar { s with status_extra = "No active session" } in
-       redraw mvar; Lwt.return true)
-
-  | "/status" ->
-    let* () = update mvar (fun s ->
-      let running = match s.daemon with
-        | Some d -> Urme_claude.Process.is_running d | None -> false in
-      let cost_line = match s.config.plan, s.usage with
-        | (Urme_core.Config.Pro | Urme_core.Config.Max), Some u ->
-          Urme_core.Usage.format_detailed u
-        | _ -> Printf.sprintf "Cost: $%.4f" s.status_cost
-      in
-      let info = Printf.sprintf
-        "Model: %s\nDaemon: %s\nProject: %s\nTokens: %dk in / %dk out\n%s"
-        (if s.status_model = "" then "(none)" else s.status_model)
-        (if running then "running" else "stopped")
-        s.project_dir
-        (s.status_tokens_in / 1000) (s.status_tokens_out / 1000)
-        cost_line in
-      { s with entries = System_info info :: s.entries }) in
-    redraw mvar; Lwt.return true
-
-  | "/help" ->
-    let help =
-      List.map (fun c -> Printf.sprintf "  %-12s %s" c.cmd c.description) (Lazy.force commands)
-      |> String.concat "\n" in
-    let help = help ^ "\n\n  Keybindings:\n\
-       \  Tab          Switch pane focus\n\
-       \  Up/Down      Scroll active pane\n\
-       \  Ctrl-V       Toggle thinking blocks\n\
-       \  Alt-G        Git mode\n\
-       \  Alt-H        History mode\n\
-       \  Ctrl-C       Quit" in
-    let* () = update mvar (fun s ->
-      { s with entries = System_info help :: s.entries }) in
-    redraw mvar; Lwt.return true
-
-  | "/agents" ->
-    let* () = update mvar (fun s ->
-      let info = match s.daemon with
-        | Some d when Urme_claude.Process.is_running d ->
-          Printf.sprintf "Claude daemon: running (model: %s)"
-            (if s.status_model = "" then "unknown" else s.status_model)
-        | _ -> "No agents running" in
-      { s with entries = System_info info :: s.entries }) in
-    redraw mvar; Lwt.return true
-
-  | "/context" ->
-    let* () = update mvar (fun s ->
-      let total_chars = List.fold_left (fun acc e -> acc + match e with
-        | User_msg t | Assistant_text t | Thinking_block t | System_info t -> String.length t
-        | Tool_use_block { inline_diff; _ } ->
-          (match inline_diff with Some d -> String.length d | None -> 0)
-        | Tool_result_block { content; _ } -> String.length content
-        | Turn_separator -> 0
-      ) 0 s.entries in
-      let est_tokens = total_chars / 4 in
-      let info = Printf.sprintf
-        "Entries: %d | ~%dk tokens used | %dk in / %dk out"
-        (List.length s.entries) (est_tokens / 1000)
-        (s.status_tokens_in / 1000) (s.status_tokens_out / 1000) in
-      { s with entries = System_info info :: s.entries }) in
-    redraw mvar; Lwt.return true
-
-  | "/copy" ->
-    let* s = Lwt_mvar.take mvar in
-    let last_text = List.find_map (fun e -> match e with
-      | Assistant_text t -> Some t | _ -> None) s.entries in
-    (match last_text with
-     | Some t ->
-       let* _status = Lwt_process.exec
-         (Lwt_process.shell (Printf.sprintf "printf '%%s' %s | pbcopy"
-            (Filename.quote t))) in
-       let* () = Lwt_mvar.put mvar { s with status_extra = "Copied to clipboard" } in
-       redraw mvar; Lwt.return true
-     | None ->
-       let* () = Lwt_mvar.put mvar { s with status_extra = "No response to copy" } in
-       redraw mvar; Lwt.return true)
-
-  | "/export" ->
-    let* s_val = Lwt_mvar.take mvar in
-    let buf = Buffer.create 1024 in
-    List.iter (fun e -> match e with
-      | User_msg t -> Buffer.add_string buf (Printf.sprintf "User: %s\n\n" t)
-      | Assistant_text t -> Buffer.add_string buf (Printf.sprintf "Assistant: %s\n\n" t)
-      | Thinking_block t -> Buffer.add_string buf (Printf.sprintf "[Thinking] %s\n\n" t)
-      | Tool_use_block { tool_name; inline_diff; _ } ->
-        Buffer.add_string buf (Printf.sprintf "[%s]\n" tool_name);
-        (match inline_diff with Some d -> Buffer.add_string buf (d ^ "\n") | None -> ())
-      | Tool_result_block { tool_name; content; _ } ->
-        Buffer.add_string buf (Printf.sprintf "[%s result] %s\n\n" tool_name content)
-      | System_info t -> Buffer.add_string buf (Printf.sprintf "[System] %s\n\n" t)
-      | Turn_separator -> Buffer.add_string buf "---\n\n"
-    ) (List.rev s_val.entries);
-    let filename = if args_str <> "" then args_str
-      else Printf.sprintf "urme-export-%s.txt"
-        (string_of_float (Unix.gettimeofday ())) in
-    (try
-       let oc = open_out filename in
-       output_string oc (Buffer.contents buf);
-       close_out oc
-     with _ -> ());
-    let* () = Lwt_mvar.put mvar
-      { s_val with entries = System_info (Printf.sprintf "Exported to %s" filename)
-                             :: s_val.entries } in
-    redraw mvar; Lwt.return true
-
-  | "/login" ->
-    let* () = update mvar (fun s ->
-      { s with entries = System_info "Run 'claude login' in your terminal to authenticate." :: s.entries }) in
-    redraw mvar; Lwt.return true
-
-  | "/skills" ->
-    let* () = update mvar (fun s ->
-      { s with entries = System_info "No custom skills configured." :: s.entries }) in
-    redraw mvar; Lwt.return true
-
-  | "/git" ->
-    let* () = switch_to_git mvar in
-    Lwt.return true
-
-  | "/history" ->
-    let* () = switch_to_history mvar in
-    let* () = if args_str <> "" then execute_search mvar args_str
-      else Lwt.return_unit in
-    Lwt.return true
-
-  | "/exit" | "/quit" ->
-    (* Signal exit — handled specially in the event loop *)
-    Lwt.return false
-
-  | _ when String.length name > 0 && name.[0] = '/' ->
-    let* () = update mvar (fun s ->
-      { s with entries = System_info (Printf.sprintf "Unknown command: %s. Type /help for available commands." name)
-                         :: s.entries }) in
-    redraw mvar; Lwt.return true
-  | _ -> Lwt.return false
-
 (* ---------- Usage refresh ---------- *)
 
 let refresh_usage mvar =
@@ -2118,154 +1551,6 @@ let refresh_usage mvar =
       | None -> Lwt.return_unit
     ) (fun _exn -> Lwt.return_unit))
 
-let maybe_refresh_usage mvar s =
-  let count = s.message_count + 1 in
-  let s = { s with message_count = count } in
-  (match s.config.plan with
-   | Urme_core.Config.Pro | Urme_core.Config.Max ->
-     if count = 1 || count mod 10 = 0 then refresh_usage mvar
-   | Urme_core.Config.Api -> ());
-  s
-
-(* ---------- Auto-index previous turn ---------- *)
-
-let extract_last_turn entries =
-  (* entries are newest-first; find the first User_msg = last user question *)
-  let rec collect_assistant acc = function
-    | [] -> (acc, None)
-    | User_msg u :: _ -> (acc, Some u)
-    | Assistant_text t :: rest -> collect_assistant (t :: acc) rest
-    | _ :: rest -> collect_assistant acc rest
-  in
-  let (texts, user) = collect_assistant [] entries in
-  match user with
-  | Some u when texts <> [] -> Some (u, String.concat "\n" texts)
-  | _ -> None
-
-let index_previous_turn s =
-  match s.daemon with
-  | Some d ->
-    (match d.Urme_claude.Process.session_id, extract_last_turn s.entries with
-     | Some sid, Some (user_text, assistant_text) ->
-       let port = s.config.chromadb_port in
-       let project = Filename.basename s.project_dir in
-       Lwt.async (fun () ->
-         Lwt.catch (fun () ->
-           let* chroma_ok = check_port port in
-           let* ollama_ok = check_ollama s.config.ollama_url in
-           if not chroma_ok || not ollama_ok then Lwt.return_unit
-           else
-             let* collection_id =
-               Urme_search.Chromadb.ensure_interactions_collection ~port ~project in
-             let ts = Printf.sprintf "%.0f" (Unix.gettimeofday ()) in
-             let idx = Hashtbl.hash (sid ^ ts) land 0x7FFFFFFF in
-             let assistant_summary =
-               if String.length assistant_text > 500
-               then String.sub assistant_text 0 500 ^ "..."
-               else assistant_text in
-             Urme_search.Chromadb.save_interaction ~port ~collection_id
-               ~experience_id:sid ~interaction_index:idx
-               ~user_text ~assistant_summary
-               ~user_uuid:(Printf.sprintf "%s_%d" sid idx)
-               ~timestamp:ts ()
-         ) (fun _exn -> Lwt.return_unit))
-     | _ -> ())
-  | None -> ()
-
-(* ---------- Send message + event reader ---------- *)
-
-let send_message mvar =
-  let* s = Lwt_mvar.take mvar in
-  if s.input_text = "" || s.streaming then
-    Lwt_mvar.put mvar s
-  else begin
-    let text = s.input_text in
-    index_previous_turn s;
-    let s = maybe_refresh_usage mvar s in
-    let* () = Lwt_mvar.put mvar { s with
-      input_text = ""; entries = User_msg text :: s.entries;
-      streaming = true; status_extra = "Claude is thinking...";
-      stream_text = "" } in
-    redraw mvar;
-    let* daemon = ensure_daemon mvar in
-    let* () = Urme_claude.Process.send daemon ~text in
-    Lwt.async (fun () ->
-      let rec read_loop () =
-        let* event = Urme_claude.Process.next_event daemon in
-        match event with
-        | None ->
-          let* () = update mvar (fun s ->
-            let entries = if s.stream_text <> "" then
-              Assistant_text s.stream_text :: s.entries else s.entries in
-            { s with streaming = false; daemon = None; entries;
-                     stream_text = ""; status_extra = "Claude process ended." }) in
-          redraw mvar; Lwt.return_unit
-
-        | Some (Urme_claude.Stream.System_init { model; _ }) ->
-          let* () = update mvar (fun s -> { s with status_model = model }) in
-          redraw mvar; read_loop ()
-
-        | Some (Urme_claude.Stream.Assistant_message { content; model; usage; _ }) ->
-          let* () = update mvar (fun s ->
-            let s = { s with
-              status_model = model;
-              context_tokens = usage.input_tokens;
-              status_tokens_in = s.status_tokens_in + usage.input_tokens;
-              status_tokens_out = s.status_tokens_out + usage.output_tokens } in
-            let s = if s.stream_text <> "" then
-              { s with entries = Assistant_text s.stream_text :: s.entries;
-                       stream_text = "" }
-            else s in
-            List.fold_left (fun s block -> match block with
-              | Urme_claude.Stream.Text t when t <> "" ->
-                { s with entries = Assistant_text t :: s.entries }
-              | Urme_claude.Stream.Thinking t when t <> "" ->
-                { s with entries = Thinking_block t :: s.entries }
-              | Urme_claude.Stream.Tool_use { id; name; input } ->
-                let inline_diff = match name with
-                  | "Edit" | "Write" | "Bash" -> Some (diff_of_tool_input name input)
-                  | _ -> None in
-                let s = { s with
-                  tool_use_map = (id, name) :: s.tool_use_map;
-                  entries = Tool_use_block { tool_name = name; tool_use_id = id;
-                                            input; inline_diff;
-                                            timestamp = Unix.gettimeofday () }
-                            :: s.entries } in
-                (match name with
-                 | "Edit" | "Write" -> append_diff s (diff_of_tool_input name input)
-                 | _ -> s)
-              | Urme_claude.Stream.Tool_result { tool_use_id; content; is_error } ->
-                let tn = match List.assoc_opt tool_use_id s.tool_use_map with
-                  | Some n -> n | None -> "tool" in
-                { s with entries = Tool_result_block { tool_name = tn; content;
-                                                      is_error } :: s.entries }
-              | _ -> s
-            ) s content
-          ) in
-          redraw mvar; read_loop ()
-
-        | Some (Urme_claude.Stream.Result { is_error; result; total_cost_usd;
-                                            usage; _ }) ->
-          let* () = update mvar (fun s ->
-            let entries = if s.stream_text <> "" then
-              Assistant_text s.stream_text :: s.entries else s.entries in
-            let entries = if is_error then
-              System_info ("Error: " ^ result) :: entries else entries in
-            let ctx = usage.input_tokens + usage.output_tokens in
-            { s with streaming = false; status_cost = total_cost_usd;
-                     context_tokens = (if ctx > 0 then ctx else s.context_tokens);
-                     status_tokens_in = usage.input_tokens;
-                     status_tokens_out = usage.output_tokens;
-                     stream_text = ""; entries = Turn_separator :: entries;
-                     status_extra = "Ready" }) in
-          redraw mvar; Lwt.return_unit
-
-        | Some _ -> read_loop ()
-      in
-      read_loop ());
-    Lwt.return_unit
-  end
-
 (* ---------- Main ---------- *)
 
 let run ~config ~project_dir () =
@@ -2277,29 +1562,8 @@ let run ~config ~project_dir () =
   let term = Notty_lwt.Term.create ~mouse:false ~nosig:true () in
   term_ref := Some term;
 
-  (* Permission server *)
-  let* perm_server = Permission_server.start ~on_request:(fun req ->
-    let waiter, resolver = Lwt.wait () in
-    let* s = Lwt_mvar.take mvar in
-    let diff_before = s.diff_text in
-    let s = append_diff s (diff_of_tool_input req.Permission_server.tool_name
-                             req.Permission_server.tool_input) in
-    let* () = Lwt_mvar.put mvar { s with
-      pending = Some {
-        tool_name = req.tool_name; tool_input = req.tool_input;
-        resolve = (fun allow -> Lwt.wakeup_later resolver allow) };
-      status_extra = Printf.sprintf "Permission: %s [Y/N]"
-        (summarize_tool_input req.tool_name req.tool_input) } in
-    redraw mvar;
-    let* allow = waiter in
-    let* () = update mvar (fun s -> { s with
-      pending = None;
-      diff_text = (if allow then s.diff_text else diff_before);
-      status_extra = "Claude is thinking..." }) in
-    redraw mvar;
-    Lwt.return allow
-  ) () in
-  let* () = update mvar (fun s -> { s with perm_server = Some perm_server }) in
+  (* Load sessions for History mode on startup *)
+  let* () = switch_to_history mvar in
 
   (* Initial render *)
   redraw mvar;
@@ -2309,18 +1573,11 @@ let run ~config ~project_dir () =
    | Urme_core.Config.Pro | Urme_core.Config.Max -> refresh_usage mvar
    | Urme_core.Config.Api -> ());
 
-  let handle_approval mvar allow =
-    match (match peek mvar with Some s -> s.pending | None -> None) with
-    | Some p -> p.resolve allow; redraw mvar; Lwt.return_unit
-    | None -> Lwt.return_unit
-  in
-
   let do_quit () =
     let s = match peek mvar with Some s -> s | None -> initial_state ~config ~project_dir in
-    (match s.daemon with Some d -> Urme_claude.Process.kill d | None -> ());
-    (match s.perm_server with
-     | Some ps ->
-       Lwt.catch (fun () -> Permission_server.stop ps) (fun _ -> Lwt.return_unit)
+    (match s.tui_bridge with
+     | Some tb ->
+       Lwt.catch (fun () -> Tui_bridge.stop tb) (fun _ -> Lwt.return_unit)
        |> Lwt.ignore_result
      | None -> ());
     (* Gracefully stop services we started *)
@@ -2453,17 +1710,6 @@ let run ~config ~project_dir () =
     | `Key (`ASCII 'h', mods) when List.mem `Meta mods ->
       let* () = switch_to_history mvar in loop ()
 
-    | `Key (`ASCII c, []) when (match peek mvar with Some s -> s.pending <> None | None -> false)
-        && (c = 'y' || c = 'Y') ->
-      let* () = handle_approval mvar true in loop ()
-
-    | `Key (`ASCII c, []) when (match peek mvar with Some s -> s.pending <> None | None -> false)
-        && (c = 'n' || c = 'N') ->
-      let* () = handle_approval mvar false in loop ()
-
-    | _ when (match peek mvar with Some s -> s.pending <> None | None -> false) ->
-      loop ()
-
     (* --- Palette open: intercept keys --- *)
     | `Key (`Enter, _)
       when (match peek mvar with Some s -> s.palette_open | None -> false) ->
@@ -2478,7 +1724,17 @@ let run ~config ~project_dir () =
         { s with input_text = ""; palette_open = false; palette_selected = 0 }) in
       if cmd = "/exit" || cmd = "/quit" then do_quit ()
       else begin
-        let* _handled = handle_command mvar cmd in
+        let* () = (match cmd with
+          | "/git" -> switch_to_git mvar
+          | "/history" -> switch_to_history mvar
+          | "/verbose" | "/v" ->
+            update mvar (fun s ->
+              { s with verbose = not s.verbose;
+                       status_extra = if s.verbose then "Verbose off" else "Verbose on" })
+          | _ ->
+            update mvar (fun s ->
+              { s with status_extra = Printf.sprintf "Unknown: %s" cmd })
+        ) in
         redraw mvar; loop ()
       end
 
@@ -2540,7 +1796,7 @@ let run ~config ~project_dir () =
           { s with git = { s.git with file_diff_filter = None; diff_scroll_git = 0 };
                    status_extra = "Git browser" }
         | None ->
-          { s with mode = Conv; status_extra = "Ready" }) in
+          { s with mode = History; status_extra = "Ready" }) in
       redraw mvar; loop ()
 
     (* Tab: next panel *)
@@ -2915,11 +2171,13 @@ let run ~config ~project_dir () =
         { s with mode = s.history.return_mode; status_extra = "Ready" }) in
       redraw mvar; loop ()
 
-    | `Key (`ASCII 'q', [])
+    | `Key (`ASCII 'g', [])
       when (match peek mvar with Some s -> s.mode = History | None -> false) ->
-      let* () = update mvar (fun s ->
-        { s with mode = s.history.return_mode; status_extra = "Ready" }) in
-      redraw mvar; loop ()
+      let* () = switch_to_git mvar in loop ()
+
+    | `Key (`ASCII 'q', [])
+      when (match peek mvar with Some s -> s.mode = History || s.mode = Git | None -> false) ->
+      do_quit ()
 
     | `Key (`ASCII '/', [])
       when (match peek mvar with Some s -> s.mode = History | None -> false) ->
@@ -2927,16 +2185,16 @@ let run ~config ~project_dir () =
         { s with history = { s.history with search_active = true; search_query = "" } }) in
       redraw mvar; loop ()
 
-    | `Key (`ASCII 'i', [])
+    | `Key (`ASCII 'u', [])
       when (match peek mvar with Some s -> s.mode = History | None -> false) ->
       let* () = index_sessions mvar in
       loop ()
 
-    | `Key (`ASCII 'w', [])
+    | `Key (`ASCII 'i', [])
       when (match peek mvar with Some s -> s.mode = History | None -> false) ->
       (* Wipe ChromaDB collections and re-index *)
       let* () = update mvar (fun s ->
-        { s with status_extra = "Wiping ChromaDB..." }) in
+        { s with status_extra = "Initialising (wiping DB)..." }) in
       redraw mvar;
       Lwt.async (fun () ->
         Lwt.catch (fun () ->
@@ -2953,7 +2211,7 @@ let run ~config ~project_dir () =
             Urme_search.Chromadb.delete_collection ~port
               ~name:(project ^ "_experiences")) (fun _ -> Lwt.return_unit) in
           let* () = update mvar (fun s ->
-            { s with status_extra = "Wiped. Re-indexing..." }) in
+            { s with status_extra = "Initialising: indexing..." }) in
           redraw mvar;
           (* Now run index_sessions *)
           index_sessions mvar
@@ -3057,64 +2315,6 @@ let run ~config ~project_dir () =
 
     | _ when (match peek mvar with Some s -> s.mode = Git || s.mode = History | None -> false) ->
       loop ()
-
-    (* --- Conv mode keys --- *)
-    | `Key (`Enter, _) ->
-      let text = (match peek mvar with Some s -> s.input_text | None -> "") in
-      if text = "/exit" || text = "/quit" then begin
-        let* () = update mvar (fun s -> { s with input_text = "" }) in
-        do_quit ()
-      end else begin
-        let is_cmd = String.length text > 0 && text.[0] = '/' in
-        let* () =
-          if is_cmd then begin
-            let* () = update mvar (fun s -> { s with input_text = "" }) in
-            let* _handled = handle_command mvar text in
-            Lwt.return_unit
-          end else
-            send_message mvar
-        in
-        loop ()
-      end
-
-    | `Key (`Backspace, _) ->
-      let* () = update mvar (fun s ->
-        let len = String.length s.input_text in
-        if len > 0 then { s with input_text = String.sub s.input_text 0 (len - 1) }
-        else s) in
-      redraw mvar; loop ()
-
-    | `Key (`ASCII c, []) ->
-      let ch = Char.code c in
-      let* () =
-        if ch >= 32 && ch < 127 then
-          let* () = update mvar (fun s ->
-            let text = s.input_text ^ String.make 1 c in
-            let open_palette = s.input_text = "" && c = '/' in
-            { s with input_text = text;
-                     palette_open = open_palette;
-                     palette_selected = 0 }) in
-          (redraw mvar; Lwt.return_unit)
-        else Lwt.return_unit
-      in
-      loop ()
-
-    | `Key (`Tab, _) ->
-      let* () = update mvar (fun s -> { s with active_pane =
-        match s.active_pane with `Conv -> `Diff | `Diff -> `Conv }) in
-      redraw mvar; loop ()
-
-    | `Key (`Arrow `Up, _) ->
-      let* () = update mvar (fun s -> match s.active_pane with
-        | `Conv -> { s with scroll_offset = s.scroll_offset + 1 }
-        | `Diff -> { s with diff_scroll = s.diff_scroll + 1 }) in
-      redraw mvar; loop ()
-
-    | `Key (`Arrow `Down, _) ->
-      let* () = update mvar (fun s -> match s.active_pane with
-        | `Conv -> { s with scroll_offset = max 0 (s.scroll_offset - 1) }
-        | `Diff -> { s with diff_scroll = max 0 (s.diff_scroll - 1) }) in
-      redraw mvar; loop ()
 
     | `Resize _ -> redraw mvar; loop ()
     | _ -> loop ()

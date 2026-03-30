@@ -457,6 +457,38 @@ let update_index ~project_dir ~port ~collection_id
         Lwt.return_unit)
     ) update_list in
 
+    (* Phase 5b: mark scanned interactions that had no matches
+       so they are not re-scanned on subsequent runs *)
+    let* all_ids_after =
+      Urme_search.Chromadb.get_all_interaction_ids ~port ~collection_id in
+    let* gis_after =
+      Urme_search.Chromadb.get_all_with_git_info ~port ~collection_id in
+    let has_gi_after = Hashtbl.create (List.length gis_after) in
+    List.iter (fun (id, _, _, _, _) -> Hashtbl.replace has_gi_after id ()) gis_after;
+    let scanned_sids = match sessions_filter with
+      | Some sids ->
+        let s = Hashtbl.create (List.length sids) in
+        List.iter (fun sid -> Hashtbl.replace s sid ()) sids; s
+      | None ->
+        let s = Hashtbl.create 64 in
+        List.iter (fun id ->
+          match String.rindex_opt id '_' with
+          | Some pos -> Hashtbl.replace s (String.sub id 0 pos) ()
+          | None -> ()
+        ) all_ids_after; s in
+    let unmarked = List.filter (fun id ->
+      not (Hashtbl.mem has_gi_after id) &&
+      (match String.rindex_opt id '_' with
+       | Some pos -> Hashtbl.mem scanned_sids (String.sub id 0 pos)
+       | None -> false)
+    ) all_ids_after in
+    let* () = lwt_iter ~n:ncpu (fun iid ->
+      Lwt.catch (fun () ->
+        let+ _ok = Urme_search.Chromadb.update_interaction_git_info
+          ~port ~collection_id ~id:iid ~git_info:"{}" in ()
+      ) (fun _ -> Lwt.return_unit)
+    ) unmarked in
+
     (* Phase 6: rebuild in-memory links *)
     let* () = status "Git links: building link index..." in
     let* fresh_gis =
