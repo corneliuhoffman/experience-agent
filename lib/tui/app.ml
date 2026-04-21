@@ -1150,14 +1150,6 @@ let log_debug msg =
 
 let parse_git_info = Urme_engine.Git_link_types.parse_git_info_json
 
-(* update_git_links: delegate to Git_link engine module *)
-let update_git_links ~project_dir ~port ~collection_id ?(sessions_filter : string list option) mvar =
-  let on_status msg =
-    let* () = update mvar (fun s -> { s with status_extra = msg }) in
-    redraw mvar; Lwt.return_unit in
-  Urme_engine.Git_link.update_index ~project_dir ~port ~collection_id
-    ?sessions_filter ~on_status ()
-
 (* ---------- Mode switching helpers ---------- *)
 
 let load_git_data ~cwd =
@@ -1432,51 +1424,25 @@ let index_sessions mvar =
           close_out oc;
           Lwt.return_unit)
       ) all_batches in
-      (* Find sessions with interactions missing git_info *)
-      let* all_ids =
-        Urme_search.Chromadb.get_all_interaction_ids ~port ~collection_id in
-      let* gis =
-        Urme_search.Chromadb.get_all_with_git_info ~port ~collection_id in
-      let has_gi = Hashtbl.create (List.length gis) in
-      List.iter (fun (id, _, _, _, _) -> Hashtbl.replace has_gi id ()) gis;
-      let sessions_needing_scan = Hashtbl.create 16 in
-      List.iter (fun id ->
-        if not (Hashtbl.mem has_gi id) then
-          (* id = "session_id_index" — extract session_id *)
-          match String.rindex_opt id '_' with
-          | Some pos -> Hashtbl.replace sessions_needing_scan
-              (String.sub id 0 pos) ()
-          | None -> ()
-      ) all_ids;
-      let sids = Hashtbl.fold (fun k () acc -> k :: acc) sessions_needing_scan [] in
-      let n_scan = List.length sids in
-      if n_scan = 0 && !n_new = 0 then begin
-        (* Rebuild in-memory links from ChromaDB *)
-        let* git_links = load_git_links_from_chroma ~port ~project in
-        let n_links = Hashtbl.length git_links in
-        let* () = update mvar (fun s ->
-          { s with git = { s.git with git_links };
-                   status_extra =
-              Printf.sprintf "Up to date: %d existing, %d links (%d sessions)"
-                !n_skip n_links total }) in
-        redraw mvar; Lwt.return_unit
-      end else begin
-        let* () = update mvar (fun s ->
-          { s with status_extra =
-              Printf.sprintf "Git links: scanning %d sessions (%d new)..."
-                n_scan !n_new }) in
-        redraw mvar;
-        let* (git_links, human_edits, human_diffs, gl_edits, gl_matched, _gl_commits, _gl_relinked) =
-          update_git_links ~project_dir:cwd ~port ~collection_id
-            ~sessions_filter:sids mvar in
-        let n_links = Hashtbl.length git_links in
-        let* () = update mvar (fun s ->
-          { s with git = { s.git with git_links; human_edits; human_diffs };
-                   status_extra =
-              Printf.sprintf "Done: %d new, %d scanned | %d edits, %d matched, %d links"
-                !n_new n_scan gl_edits gl_matched n_links }) in
-        redraw mvar; Lwt.return_unit
-      end
+      (* Branch-aware git linking via Git_index *)
+      let* () = update mvar (fun s ->
+        { s with status_extra = "Git links: diffing branches..." }) in
+      redraw mvar;
+      let pool = Domainslib.Task.setup_pool ~num_domains:4 () in
+      let edits = Urme_engine.Edit_extract.edits_of_sessions
+          ~pool ~project_dir:cwd in
+      Domainslib.Task.teardown_pool pool;
+      let* () = Urme_engine.Git_index.update
+          ~project_dir:cwd ~port ~collection_id ~edits in
+      (* Rebuild in-memory links for the TUI from ChromaDB *)
+      let* git_links = load_git_links_from_chroma ~port ~project in
+      let n_links = Hashtbl.length git_links in
+      let* () = update mvar (fun s ->
+        { s with git = { s.git with git_links };
+                 status_extra =
+            Printf.sprintf "Done: %d new interactions | %d links (%d sessions)"
+              !n_new n_links total }) in
+      redraw mvar; Lwt.return_unit
     ) (fun exn ->
       let* () = update mvar (fun s ->
         { s with status_extra = Printf.sprintf "Index error: %s"
