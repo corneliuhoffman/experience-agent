@@ -107,6 +107,11 @@ type git_state = {
   link_candidates : git_conv_link list;
 }
 
+(* View state for a single opened search result:
+   - Overview: compact panel of step properties, no turn body.
+   - Body: full user+assistant transcript of the turn (legacy view). *)
+type result_view = Overview | Body
+
 type history_state = {
   sessions : string list;           (* JSONL file paths, newest first *)
   session_idx : int;                (* which session file *)
@@ -120,6 +125,9 @@ type history_state = {
     (* session_id, user_text, document, interaction_index, timestamp, distance *)
   result_idx : int;
   showing_results : bool;
+  result_view : result_view;        (* Overview vs Body when drilling into a result *)
+  search_synthesis : string;        (* Claude's answer sentence from smart/deep search *)
+  searching : bool;                 (* True while an async search is in flight *)
 }
 
 let empty_git_state = {
@@ -135,6 +143,7 @@ let empty_history_state = {
   hist_scroll = 0; return_mode = History;
   search_active = false; search_query = "";
   search_results = []; result_idx = 0; showing_results = false;
+  result_view = Overview; search_synthesis = ""; searching = false;
 }
 
 (* Split a flat conv_entry list into turns, each starting with a User_msg *)
@@ -265,7 +274,7 @@ let initial_state ~config ~project_dir = {
   input_text = "";
   config; project_dir;
   status_extra = "Ready";
-  verbose = false;
+  verbose = true;
   palette_open = false; palette_selected = 0;
   git = empty_git_state; history = empty_history_state;
   usage = None;
@@ -1000,13 +1009,47 @@ let render_history_results state w h =
   let title_row = mk_row ~attr:title_attr w
     (Printf.sprintf "%s%s" title (String.make (max 0 (w - String.length title)) ' ')) in
   let content_h = max 0 (h - 1) in
+  (* If Claude produced a synthesis sentence, wrap it and render as a
+     highlighted banner above the result list. *)
+  let synthesis_rows, synthesis_h =
+    if hs.search_synthesis = "" then ([], 0)
+    else
+      let margin = 4 in
+      let maxw = max 10 (w - margin) in
+      let wrap s =
+        let rec go acc s =
+          if String.length s <= maxw then List.rev (s :: acc)
+          else
+            let cut = ref maxw in
+            while !cut > 0 && s.[!cut] <> ' ' do decr cut done;
+            if !cut = 0 then cut := maxw;
+            let head = String.sub s 0 !cut in
+            let tail = String.sub s !cut (String.length s - !cut)
+                       |> String.trim in
+            go (head :: acc) tail
+        in go [] s
+      in
+      let wrapped = wrap hs.search_synthesis in
+      let attr = Notty.A.(fg c_assistant ++ bg c_bg ++ st bold) in
+      let rows = List.mapi (fun i line ->
+        let prefix = if i = 0 then "  ▍ " else "    " in
+        mk_row ~attr w (prefix ^ line)
+      ) wrapped in
+      let sep = mk_row ~attr:Notty.A.(fg c_separator ++ bg c_bg) w
+        ("  " ^ String.make (max 0 (w - 4)) '-') in
+      (rows @ [sep], List.length rows + 1)
+  in
+  let content_h = max 0 (content_h - synthesis_h) in
   if hs.search_results = [] then
     let empty_msg = mk_row ~attr:Notty.A.(fg c_border ++ bg c_bg) w "  (no results)" in
     let fill = bg_block w (max 0 (content_h - 1)) in
-    (title_row <-> empty_msg <-> fill)
+    let base = title_row <-> empty_msg <-> fill in
+    if synthesis_rows = [] then base
+    else List.fold_left (fun acc r -> acc <-> r)
+           (title_row) (synthesis_rows @ [empty_msg; fill])
   else begin
     let rows = ref [] in
-    List.iteri (fun i (session_id, user_text, doc, _idx, _ts, distance) ->
+    List.iteri (fun i (session_id, user_text, doc, turn_idx, _ts, distance) ->
       if List.length !rows < content_h then begin
         let selected = i = hs.result_idx in
         let marker = if selected then ">" else " " in
@@ -1032,9 +1075,11 @@ let render_history_results state w h =
         if List.length !rows < content_h then begin
           let sid = if String.length session_id > 8
             then String.sub session_id 0 8 else session_id in
-          let line2 = Printf.sprintf "   session: %s" sid in
+          let line2 = Printf.sprintf "   session: %s  step %d" sid turn_idx in
           let line2 = if String.length line2 > w then String.sub line2 0 w else line2 in
-          let attr2 = Notty.A.(fg c_border ++ bg bg_c) in
+          (* Use c_tool_result (readable grey) for session line — c_border
+             was so dim it looked unselectable. *)
+          let attr2 = Notty.A.(fg c_tool_result ++ bg bg_c) in
           rows := mk_row ~attr:attr2 w line2 :: !rows
         end
       end
@@ -1047,14 +1092,346 @@ let render_history_results state w h =
         if used < content_h then
           img <-> bg_block w (content_h - used)
         else img in
-    title_row <-> content_img
+    let synthesis_block = match synthesis_rows with
+      | [] -> Notty.I.empty
+      | rs -> Notty.I.vcat rs in
+    title_row <-> synthesis_block <-> content_img
   end
+
+(* Compact property panel for a single turn — no body.
+
+   Sources of the displayed data, in preference order:
+   1. Current search result (if any search_results exist and we're in
+      that flow). We already have tuple fields.
+   2. Current History turn: pulled from SQLite using the open session's
+      session_id and a best-effort turn-text match. *)
+
+let fetch_step_meta_from_db ~project_dir ~session_id ~needle =
+  try
+    let db = Urme_store.Schema.open_or_create ~project_dir in
+    let sql =
+      "SELECT s.turn_index, s.timestamp, \
+              COALESCE(s.summary,''), COALESCE(s.tags,''), \
+              COALESCE(s.files_touched,'[]'), \
+              COALESCE(s.commands_run,'[]'), \
+              s.commit_before, s.commit_after, \
+              COALESCE(s.thinking,'[]') \
+       FROM steps s \
+       WHERE s.session_id = ? AND s.prompt_text LIKE ? \
+       LIMIT 1"
+    in
+    let needle_head =
+      let n = String.trim needle in
+      let n = if String.length n > 60 then String.sub n 0 60 else n in
+      "%" ^ n ^ "%"
+    in
+    let rows = Urme_store.Db.query_list db sql
+      [Sqlite3.Data.TEXT session_id; Sqlite3.Data.TEXT needle_head]
+      ~f:(fun cols ->
+        let s = Urme_store.Db.data_to_string in
+        let so = Urme_store.Db.data_to_string_opt in
+        (Urme_store.Db.data_to_int cols.(0),
+         Urme_store.Db.data_to_float cols.(1),
+         s cols.(2), s cols.(3), s cols.(4), s cols.(5),
+         so cols.(6), so cols.(7), s cols.(8)))
+    in
+    Urme_store.Schema.close db;
+    match rows with r :: _ -> Some r | [] -> None
+  with _ -> None
+
+let render_history_overview state w h =
+  let hs = state.history in
+  let content_h = max 0 (h - 1) in
+  let sep = { fg = c_separator; bg = None; text = "" } in
+  let field name value =
+    { fg = c_tool_name; bg = None;
+      text = Printf.sprintf "  %-14s %s" (name ^ ":") value } in
+  let body_lines text color =
+    let lines_split =
+      String.split_on_char '\n' text
+      |> List.concat_map (fun line ->
+        if String.length line <= w - 4 then [line]
+        else
+          let rec chunks s =
+            if String.length s <= w - 4 then [s]
+            else String.sub s 0 (w - 4)
+                 :: chunks (String.sub s (w - 4)
+                              (String.length s - (w - 4)))
+          in chunks line) in
+    List.map (fun l -> { fg = color; bg = None; text = "    " ^ l })
+      lines_split in
+
+  let in_search = hs.search_results <> [] && not hs.showing_results in
+  let header =
+    if in_search then
+      Printf.sprintf
+        " Result %d/%d — Overview (Enter=body, ←/→=prev/next, b=list)"
+        (hs.result_idx + 1) (List.length hs.search_results)
+    else
+      Printf.sprintf
+        " Turn %d/%d — Overview (Enter=body, ←/→=prev/next turn)"
+        (hs.turn_idx + 1) (List.length hs.turns)
+  in
+  let header = header ^ String.make (max 0 (w - String.length header)) ' ' in
+  let title_attr = Notty.A.(fg c_highlight ++ bg c_status_bg ++ st bold) in
+  let title_row = mk_row ~attr:title_attr w header in
+
+  (* Extract per-turn "actions" (tool_uses) from the currently-loaded
+     turn entries. Works for both search-result and plain-history views
+     because jump_to_result loads hs.turns for the target session. *)
+  let current_turn = List.nth_opt hs.turns hs.turn_idx in
+  let actions_block =
+    match current_turn with
+    | None | Some [] -> []
+    | Some entries ->
+      let actions = List.filter_map (fun e ->
+        match e with
+        | Tool_use_block { tool_name; input; _ } ->
+          let open Yojson.Safe.Util in
+          let get_s k default =
+            try input |> member k |> to_string with _ -> default in
+          let summary = match tool_name with
+            | "Bash" -> "$ " ^ get_s "command" ""
+            | "Edit" | "Write" | "Read" -> get_s "file_path" ""
+            | "Grep" -> "/" ^ get_s "pattern" "" ^ "/"
+            | "Glob" -> get_s "pattern" ""
+            | "Task" -> get_s "description" ""
+            | "WebFetch" -> get_s "url" ""
+            | "WebSearch" -> get_s "query" ""
+            | _ ->
+              (try
+                 match input with
+                 | `Assoc ((_, `String v) :: _) -> v
+                 | _ -> ""
+               with _ -> "")
+          in
+          let max_len = max 10 (w - 16) in
+          let trimmed =
+            if String.length summary > max_len
+            then String.sub summary 0 max_len ^ "..."
+            else summary
+          in
+          Some (tool_name, trimmed)
+        | _ -> None
+      ) entries in
+      if actions = [] then []
+      else
+        [ sep;
+          { fg = c_tool_name; bg = None;
+            text = Printf.sprintf "  Actions (%d):" (List.length actions) };
+        ]
+        @ List.map (fun (name, summary) ->
+            { fg = c_tool_name; bg = None;
+              text = Printf.sprintf "    [%s] %s" name summary }
+          ) actions
+  in
+  let lines =
+    if in_search then begin
+      match List.nth_opt hs.search_results hs.result_idx with
+      | None -> [ { fg = c_border; bg = None; text = "  (no result)" } ]
+      | Some (session_id, user_text, doc, turn_idx, ts_str, dist) ->
+        let sid = if String.length session_id >= 8
+          then String.sub session_id 0 8 else session_id in
+        [ field "session" sid;
+          field "turn" (string_of_int turn_idx);
+          field "timestamp" ts_str;
+          field "score" (Printf.sprintf "%.2f" dist);
+          sep;
+          { fg = c_assistant; bg = None; text = "  Summary:" };
+        ]
+        @ body_lines (if doc <> "" then doc else "(none)") c_assistant
+        @ actions_block
+        @ [ sep;
+            { fg = c_user; bg = None; text = "  User message (excerpt):" };
+          ]
+        @ body_lines
+            (let t = String.trim user_text in
+             if t = "" then "(empty)"
+             else if String.length t > 600
+             then String.sub t 0 600 ^ "..."
+             else t)
+            c_user
+    end else begin
+      (* Main History mode: derive metadata from the open turn +
+         best-effort DB lookup. *)
+      let session_id = match List.nth_opt hs.sessions hs.session_idx with
+        | Some path -> Filename.basename path |> Filename.chop_extension
+        | None -> "" in
+      let sid = if String.length session_id >= 8
+        then String.sub session_id 0 8 else session_id in
+      let current_turn = List.nth_opt hs.turns hs.turn_idx in
+      let user_text = match current_turn with
+        | Some entries ->
+          (match List.find_opt (function User_msg _ -> true | _ -> false)
+                  entries with
+           | Some (User_msg t) -> t
+           | _ -> "")
+        | None -> ""
+      in
+      let meta = fetch_step_meta_from_db ~project_dir:state.project_dir
+                   ~session_id ~needle:user_text in
+      let common =
+        [ field "session" sid; ] @
+        (match meta with
+         | Some (turn_index, ts, _, _, _, _, cb, ca, _) ->
+           let tm = Unix.gmtime ts in
+           let date = Printf.sprintf
+             "%04d-%02d-%02d %02d:%02d"
+             (tm.tm_year + 1900) (tm.tm_mon + 1) tm.tm_mday
+             tm.tm_hour tm.tm_min in
+           [ field "db turn" (string_of_int turn_index);
+             field "timestamp" date;
+             field "commit_before"
+               (match cb with Some s ->
+                  if String.length s >= 7 then String.sub s 0 7 else s
+                | None -> "-");
+             field "commit_after"
+               (match ca with Some s ->
+                  if String.length s >= 7 then String.sub s 0 7 else s
+                | None -> "-"); ]
+         | None ->
+           [ field "turn" (string_of_int hs.turn_idx);
+             { fg = c_border; bg = None;
+               text = "  (no matching DB row for this turn)" }; ])
+      in
+      let summary_block = match meta with
+        | Some (_, _, summary, tags, _, _, _, _, _) ->
+          [ sep;
+            { fg = c_assistant; bg = None; text = "  Summary:" } ]
+          @ body_lines
+              (if summary <> "" then summary else "(not yet summarised)")
+              c_assistant
+          @ (if tags <> ""
+             then [ field "tags" tags ] else [])
+        | None -> []
+      in
+      let thinking_block = match meta with
+        | Some (_, _, _, _, _, _, _, _, thinking_json) ->
+          let parse_arr j =
+            try match Yojson.Safe.from_string j with
+              | `List xs ->
+                List.filter_map
+                  (function `String s -> Some s | _ -> None) xs
+              | _ -> []
+            with _ -> []
+          in
+          let thoughts = parse_arr thinking_json in
+          if thoughts = [] then []
+          else
+            [ sep;
+              { fg = c_thinking; bg = None;
+                text = Printf.sprintf "  Thinking (%d):"
+                         (List.length thoughts) } ]
+            @ List.concat_map (fun t ->
+                let clipped =
+                  let t = String.trim t in
+                  if String.length t > 400
+                  then String.sub t 0 400 ^ "..."
+                  else t in
+                body_lines clipped c_thinking) thoughts
+        | None -> []
+      in
+      let files_cmds_block = match meta with
+        | Some (_, _, _, _, files_json, cmds_json, _, _, _) ->
+          let parse_arr j =
+            try match Yojson.Safe.from_string j with
+              | `List xs ->
+                List.filter_map
+                  (function `String s -> Some s | _ -> None) xs
+              | _ -> []
+            with _ -> []
+          in
+          let files = parse_arr files_json in
+          let cmds = parse_arr cmds_json in
+          (if files <> [] then
+             [ sep;
+               { fg = c_tool_name; bg = None;
+                 text = Printf.sprintf "  Files (%d):" (List.length files) };
+             ]
+             @ List.map (fun f ->
+                 { fg = c_fg; bg = None; text = "    " ^ f }) files
+           else [])
+          @ (if cmds <> [] then
+               [ sep;
+                 { fg = c_tool_name; bg = None;
+                   text = Printf.sprintf "  Commands (%d):"
+                            (List.length cmds) };
+               ]
+               @ List.map (fun c ->
+                   { fg = c_fg; bg = None;
+                     text = "    $ " ^
+                            (if String.length c > w - 8
+                             then String.sub c 0 (w - 11) ^ "..."
+                             else c) }) cmds
+             else [])
+        | None -> []
+      in
+      let user_block =
+        [ sep;
+          { fg = c_user; bg = None; text = "  User message (excerpt):" } ]
+        @ body_lines
+            (let t = String.trim user_text in
+             if t = "" then "(empty)"
+             else if String.length t > 600
+             then String.sub t 0 600 ^ "..."
+             else t)
+            c_user
+      in
+      common @ summary_block @ thinking_block @ files_cmds_block
+      @ actions_block @ user_block
+    end
+  in
+  let visible = List.filteri (fun i _ -> i < content_h) lines in
+  let rows = List.map (fun l ->
+    let attr = Notty.A.(fg l.fg ++ bg (match l.bg with Some b -> b | None -> c_bg)) in
+    mk_row ~attr w l.text
+  ) visible in
+  let content_img = match rows with
+    | [] -> bg_block w content_h
+    | _ ->
+      let img = Notty.I.vcat rows in
+      let used = Notty.I.height img in
+      if used < content_h then img <-> bg_block w (content_h - used)
+      else img in
+  title_row <-> content_img
 
 let render_history_content state w h =
   let hs = state.history in
-  if hs.showing_results then
-    render_history_results state w h
+  if hs.searching then begin
+    (* In-flight async search — replace the whole content with a
+       prominent "Searching..." panel so the user doesn't see a stale
+       step while Claude's NL→SQL + rerank + answer chain runs. *)
+    let title = Printf.sprintf " Searching: \"%s\"" hs.search_query in
+    let title = title ^ String.make (max 0 (w - String.length title)) ' ' in
+    let title_attr = Notty.A.(fg c_highlight ++ bg c_status_bg ++ st bold) in
+    let title_row = mk_row ~attr:title_attr w title in
+    let content_h = max 0 (h - 1) in
+    let msg1 = mk_row ~attr:Notty.A.(fg c_assistant ++ bg c_bg ++ st bold) w
+      "  ⏳ Asking Claude to plan the search, rank candidates, and draft an answer…" in
+    let msg2 = mk_row ~attr:Notty.A.(fg c_tool_result ++ bg c_bg) w
+      "     (typically 5–15s)" in
+    let fill = bg_block w (max 0 (content_h - 2)) in
+    title_row <-> msg1 <-> msg2 <-> fill
+  end
   else if hs.search_active then begin
+    (* Search input prompt always wins — it's the active focus. *)
+    let title = " Search history" in
+    let title_attr = Notty.A.(fg c_highlight ++ bg c_status_bg ++ st bold) in
+    let title_row = mk_row ~attr:title_attr w
+      (Printf.sprintf "%s%s" title (String.make (max 0 (w - String.length title)) ' ')) in
+    let content_h = max 0 (h - 1) in
+    let prompt = Printf.sprintf " > %s_" hs.search_query in
+    let prompt_attr = Notty.A.(fg c_highlight ++ bg c_bg) in
+    let prompt_row = mk_row ~attr:prompt_attr w prompt in
+    let gap = bg_block w 1 in
+    let fill = bg_block w (max 0 (content_h - 2)) in
+    title_row <-> gap <-> prompt_row <-> fill
+  end
+  else if hs.showing_results then
+    render_history_results state w h
+  else if hs.result_view = Overview then
+    render_history_overview state w h
+  else if false then begin  (* dead branch kept for structure, now in if-above *)
     (* Show search input *)
     let title = " Search history" in
     let title_attr = Notty.A.(fg c_highlight ++ bg c_status_bg ++ st bold) in
@@ -1413,11 +1790,7 @@ let index_sessions mvar =
             Printf.sprintf "Indexed %d turns; building git links..." n }) in
       redraw mvar;
       let* () = Lwt.catch (fun () ->
-        let pool = Domainslib.Task.setup_pool ~num_domains:4 () in
-        let edits = Urme_engine.Edit_extract.edits_of_sessions
-            ~pool ~project_dir:cwd in
-        Domainslib.Task.teardown_pool pool;
-        Urme_engine.Git_index.update ~project_dir:cwd ~db ~edits
+        Urme_engine.Git_index.run_once ~project_dir:cwd ~db
       ) (fun _ -> Lwt.return_unit) in
       Urme_store.Schema.close db;
       let* git_links = load_git_links_from_db ~project_dir:cwd in
@@ -1447,45 +1820,48 @@ let hit_to_tuple (h : Urme_search.Search.hit) =
     else "" in
   (session_id, h.prompt_text, doc, h.turn_index, ts_str, -. h.score)
 
-(* [smart] = true runs Claude rewrite + rerank on top of FTS5.
-   Slower (a few seconds) but cleaner results on generic queries. *)
-let execute_search ?(smart=false) mvar query =
+(* Single search mode: Deep (NL→SQL + rerank + grounded answer). The
+   earlier fast/smart variants are kept in the library for other
+   callers but the TUI only exposes deep. *)
+let execute_search mvar query =
   let* () = update mvar (fun s ->
-    { s with status_extra =
-               (if smart then "Searching (smart)..." else "Searching...");
-             history = { s.history with search_active = false } }) in
+    { s with status_extra = "Searching...";
+             history = { s.history with
+                         search_active = false;
+                         searching = true;
+                         search_synthesis = "";
+                         search_results = [];
+                         showing_results = false } }) in
   redraw mvar;
   Lwt.async (fun () ->
     Lwt.catch (fun () ->
       let* s_val = Lwt_mvar.take mvar in
       let* () = Lwt_mvar.put mvar s_val in
       let db = Urme_store.Schema.open_or_create ~project_dir:s_val.project_dir in
+      let config = s_val.config in
       let* hits, synthesis =
-        if smart then
-          let config = s_val.config in
-          Urme_search.Search.run_smart
-            ~db ~binary:config.claude_binary ~limit:20 query
-        else
-          Lwt.return
-            (Urme_search.Search.run_with_fallback ~db ~limit:20 query, "")
+        Urme_search.Search.run_deep
+          ~db ~binary:config.claude_binary
+          ~project_dir:s_val.project_dir ~limit:20 query
       in
       Urme_store.Schema.close db;
       let results = List.map hit_to_tuple hits in
-      let status = match synthesis with
-        | "" -> Printf.sprintf "Found %d results" (List.length results)
-        | s -> Printf.sprintf "— %s" s
-      in
+      let status = Printf.sprintf "Found %d results" (List.length results) in
       let* () = update mvar (fun s ->
         { s with history = { s.history with
             search_results = results;
             showing_results = true;
             search_query = query;
-            result_idx = 0 };
+            result_idx = 0;
+            search_synthesis = synthesis;
+            searching = false };
           status_extra = status }) in
       redraw mvar; Lwt.return_unit
     ) (fun exn ->
       let* () = update mvar (fun s ->
-        { s with history = { s.history with showing_results = false };
+        { s with history = { s.history with
+                              showing_results = false;
+                              searching = false };
                  status_extra = Printf.sprintf "Search error: %s"
                    (Printexc.to_string exn) }) in
       redraw mvar; Lwt.return_unit));
@@ -1505,9 +1881,79 @@ let switch_to_history mvar =
                          hist_scroll = 0; return_mode = s.mode;
                          search_active = false; search_query = "";
                          search_results = []; result_idx = 0;
-                         showing_results = false };
+                         showing_results = false;
+                         result_view = Overview;
+                         search_synthesis = "";
+                         searching = false };
              status_extra = Printf.sprintf "History (%d sessions)" n }) in
   redraw mvar; Lwt.return_unit
+
+(* ---------- Background resync (indexer + summariser + linker) ----------
+
+   Runs once at TUI startup, then every hour while the TUI is alive.
+   Idempotent — indexer upserts by (session_id, turn_index), summariser
+   only touches rows with NULL summary, linker walks the small diff from
+   last-saved state. Concurrent runs are guarded by [refresh_busy]. *)
+
+let refresh_busy = ref false
+
+(* Background resync = indexer + incremental summariser + git linker.
+   [Summarise.summarise_pending] only processes rows where summary
+   IS NULL, so this is a no-op on steady state and costs a few Claude
+   calls only when new turns appear. *)
+let full_resync mvar =
+  if !refresh_busy then Lwt.return_unit
+  else begin
+    refresh_busy := true;
+    Lwt.finalize (fun () ->
+      Lwt.catch (fun () ->
+        let* s_val = Lwt_mvar.take mvar in
+        let* () = Lwt_mvar.put mvar s_val in
+        let cwd = s_val.project_dir in
+        let config = s_val.config in
+        let* () = update mvar (fun s ->
+          { s with status_extra = "Background resync: indexing..." }) in
+        redraw mvar;
+        let db = Urme_store.Schema.open_or_create ~project_dir:cwd in
+        let n = Urme_engine.Indexer.index_all_sessions ~db ~project_dir:cwd in
+        let* () = update mvar (fun s ->
+          { s with status_extra =
+              Printf.sprintf "Resync: %d turns; summarising new..." n }) in
+        redraw mvar;
+        let* () =
+          Lwt.catch (fun () ->
+            Urme_engine.Summarise.summarise_pending
+              ~binary:config.claude_binary ~db ())
+            (fun _ -> Lwt.return_unit)
+        in
+        let* () = update mvar (fun s ->
+          { s with status_extra = "Resync: building git links..." }) in
+        redraw mvar;
+        let* () = Lwt.catch (fun () ->
+          Urme_engine.Git_index.run_once ~project_dir:cwd ~db)
+          (fun _ -> Lwt.return_unit) in
+        Urme_store.Schema.close db;
+        let* () = update mvar (fun s ->
+          { s with status_extra = "Ready" }) in
+        redraw mvar; Lwt.return_unit
+      ) (fun exn ->
+        let* () = update mvar (fun s ->
+          { s with status_extra =
+              Printf.sprintf "Resync error: %s" (Printexc.to_string exn) }) in
+        redraw mvar; Lwt.return_unit))
+      (fun () -> refresh_busy := false; Lwt.return_unit)
+  end
+
+(* Hourly background loop — kicked off once at startup and runs for the
+   life of the TUI. *)
+let spawn_hourly_resync mvar =
+  Lwt.async (fun () ->
+    let rec loop () =
+      let* () = Lwt_unix.sleep 3600.0 in
+      let* () = full_resync mvar in
+      loop ()
+    in
+    loop ())
 
 (* ---------- Usage refresh ---------- *)
 
@@ -1544,6 +1990,10 @@ let run ~config ~project_dir () =
    | Urme_core.Config.Pro | Urme_core.Config.Max -> refresh_usage mvar
    | Urme_core.Config.Api -> ());
 
+  (* One-shot resync on startup + hourly background loop. *)
+  Lwt.async (fun () -> full_resync mvar);
+  spawn_hourly_resync mvar;
+
   let do_quit () =
     let s = match peek mvar with Some s -> s | None -> initial_state ~config ~project_dir in
     (match s.tui_bridge with
@@ -1557,7 +2007,8 @@ let run ~config ~project_dir () =
   in
 
   (* Navigate to result ri in the search_results list (works for both search and git links) *)
-  let jump_to_result s ri =
+  (* Internal helper; wrapped below to force result_view = Overview on entry. *)
+  let jump_to_result_raw s ri =
     let h = s.history in
     match List.nth_opt h.search_results ri with
     | Some (session_id, user_text, _doc, _turn_idx, _ts, _dist) ->
@@ -1643,16 +2094,25 @@ let run ~config ~project_dir () =
                  status_extra = Printf.sprintf "Link %d/%d"
                    (ri + 1) (List.length h.search_results) }
       else
-        (* Search result: match by user text *)
+        (* Search result: match by user text. The indexer preserves the
+           raw prompt_text including XML wrappers like
+           <local-command-stdout>…</…>, but the TUI's turn splitter
+           strips those. So normalize both sides before comparing. *)
         let turns = split_into_turns (load_session_entries path) in
-        let needle = String.trim user_text in
+        let norm s = String.trim (strip_xml_tags s) in
+        let needle = norm user_text in
+        let needle_head =
+          if String.length needle > 80
+          then String.sub needle 0 80 else needle in
         let ti = let rec f i = function
           | [] -> min _turn_idx (max 0 (List.length turns - 1))
           | turn :: rest ->
             if List.exists (fun e -> match e with
-              | User_msg t -> let t = String.trim t in
-                (needle <> "" && String.length t >= String.length needle &&
-                 String.sub t 0 (String.length needle) = needle) || t = needle
+              | User_msg t ->
+                let t = norm t in
+                needle_head <> ""
+                && String.length t >= String.length needle_head
+                && String.sub t 0 (String.length needle_head) = needle_head
               | _ -> false) turn then i else f (i+1) rest
           in f 0 turns in
         { s with history = { h with result_idx = ri; session_idx = new_si;
@@ -1661,6 +2121,12 @@ let run ~config ~project_dir () =
                  status_extra = Printf.sprintf "Result %d/%d"
                    (ri + 1) (List.length h.search_results) }
     | None -> s
+  in
+
+  (* Public wrapper: always land in Overview view on a fresh jump. *)
+  let jump_to_result s ri =
+    let s' = jump_to_result_raw s ri in
+    { s' with history = { s'.history with result_view = Overview } }
   in
 
   let events = Notty_lwt.Term.events term in
@@ -1914,7 +2380,10 @@ let run ~config ~project_dir () =
                                return_mode = Git;
                                search_active = false; search_query = "";
                                search_results = results; result_idx = 0;
-                               showing_results = true };
+                               showing_results = true;
+                               result_view = Overview;
+                               search_synthesis = "";
+                               searching = false };
                    git = { g with link_candidates = links; link_idx = 0 };
                    status_extra = Printf.sprintf "%d links" (List.length links) }) in
         redraw mvar; loop ()
@@ -2059,14 +2528,7 @@ let run ~config ~project_dir () =
       let query = (match peek mvar with
         | Some s -> s.history.search_query | None -> "") in
       if query <> "" then begin
-        (* Prefix '?' toggles smart mode (Claude rewrite + rerank). *)
-        let smart, q =
-          if String.length query > 0 && query.[0] = '?'
-          then true, String.sub query 1 (String.length query - 1) |> String.trim
-          else false, query in
-        let* () =
-          if q = "" then Lwt.return_unit
-          else execute_search ~smart mvar q in
+        let* () = execute_search mvar query in
         loop ()
       end else begin
         let* () = update mvar (fun s ->
@@ -2115,6 +2577,66 @@ let run ~config ~project_dir () =
             | Some s -> s.mode = History && s.history.showing_results | _ -> false) ->
       let* () = update mvar (fun s ->
         jump_to_result s s.history.result_idx) in
+      redraw mvar; loop ()
+
+    (* Overview → Body: Enter promotes from metadata panel to full turn.
+       Works for both search-result and plain history-turn navigation. *)
+    | `Key (`Enter, _)
+      when (match peek mvar with
+            | Some s ->
+              s.mode = History
+              && not s.history.search_active
+              && not s.history.showing_results
+              && s.history.result_view = Overview
+            | None -> false) ->
+      let* () = update mvar (fun s ->
+        { s with history = { s.history with result_view = Body };
+                 status_extra = "Turn body — ←/→ prev/next, b/Enter=overview" }) in
+      redraw mvar; loop ()
+
+    (* Body → Overview: Enter snaps back up. *)
+    | `Key (`Enter, _)
+      when (match peek mvar with
+            | Some s ->
+              s.mode = History
+              && not s.history.search_active
+              && not s.history.showing_results
+              && s.history.result_view = Body
+            | None -> false) ->
+      let* () = update mvar (fun s ->
+        { s with history = { s.history with result_view = Overview };
+                 status_extra = "Overview" }) in
+      redraw mvar; loop ()
+
+    (* Plain Right in Overview/Body (search-result mode) → next result,
+       snapping to Overview. *)
+    | `Key (`Arrow `Right, mods)
+      when not (List.mem `Shift mods)
+        && (match peek mvar with
+            | Some s ->
+              s.mode = History
+              && s.history.search_results <> []
+              && not s.history.showing_results
+            | None -> false) ->
+      let* () = update mvar (fun s ->
+        let max_ri = max 0 (List.length s.history.search_results - 1) in
+        let ri = min max_ri (s.history.result_idx + 1) in
+        if ri = s.history.result_idx then s
+        else jump_to_result s ri) in
+      redraw mvar; loop ()
+
+    | `Key (`Arrow `Left, mods)
+      when not (List.mem `Shift mods)
+        && (match peek mvar with
+            | Some s ->
+              s.mode = History
+              && s.history.search_results <> []
+              && not s.history.showing_results
+            | None -> false) ->
+      let* () = update mvar (fun s ->
+        let ri = max 0 (s.history.result_idx - 1) in
+        if ri = s.history.result_idx then s
+        else jump_to_result s ri) in
       redraw mvar; loop ()
 
     | `Key (`Arrow `Up, _)
@@ -2240,10 +2762,10 @@ let run ~config ~project_dir () =
       let* () = update mvar (fun s ->
         let h = s.history in
         if h.turn_idx > 0 then
-          (* Previous turn in same session *)
-          { s with history = { h with turn_idx = h.turn_idx - 1; hist_scroll = 0 } }
+          { s with history = { h with turn_idx = h.turn_idx - 1;
+                                       hist_scroll = 0;
+                                       result_view = Overview } }
         else
-          (* Go to previous session, last turn *)
           let si = max 0 (h.session_idx - 1) in
           if si <> h.session_idx then
             let turns = match List.nth_opt h.sessions si with
@@ -2251,7 +2773,8 @@ let run ~config ~project_dir () =
               | None -> [] in
             let ti = max 0 (List.length turns - 1) in
             { s with history = { h with session_idx = si; turns; turn_idx = ti;
-                                         hist_scroll = 0 } }
+                                         hist_scroll = 0;
+                                         result_view = Overview } }
           else s) in
       redraw mvar; loop ()
 
@@ -2260,10 +2783,10 @@ let run ~config ~project_dir () =
       let* () = update mvar (fun s ->
         let h = s.history in
         if h.turn_idx < List.length h.turns - 1 then
-          (* Next turn in same session *)
-          { s with history = { h with turn_idx = h.turn_idx + 1; hist_scroll = 0 } }
+          { s with history = { h with turn_idx = h.turn_idx + 1;
+                                       hist_scroll = 0;
+                                       result_view = Overview } }
         else
-          (* Go to next session, first turn *)
           let max_si = max 0 (List.length h.sessions - 1) in
           let si = min max_si (h.session_idx + 1) in
           if si <> h.session_idx then
@@ -2271,7 +2794,8 @@ let run ~config ~project_dir () =
               | Some path -> split_into_turns (load_session_entries path)
               | None -> [] in
             { s with history = { h with session_idx = si; turns; turn_idx = 0;
-                                         hist_scroll = 0 } }
+                                         hist_scroll = 0;
+                                         result_view = Overview } }
           else s) in
       redraw mvar; loop ()
 

@@ -52,9 +52,11 @@ let run ~db ?(limit=default_limit) ?(join=Fts.And) query =
        ORDER BY score \
        LIMIT ?"
     in
-    D.query_list db sql
-      [S.Data.TEXT match_expr; S.Data.INT (Int64.of_int limit)]
-      ~f:row_to_hit
+    try
+      D.query_list db sql
+        [S.Data.TEXT match_expr; S.Data.INT (Int64.of_int limit)]
+        ~f:row_to_hit
+    with _ -> []
 
 (* Fallback-on-miss: run primary query; if fewer than [~min_hits], retry
    with OR-join; still sparse → return whatever we got. Callers that want
@@ -66,6 +68,149 @@ let run_with_fallback ~db ?(limit=default_limit) ?(min_hits=3) query =
     let widened = run ~db ~limit ~join:Or query in
     if List.length widened >= List.length primary then widened
     else primary
+
+(* ---------- Deep search (NL→SQL + rerank + grounded answer) ----- *)
+
+(* Execute a Prompts.query_spec as a SQL query. Tries progressively
+   looser variants if the strictest one returns nothing:
+     1) AND + require_summary + date bounds
+     2) OR  + require_summary + date bounds
+     3) OR  + no require_summary + date bounds
+     4) OR  + no require_summary + no date bounds *)
+let run_spec ~db (spec : Urme_claude.Prompts.query_spec) =
+  let order = match spec.order_by with
+    | Urme_claude.Prompts.Earliest -> "s.timestamp ASC, bm25(steps_fts)"
+    | Latest -> "s.timestamp DESC, bm25(steps_fts)"
+    | Relevance -> "bm25(steps_fts)"
+  in
+  let attempt ?(join=Fts.And) ?(require_summary=spec.require_summary)
+              ?(use_dates=true) () =
+    (* Fts.build_match sanitises tokens; if it yields None we have no
+       usable FTS expression, so bail. *)
+    match Fts.build_match ~join spec.fts_terms with
+    | None -> []
+    | Some fts_expr ->
+      let where = ref [ "steps_fts MATCH ?" ] in
+      let params = ref [ S.Data.TEXT fts_expr ] in
+      if require_summary then
+        where := "s.summary IS NOT NULL AND s.summary != ''" :: !where;
+      if use_dates then begin
+        (match spec.after with
+         | Some ts ->
+           where := "s.timestamp >= ?" :: !where;
+           params := !params @ [ S.Data.FLOAT ts ]
+         | None -> ());
+        (match spec.before with
+         | Some ts ->
+           where := "s.timestamp <= ?" :: !where;
+           params := !params @ [ S.Data.FLOAT ts ]
+         | None -> ());
+      end;
+      let sql =
+        Printf.sprintf
+          "SELECT s.id, s.session_id, s.turn_index, s.timestamp, \
+                  COALESCE(s.summary, ''), COALESCE(s.tags, ''), \
+                  COALESCE(s.prompt_text, ''), COALESCE(s.files_touched, '[]'), \
+                  s.commit_before, s.commit_after, \
+                  COALESCE(bm25(steps_fts), 0.0) AS score \
+           FROM steps_fts \
+           JOIN steps s ON s.id = steps_fts.rowid \
+           WHERE %s \
+           ORDER BY %s \
+           LIMIT %d"
+          (String.concat " AND " !where) order spec.limit
+      in
+      (* FTS5 rejects some expressions at runtime (stray operators, bad
+         quoting, etc.). Swallow the error and let the caller try a
+         looser attempt rather than propagating a search-level failure. *)
+      try D.query_list db sql !params ~f:row_to_hit
+      with _ -> []
+  in
+  let r = attempt () in
+  if r <> [] then r else
+  let r = attempt ~join:Fts.Or () in
+  if r <> [] then r else
+  let r = attempt ~join:Fts.Or ~require_summary:false () in
+  if r <> [] then r else
+  attempt ~join:Fts.Or ~require_summary:false ~use_dates:false ()
+
+(* Read the assistant text for a specific (session_id, turn_index) by
+   parsing the JSONL. Returns "" if not found. *)
+let fetch_assistant_text ~project_dir ~session_id ~turn_index =
+  try
+    let jsonl_dir =
+      Jsonl_reader.find_jsonl_dir ~project_dir in
+    let path = Filename.concat jsonl_dir (session_id ^ ".jsonl") in
+    if not (Sys.file_exists path) then ""
+    else
+      let interactions =
+        Jsonl_reader.parse_interactions ~filepath:path in
+      match List.find_opt (fun (i : Urme_core.Types.interaction) ->
+        i.index = turn_index) interactions with
+      | Some i -> i.assistant_summary
+      | None -> ""
+  with _ -> ""
+
+let rec take n = function
+  | _ when n <= 0 -> []
+  | [] -> []
+  | x :: xs -> x :: take (n - 1) xs
+
+(* The deep pipeline: 2 Claude calls.
+
+   Layer 1 (NL → SQL spec): Claude parses query intent into a
+   structured spec; we run it as a SQL query to get a preliminary
+   candidate set with cascading fallback.
+
+   Layer 2 (answer-with-ranking): Claude sees up to 10 top candidates,
+   with FULL user+assistant text for the first 5. It returns BOTH the
+   final ranked order AND a synthesis sentence — unified so the row
+   cited in the synthesis is the one ranked first. *)
+let run_deep ~db ~binary ?(limit=20) ?(project_dir=".") query =
+  let open Lwt.Syntax in
+  let* spec = Urme_claude.Prompts.sql_rewrite ~binary ~query in
+  let candidates = run_spec ~db spec in
+  if candidates = [] then Lwt.return ([], "")
+  else
+    (* Top 10 candidates from BM25 ordering. Top 5 get full turn text. *)
+    let short = take 10 candidates in
+    let full_text_count = 5 in
+    let answer_candidates =
+      List.mapi (fun i (h : hit) ->
+        let sid = Option.value h.session_id ~default:"" in
+        let assistant =
+          if i < full_text_count then
+            fetch_assistant_text ~project_dir
+              ~session_id:sid ~turn_index:h.turn_index
+          else "" in
+        let prompt =
+          if i < full_text_count then h.prompt_text
+          else if String.length h.prompt_text > 160
+          then String.sub h.prompt_text 0 160 ^ "..."
+          else h.prompt_text in
+        { Urme_claude.Prompts.tc_step_id = h.step_id;
+          tc_session_id = sid;
+          tc_turn_index = h.turn_index;
+          tc_timestamp = h.timestamp;
+          tc_prompt_text = prompt;
+          tc_assistant_text = assistant;
+          tc_summary = h.summary }
+      ) short in
+    let* { ao_ranked_step_ids; ao_synthesis } =
+      Urme_claude.Prompts.answer_from_text ~binary ~query
+        ~candidates:answer_candidates in
+    let by_id = Hashtbl.create (List.length candidates) in
+    List.iter (fun (h : hit) -> Hashtbl.add by_id h.step_id h) candidates;
+    let ranked =
+      List.filter_map (fun id -> Hashtbl.find_opt by_id id) ao_ranked_step_ids
+    in
+    let tail = List.filter (fun (h : hit) ->
+      not (List.mem h.step_id ao_ranked_step_ids)) candidates in
+    let ordered = ranked @ tail in
+    let cut =
+      if List.length ordered <= limit then ordered
+      else take limit ordered in
+    Lwt.return (cut, ao_synthesis)
 
 (* ---------- Smart search (Claude rewrite + rerank) ---------- *)
 

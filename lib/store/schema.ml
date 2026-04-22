@@ -14,7 +14,7 @@
 module D = Db
 module S = Sqlite3
 
-let schema_version = 4
+let schema_version = 5
 
 (* Migration 1: initial schema. *)
 let migration_1 = [
@@ -158,11 +158,22 @@ let migration_4 = [
   {|ALTER TABLE edit_links ADD COLUMN new_content TEXT|};
 ]
 
+(* Migration 5: persist per-turn extended-thinking blocks. Claude Code
+   keeps them in the JSONL as content blocks of type "thinking"; we
+   concatenate per turn (JSON array of strings) so the overview panel
+   can show them and searchers can grep. Position within the turn
+   stays in the JSONL — the TUI re-reads from there for inline body
+   rendering. *)
+let migration_5 = [
+  {|ALTER TABLE steps ADD COLUMN thinking TEXT|};
+]
+
 let migrations = [
   1, migration_1;
   2, migration_2;
   3, migration_3;
   4, migration_4;
+  5, migration_5;
 ]
 
 (* --- meta helpers --- *)

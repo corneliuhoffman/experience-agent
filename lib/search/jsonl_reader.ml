@@ -90,6 +90,10 @@ let extract_uuid (json : Yojson.Safe.t) =
   json |> member "uuid" |> to_string_option |> Option.value ~default:""
 
 (* Extract text blocks from assistant messages *)
+(* Concatenate assistant output in block order. Thinking blocks are
+   labelled `[thinking]` so the summariser can tell reasoning from
+   spoken output; it's still the same "assistant produced this"
+   stream, just with the hidden layer included. *)
 let extract_assistant_text (json : Yojson.Safe.t) =
   let open Yojson.Safe.Util in
   let typ = json |> member "type" |> to_string_option in
@@ -100,6 +104,10 @@ let extract_assistant_text (json : Yojson.Safe.t) =
     List.filter_map (fun block ->
       match block |> member "type" |> to_string_option with
       | Some "text" -> block |> member "text" |> to_string_option
+      | Some "thinking" ->
+        (match block |> member "thinking" |> to_string_option with
+         | Some t when t <> "" -> Some ("[thinking]\n" ^ t)
+         | _ -> None)
       | _ -> None
     ) blocks
   | _ -> []

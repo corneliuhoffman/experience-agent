@@ -54,9 +54,22 @@ let group_edits (edits : edit list) =
   List.iter (fun (e : edit) ->
     let key = (e.session_id, e.turn_idx) in
     let existing = try Hashtbl.find by_turn key with Not_found -> [] in
-    Hashtbl.replace by_turn key (existing @ [e])
+    Hashtbl.replace by_turn key (e :: existing)
   ) edits;
-  Hashtbl.fold (fun _ es acc -> es :: acc) by_turn []
+  (* Sort groups by (session_id, turn_idx) for deterministic order.
+     Within each group, sort by (entry_idx, timestamp) ascending —
+     [edits_of_sessions] hands us a descending-timestamp list, so
+     without this within-turn resort the walker applies entry N
+     before entry 0 and subsequent Edits' [old_string] lookups fail. *)
+  let groups_with_keys =
+    Hashtbl.fold (fun (sid, ti) es acc -> ((sid, ti), es) :: acc) by_turn [] in
+  List.sort (fun ((s1, t1), _) ((s2, t2), _) ->
+    let c = String.compare s1 s2 in
+    if c <> 0 then c else Int.compare t1 t2) groups_with_keys
+  |> List.map (fun (_, es) ->
+       List.sort (fun (a : edit) b ->
+         let c = Int.compare a.entry_idx b.entry_idx in
+         if c <> 0 then c else Float.compare a.timestamp b.timestamp) es)
 
 (* ---------- Event stream ---------- *)
 
@@ -165,3 +178,13 @@ let update ~project_dir ~db ~edits =
   else Lwt.return_unit in
   Git_state.save ~project_dir !new_state;
   Lwt.return_unit
+
+(* One-shot link pass from scratch inputs. Extract edits via
+   Domainslib, then call [update]. Both [urme init] and the TUI's
+   `i` / hourly resync go through here so the two paths can't
+   diverge. *)
+let run_once ~project_dir ~db =
+  let pool = Domainslib.Task.setup_pool ~num_domains:4 () in
+  let edits = Edit_extract.edits_of_sessions ~pool ~project_dir in
+  Domainslib.Task.teardown_pool pool;
+  update ~project_dir ~db ~edits

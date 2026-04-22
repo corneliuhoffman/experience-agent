@@ -92,3 +92,7 @@ let data_to_float = function
 let data_to_string_opt = function
   | S.Data.NULL | S.Data.NONE -> None
   | d -> Some (data_to_string d)
+
+let data_to_float_opt = function
+  | S.Data.NULL | S.Data.NONE -> None
+  | d -> Some (data_to_float d)

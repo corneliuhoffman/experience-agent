@@ -58,6 +58,10 @@ let search_cmd =
     Arg.(value & flag & info ["smart"; "s"]
            ~doc:"Let Claude rewrite sparse queries and rerank the shortlist \
                  (adds latency; uses Claude CLI)") in
+  let deep =
+    Arg.(value & flag & info ["deep"]
+           ~doc:"Full three-layer pipeline: NL→SQL, rerank, read top-3 turn \
+                 text and produce a grounded answer sentence (slowest)") in
   let short_sha = function
     | Some s when String.length s >= 7 -> String.sub s 0 7
     | Some s -> s
@@ -74,25 +78,36 @@ let search_cmd =
     if h.tags <> "" then Printf.printf "    tags: %s\n" h.tags;
     print_newline ()
   in
-  let run query n smart project_dir _chromadb_port =
+  let run query n smart deep project_dir _chromadb_port =
     let db = Urme_store.Schema.open_or_create ~project_dir in
-    if smart then begin
-      let config = Urme_core.Config.load () in
-      let hits, synth = Lwt_main.run
-          (Urme_search.Search.run_smart ~db
-             ~binary:config.claude_binary ~limit:n query) in
-      if synth <> "" then Printf.printf "— %s\n\n" synth;
-      List.iter print_hit hits;
-      if hits = [] then print_endline "no matches"
-    end else begin
-      let hits = Urme_search.Search.run_with_fallback ~db ~limit:n query in
-      List.iter print_hit hits;
-      if hits = [] then print_endline "no matches"
-    end;
+    let config = Urme_core.Config.load () in
+    (if deep then begin
+       let hits, answer = Lwt_main.run
+           (Urme_search.Search.run_deep ~db
+              ~binary:config.claude_binary
+              ~project_dir ~limit:n query) in
+       if answer <> "" then Printf.printf "— %s\n\n" answer;
+       List.iter print_hit hits;
+       if hits = [] then print_endline "no matches"
+     end else if smart then begin
+       let hits, synth = Lwt_main.run
+           (Urme_search.Search.run_smart ~db
+              ~binary:config.claude_binary ~limit:n query) in
+       if synth <> "" then Printf.printf "— %s\n\n" synth;
+       List.iter print_hit hits;
+       if hits = [] then print_endline "no matches"
+     end else begin
+       let hits = Urme_search.Search.run_with_fallback ~db ~limit:n query in
+       List.iter print_hit hits;
+       if hits = [] then print_endline "no matches"
+     end);
     Urme_store.Schema.close db
   in
-  Cmd.v (Cmd.info "search" ~doc:"Search indexed steps by FTS5 (with --smart: Claude rewrite + rerank)")
-    Term.(const run $ query $ n $ smart $ project_dir $ chromadb_port)
+  Cmd.v (Cmd.info "search"
+           ~doc:"Search indexed steps. \
+                 --smart: Claude rewrite + rerank. \
+                 --deep: NL→SQL + rerank + grounded answer.")
+    Term.(const run $ query $ n $ smart $ deep $ project_dir $ chromadb_port)
 
 (* --- Subcommand: init --- *)
 
@@ -106,27 +121,39 @@ let init_cmd =
                  (default 3; higher = faster but more RAM)") in
   let run skip_summaries parallel project_dir _chromadb_port =
     let config = Urme_core.Config.load () in
+    (* Normalise project_dir to an absolute path. Edit_extract uses
+       the project_dir to strip the prefix from Claude's tool_use
+       file_paths; those are absolute, so a relative project_dir
+       (like the cmdliner default ".") leaves the stored file_path
+       absolute while commits use relative paths — breaking path
+       equality in [assign] and losing every Claude attribution. *)
+    let project_dir =
+      if project_dir = "." then Sys.getcwd ()
+      else if Filename.is_relative project_dir
+      then Filename.concat (Sys.getcwd ()) project_dir
+      else project_dir in
     let db = Urme_store.Schema.open_or_create ~project_dir in
     let n = Urme_engine.Indexer.index_all_sessions ~db ~project_dir in
     Printf.printf "indexed %d turns\n" n;
-    (* Summarisation runs FIRST: it spawns the claude CLI via
-       Unix.fork, which OCaml 5 forbids after any Domain.spawn. The
-       git linker below uses Domainslib, so we must summarise before
-       touching any multicore code. *)
-    if not skip_summaries then begin
-      Printf.printf "running Claude summarisation pass (Haiku 4.5, %d daemons)...\n%!"
-        parallel;
-      Lwt_main.run (Urme_engine.Summarise.summarise_pending
-                      ~pool_size:parallel
-                      ~binary:config.claude_binary ~db ())
-    end;
-    Printf.printf "building per-edit git links...\n%!";
-    (try Lwt_main.run (
-       let pool = Domainslib.Task.setup_pool ~num_domains:4 () in
-       let edits = Urme_engine.Edit_extract.edits_of_sessions
-           ~pool ~project_dir in
-       Domainslib.Task.teardown_pool pool;
-       Urme_engine.Git_index.update ~project_dir ~db ~edits)
+    (* Single Lwt_main.run: chaining summarise → run_once inside one
+       Lwt loop avoids the state drift that a separate second
+       Lwt_main.run seems to cause (the walker saved zero links when
+       two Lwt_main.run calls ran back to back). *)
+    (try
+       Lwt_main.run begin
+         let open Lwt.Syntax in
+         let* () =
+           if skip_summaries then Lwt.return_unit
+           else begin
+             Printf.printf "running Claude summarisation pass (%d daemons)...\n%!" parallel;
+             Urme_engine.Summarise.summarise_pending
+               ~pool_size:parallel
+               ~binary:config.claude_binary ~db ()
+           end
+         in
+         Printf.printf "building per-edit git links...\n%!";
+         Urme_engine.Git_index.run_once ~project_dir ~db
+       end
      with e -> Printf.eprintf "link error (non-fatal): %s\n%!"
                  (Printexc.to_string e));
     Urme_store.Schema.close db

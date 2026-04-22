@@ -266,6 +266,195 @@ let rewrite_query ~binary ~original_query ~sparse_hit_summaries =
   let* raw = ask ~binary ~prompt () in
   Lwt.return (parse_query_list raw)
 
+(* ---------- Layer 1: NL → structured SQL spec ---------- *)
+
+type order_by = Earliest | Latest | Relevance
+
+type query_spec = {
+  fts_terms : string;
+  order_by : order_by;
+  limit : int;
+  require_summary : bool;
+  after : float option;
+  before : float option;
+}
+
+let default_query_spec = {
+  fts_terms = "";
+  order_by = Relevance;
+  limit = 50;
+  require_summary = true;
+  after = None;
+  before = None;
+}
+
+let build_sql_rewrite_prompt query =
+  String.concat "\n" [
+    "You translate natural-language queries about a coding session \
+     history into a structured retrieval spec.";
+    "";
+    "The DB is a table of turns. Each row has: prompt_text, summary, \
+     tags, timestamp, session_id. An FTS5 index covers summary + tags \
+     + prompt_text.";
+    "";
+    "User query: " ^ Printf.sprintf "%S" query;
+    "";
+    "Return a JSON object with keys:";
+    "- `fts_terms`: space-separated keywords for a SQLite FTS5 MATCH \
+     expression. Use concrete technical nouns, drop filler words.";
+    "- `order_by`: \"earliest\" (for origin queries — \"when did we \
+     first X\", \"when did X start\"), \"latest\" (\"what did we last \
+     do about X\"), or \"relevance\" (default).";
+    "- `limit`: integer, 30-100.";
+    "- `require_summary`: bool. True for analytical queries, false for \
+     meta/question-style.";
+    "- `after` / `before`: ISO date (YYYY-MM-DD) or null. Temporal \
+     bounds if the query says so.";
+    "";
+    "Examples:";
+    "  \"when did we first look at sqlite?\" → \
+     { fts_terms: \"sqlite\", order_by: \"earliest\", limit: 50, \
+       require_summary: true, after: null, before: null }";
+    "  \"what did we last do about git linking?\" → \
+     { fts_terms: \"git link\", order_by: \"latest\", ... }";
+    "  \"how did we fix the crash on 2026-04-15?\" → \
+     { fts_terms: \"crash fix\", order_by: \"relevance\", \
+       after: \"2026-04-15\", before: \"2026-04-16\" }";
+    "";
+    "Output ONLY the JSON. No prose.";
+  ]
+
+let parse_iso_date s =
+  try
+    Scanf.sscanf s "%4d-%2d-%2d" (fun y m d ->
+      let dim = [|31;28;31;30;31;30;31;31;30;31;30;31|] in
+      let leap yr = (yr mod 4 = 0 && yr mod 100 <> 0) || yr mod 400 = 0 in
+      let rec yd acc yr = if yr <= 1970 then acc
+        else yd (acc + if leap (yr - 1) then 366 else 365) (yr - 1) in
+      let md = ref 0 in
+      for mi = 0 to m - 2 do
+        md := !md + dim.(mi);
+        if mi = 1 && leap y then md := !md + 1
+      done;
+      Some (Float.of_int (((yd 0 y + !md + d - 1) * 86400))))
+  with _ -> None
+
+let parse_query_spec raw =
+  match Yojson.Safe.from_string raw with
+  | exception _ -> default_query_spec
+  | json ->
+    let open Yojson.Safe.Util in
+    let s key default =
+      try json |> member key |> to_string with _ -> default in
+    let i key default =
+      try json |> member key |> to_int with _ -> default in
+    let b key default =
+      try json |> member key |> to_bool with _ -> default in
+    let date_opt key =
+      match json |> member key with
+      | `String d -> parse_iso_date d
+      | _ -> None in
+    let order_by = match String.lowercase_ascii (s "order_by" "relevance") with
+      | "earliest" -> Earliest
+      | "latest" -> Latest
+      | _ -> Relevance in
+    { fts_terms = s "fts_terms" "";
+      order_by;
+      limit = max 10 (min 200 (i "limit" 50));
+      require_summary = b "require_summary" true;
+      after = date_opt "after";
+      before = date_opt "before" }
+
+let sql_rewrite ~binary ~query =
+  let prompt = build_sql_rewrite_prompt query in
+  let* raw = ask ~binary ~prompt () in
+  Lwt.return (parse_query_spec raw)
+
+(* ---------- Layer 3: grounded answer from full turn text ---------- *)
+
+type text_candidate = {
+  tc_step_id : int;
+  tc_session_id : string;
+  tc_turn_index : int;
+  tc_timestamp : float;
+  tc_prompt_text : string;
+  tc_assistant_text : string;
+  tc_summary : string;
+}
+
+(* Answer output = final ranking (layer-3 aware of full text) plus the
+   synthesis sentence. This supersedes the layer-2 rerank because it
+   saw more evidence. *)
+type answer_output = {
+  ao_ranked_step_ids : int list;
+  ao_synthesis : string;
+}
+
+let build_answer_prompt ~query ~(candidates : text_candidate list) =
+  let blocks = List.map (fun c ->
+    let tm = Unix.gmtime c.tc_timestamp in
+    let date = Printf.sprintf "%04d-%02d-%02d"
+      (tm.tm_year + 1900) (tm.tm_mon + 1) tm.tm_mday in
+    let sid_short =
+      if String.length c.tc_session_id >= 8
+      then String.sub c.tc_session_id 0 8 else c.tc_session_id in
+    Printf.sprintf
+      "--- step_id=%d %s turn=%d date=%s ---\n\
+       Summary: %s\n\
+       User:\n%s\n\n\
+       Assistant:\n%s\n"
+      c.tc_step_id sid_short c.tc_turn_index date
+      (clamp 200 c.tc_summary)
+      (clamp 2000 c.tc_prompt_text)
+      (clamp 3000 c.tc_assistant_text)
+  ) candidates in
+  String.concat "\n" [
+    "You rank search results AND answer a question, using the \
+     candidate turns below as evidence. Top candidates include the \
+     full user+assistant text; later ones have summaries only.";
+    "";
+    "User query: " ^ Printf.sprintf "%S" query;
+    "";
+    "Candidates:";
+    "";
+    String.concat "\n" blocks;
+    "";
+    "Return a JSON object with:";
+    "- `ranked`: array of step_id integers, best first. The ranking \
+     MUST put the candidate that most directly answers the query \
+     FIRST — not the one most lexically similar.";
+    "- `synthesis`: ONE or TWO sentences answering the query, citing \
+     the top-ranked candidate (session prefix + turn + date). Empty \
+     string if nothing answers.";
+    "";
+    "Output ONLY the JSON object. No prose, no fences.";
+  ]
+
+let parse_answer_response raw =
+  match Yojson.Safe.from_string raw with
+  | exception _ -> { ao_ranked_step_ids = []; ao_synthesis = "" }
+  | json ->
+    let open Yojson.Safe.Util in
+    let ranked =
+      match json |> member "ranked" with
+      | `List xs ->
+        List.filter_map (fun j -> try Some (to_int j) with _ -> None) xs
+      | _ -> []
+    in
+    let synthesis =
+      json |> member "synthesis" |> to_string_option
+      |> Option.value ~default:""
+    in
+    { ao_ranked_step_ids = ranked; ao_synthesis = synthesis }
+
+let answer_from_text ~binary ~query ~candidates =
+  match candidates with
+  | [] -> Lwt.return { ao_ranked_step_ids = []; ao_synthesis = "" }
+  | _ ->
+    let prompt = build_answer_prompt ~query ~candidates in
+    let* raw = ask ~binary ~prompt () in
+    Lwt.return (parse_answer_response raw)
+
 (* ---------- Rerank ---------- *)
 
 (* Take a shortlist of candidate rows (already scored by FTS5), hand them

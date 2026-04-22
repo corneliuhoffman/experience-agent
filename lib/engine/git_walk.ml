@@ -166,13 +166,20 @@ let apply_one ~h st (e : edit) =
   let* state, st = ensure_file ~h st file in
 
   if e.old_string = "" then
-    (* Write: overwrite content, mark prior edits dead. *)
-    let* stack = mark_dead ~h st.stack file e.timestamp in
-    let st = set_file { st with stack } file (Content e.new_string) in
+    (* Write: overwrite walker content. DO NOT mark prior Pending
+       Edits Dead — an Edit on an Absent file genuinely means the
+       file existed on disk; those edits led up to this Write and
+       should still be attributed to the commit that eventually
+       absorbs it. *)
+    let st = set_file st file (Content e.new_string) in
     Lwt.return (st, Pending)
 
   else match state with
-  | Absent | Deleted -> Lwt.return (st, Dead)
+  | Absent | Deleted ->
+    (* File isn't in any ancestor commit the walker has processed
+       yet, but Edit implies it exists on disk. Keep Pending — the
+       next commit that touches this file will [assign] it. *)
+    Lwt.return (st, Pending)
 
   | Content content ->
     match find_substring e.old_string content with
@@ -185,13 +192,12 @@ let apply_one ~h st (e : edit) =
       Lwt.return (set_file st file (Content new_content), Pending)
 
     | None ->
-      (* Claude's Edit context doesn't match walker's state → someone
-         else modified the file between Claude edits. Reconcile to
-         bring walker in line, then record this edit as Dead (we can't
-         place it without its context). *)
+      (* Edit's old_string not in walker state → drift. Reconcile
+         (push Human for the drift) and keep THIS edit Pending so
+         the next commit can still attribute it. *)
       let* st = reconcile ~h st file
           ~actual:(Some e.old_string) e.timestamp in
-      Lwt.return (st, Dead)
+      Lwt.return (st, Pending)
 
 let process_edit_group ~h st (edits : edit list) =
   let ts = match edits with e :: _ -> e.timestamp | [] -> 0.0 in

@@ -24,6 +24,26 @@ let jsons_in_range ~filepath ~line_start ~line_end =
   List.filteri (fun i _ -> i >= line_start && i <= line_end) lines
   |> List.filter_map (fun l -> try Some (Yojson.Safe.from_string l) with _ -> None)
 
+(* Pull thinking blocks from assistant content blocks in this range.
+   Returned in original order (one string per block). *)
+let extract_thinking jsons =
+  let open Yojson.Safe.Util in
+  List.concat_map (fun json ->
+    match json |> member "type" |> to_string_option with
+    | Some "assistant" ->
+      let blocks = json |> member "message" |> member "content"
+        |> (fun j -> try to_list j with _ -> []) in
+      List.filter_map (fun block ->
+        match block |> member "type" |> to_string_option with
+        | Some "thinking" ->
+          let t = block |> member "thinking" |> to_string_option
+                  |> Option.value ~default:"" in
+          if t = "" then None else Some t
+        | _ -> None
+      ) blocks
+    | _ -> []
+  ) jsons
+
 (* Pull Bash commands from tool_use blocks in an interaction's range. *)
 let extract_commands jsons =
   let open Yojson.Safe.Util in
@@ -156,18 +176,23 @@ let upsert_session db ~session_id ~started_at ~jsonl_path ~turn_count =
    without losing the Claude pass's work. *)
 let upsert_step db
     ~session_id ~turn_index ~timestamp ~prompt_text ~files_touched
-    ~commands_run ~tokens_in ~tokens_out ~commit_before ~commit_after =
+    ~commands_run ~thinking ~tokens_in ~tokens_out
+    ~commit_before ~commit_after =
+  let thinking_json =
+    if thinking = [] then S.Data.NULL
+    else S.Data.TEXT (json_array_of_strings thinking) in
   D.exec_params db
     "INSERT INTO steps(\
        session_id, turn_index, timestamp, prompt_text, \
-       files_touched, commands_run, tokens_in, tokens_out, \
+       files_touched, commands_run, thinking, tokens_in, tokens_out, \
        commit_before, commit_after, summary, tags) \
-     VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL) \
+     VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL) \
      ON CONFLICT(session_id, turn_index) DO UPDATE SET \
        timestamp     = excluded.timestamp, \
        prompt_text   = excluded.prompt_text, \
        files_touched = excluded.files_touched, \
        commands_run  = excluded.commands_run, \
+       thinking      = excluded.thinking, \
        tokens_in     = excluded.tokens_in, \
        tokens_out    = excluded.tokens_out, \
        commit_before = excluded.commit_before, \
@@ -178,6 +203,7 @@ let upsert_step db
       nullable_text prompt_text;
       S.Data.TEXT (json_array_of_strings files_touched);
       S.Data.TEXT (json_array_of_strings commands_run);
+      thinking_json;
       int_data tokens_in;
       int_data tokens_out;
       (match commit_before with Some s -> S.Data.TEXT s | None -> S.Data.NULL);
@@ -221,6 +247,7 @@ let index_session ~db ~project_dir ~jsonl_path =
       let jsons = jsons_in_range ~filepath:jsonl_path
           ~line_start:i.line_start ~line_end:i.line_end in
       let commands = extract_commands jsons in
+      let thinking = extract_thinking jsons in
       let tokens_in, tokens_out = sum_tokens jsons in
       let commits = branch_commits i.branch in
       let commit_before, commit_after = stamp_bounds commits turn_ts in
@@ -231,6 +258,7 @@ let index_session ~db ~project_dir ~jsonl_path =
         ~prompt_text:i.user_text
         ~files_touched:i.files_changed
         ~commands_run:commands
+        ~thinking
         ~tokens_in ~tokens_out
         ~commit_before ~commit_after
     ) interactions);
@@ -252,11 +280,28 @@ let is_summariser_session interactions =
     starts_with "You summarise turns from"
   | [] -> false
 
+(* Skip files whose mtime ≤ sessions.last_indexed_at — untouched
+   JSONLs don't need re-parsing. First run always processes every
+   file since [last_indexed_at] is NULL. *)
+let session_up_to_date db ~session_id ~jsonl_mtime =
+  match
+    D.query_fold db
+      "SELECT last_indexed_at FROM sessions WHERE id = ?"
+      [S.Data.TEXT session_id] ~init:None
+      ~f:(fun _ cols -> D.data_to_float_opt cols.(0))
+  with
+  | Some last when last >= jsonl_mtime -> true
+  | _ -> false
+
 let index_all_sessions ~db ~project_dir =
   let jsonl_dir = Jsonl.find_jsonl_dir ~project_dir in
   let files = Jsonl.list_sessions ~jsonl_dir in
   List.fold_left (fun total path ->
-    let interactions = Jsonl.parse_interactions ~filepath:path in
-    if is_summariser_session interactions then total
-    else total + index_session ~db ~project_dir ~jsonl_path:path
+    let mtime = try (Unix.stat path).Unix.st_mtime with _ -> 0.0 in
+    let session_id = Jsonl.session_id_of_path path in
+    if session_up_to_date db ~session_id ~jsonl_mtime:mtime then total
+    else
+      let interactions = Jsonl.parse_interactions ~filepath:path in
+      if is_summariser_session interactions then total
+      else total + index_session ~db ~project_dir ~jsonl_path:path
   ) 0 files
