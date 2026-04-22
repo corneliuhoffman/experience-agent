@@ -764,43 +764,100 @@ let render_status_bar state w =
 (* Render the conversation pane *)
 (* ---------- Git mode rendering ---------- *)
 
-let render_git_panel ~height ~title ~focused ~items ~sel_idx ~width =
-  if height <= 0 then Notty.I.empty
+(* lazygit-style boxed panel with ┌─[N]─Title─…─┐ header, │ … │ side
+   borders, and └──┘ footer. Focused panel gets a brighter border
+   colour so the active section is obvious at a glance. *)
+let render_git_panel ~idx ~height ~title ~focused ~items ~sel_idx ~width =
+  if height <= 0 || width < 2 then Notty.I.empty
   else begin
-    let hdr_bg = if focused then c_highlight else c_status_bg in
-    let hdr_fg = if focused then c_bg else c_highlight in
-    let hdr_attr = Notty.A.(fg hdr_fg ++ bg hdr_bg ++ st bold) in
-    let hdr_text = Printf.sprintf " %s %s" title
-        (String.make (max 0 (width - String.length title - 2)) ' ') in
-    let hdr_row = mk_row ~attr:hdr_attr width hdr_text in
-    let content_h = max 0 (height - 1) in
-    let scroll = max 0 (sel_idx - content_h + 1) in
-    let rows = List.mapi (fun i (label, is_current, is_dim) ->
+    let border_fg = if focused then c_highlight else c_separator in
+    let border_attr = Notty.A.(fg border_fg ++ bg c_bg) in
+    let title_attr  = Notty.A.(fg c_highlight ++ bg c_bg ++ st bold) in
+    let inner_w = max 0 (width - 2) in
+    let inner_h = max 0 (height - 2) in
+    (* UTF-8 box-drawing needs bytes-not-code-points, so we build the
+       dash fill via a buffer rather than [String.make]. *)
+    let dash_fill n =
+      let b = Buffer.create (n * 3) in
+      for _ = 1 to n do Buffer.add_string b "─" done;
+      Buffer.contents b in
+    (* Top border: ┌─[N]─Title─────┐ *)
+    let label = Printf.sprintf "[%d]─%s" idx title in
+    let label_cps = utf8_count label in
+    let top =
+      if inner_w <= label_cps then
+        Notty.I.string border_attr "┌" <|>
+        Notty.I.string title_attr
+          (if label_cps > inner_w then utf8_truncate label inner_w else label) <|>
+        Notty.I.string border_attr "┐"
+      else
+        let fill_n = inner_w - label_cps - 1 in
+        Notty.I.string border_attr "┌─" <|>
+        Notty.I.string title_attr label <|>
+        Notty.I.string border_attr (dash_fill (max 0 fill_n)) <|>
+        Notty.I.string border_attr "┐" in
+    (* Content rows — same scrolling logic as before, just +2 cols of
+       side-border wrapping each row. *)
+    let scroll = max 0 (sel_idx - inner_h + 1) in
+    let row_for i (lbl, is_current, is_dim) =
       let vi = i - scroll in
-      if vi >= 0 && vi < content_h then begin
+      if vi >= 0 && vi < inner_h then begin
         let selected = focused && i = sel_idx in
         let fg_c = if selected then c_highlight
                  else if is_dim then c_separator
                  else if is_current then c_user
                  else c_fg in
         let bg_c = if selected then c_status_bg else c_bg in
-        let label_trunc = if String.length label > width - 1
-          then String.sub label 0 (width - 1) else label in
-        let attr = Notty.A.(fg fg_c ++ bg bg_c ++ (if selected then st bold else empty)) in
-        Some (mk_row ~attr width label_trunc)
+        let attr = Notty.A.(fg fg_c ++ bg bg_c
+                            ++ (if selected then st bold else empty)) in
+        let inner_row = mk_row ~attr inner_w (" " ^ lbl) in
+        Some (Notty.I.string border_attr "│"
+              <|> inner_row
+              <|> Notty.I.string border_attr "│")
       end else None
-    ) items in
-    let visible_rows = List.filter_map Fun.id rows in
-    let content_img = match visible_rows with
-      | [] -> bg_block width content_h
-      | _ ->
-        let img = Notty.I.vcat visible_rows in
-        let used = Notty.I.height img in
-        if used < content_h then
-          img <-> bg_block width (content_h - used)
-        else img in
-    hdr_row <-> content_img
+    in
+    let visible_rows = List.filter_map Fun.id (List.mapi row_for items) in
+    let filler_row =
+      Notty.I.string border_attr "│"
+      <|> Notty.I.char Notty.A.(fg c_fg ++ bg c_bg) ' ' inner_w 1
+      <|> Notty.I.string border_attr "│" in
+    let content =
+      let used = List.length visible_rows in
+      let pad = max 0 (inner_h - used) in
+      let fillers =
+        if pad = 0 then []
+        else List.init pad (fun _ -> filler_row) in
+      Notty.I.vcat (visible_rows @ fillers) in
+    let bot =
+      Notty.I.string border_attr "└" <|>
+      Notty.I.string border_attr (dash_fill inner_w) <|>
+      Notty.I.string border_attr "┘" in
+    top <-> content <-> bot
   end
+
+(* Refresh dependent panels when the current selection changes.
+   Files for the selected commit are derived on the fly from the
+   already-loaded [git_links] hashtable — no git call, no prefetch. *)
+let files_for_commit g sha =
+  Hashtbl.fold (fun (s, fb) _ acc ->
+    if s = sha && not (List.mem fb acc) then fb :: acc else acc
+  ) g.git_links []
+  |> List.sort String.compare
+
+let refresh_dependents g =
+  let sha = match List.nth_opt g.commits g.commit_idx with
+    | Some (s, _, _) -> s | None -> "" in
+  let files = if sha = "" then [] else files_for_commit g sha in
+  let file_idx = if g.file_idx >= List.length files then 0 else g.file_idx in
+  let file = List.nth_opt files file_idx in
+  let link_candidates =
+    match file with
+    | Some fb ->
+      (match Hashtbl.find_opt g.git_links (sha, fb) with
+       | Some l -> l | None -> [])
+    | None -> [] in
+  let link_idx = if g.link_idx >= List.length link_candidates then 0 else g.link_idx in
+  { g with files; file_idx; link_candidates; link_idx }
 
 let commit_has_links g sha =
   Hashtbl.fold (fun (s, _) _ found -> found || s = sha) g.git_links false
@@ -900,9 +957,10 @@ let render_git_left_panels state w h =
   let n_panels = List.length panels in
   let focused_idx = match g.focus with
     | Branches -> 0 | Commits -> 1 | Files -> 2 | Links -> 3 in
-  let focused_h = max 3 (total_h / 2) in
+  (* Focused panel gets ~60% of the column, the others split the rest. *)
+  let focused_h = max 5 (total_h * 3 / 5) in
   let rest_h = max 0 (total_h - focused_h) in
-  let other_h = if n_panels > 1 then max 2 (rest_h / (n_panels - 1)) else 0 in
+  let other_h = if n_panels > 1 then max 3 (rest_h / (n_panels - 1)) else 0 in
   let heights = List.mapi (fun i _ ->
     if i = focused_idx then focused_h else other_h
   ) panels in
@@ -913,7 +971,7 @@ let render_git_left_panels state w h =
   else heights in
   let panel_images = List.mapi (fun i (title, focused, items, sel_idx) ->
     let panel_h = List.nth heights i in
-    render_git_panel ~height:panel_h ~title ~focused
+    render_git_panel ~idx:(i + 1) ~height:panel_h ~title ~focused
       ~items ~sel_idx ~width
   ) panels in
   Notty.I.vcat panel_images
@@ -2276,15 +2334,19 @@ let run ~config ~project_dir () =
         { s with git = { g with focus = prev; link_candidates; link_idx = 0 } }) in
       redraw mvar; loop ()
 
-    (* Up / k: navigate up *)
+    (* Up / k: navigate up. For Commits/Files we refresh dependent
+       panels so Files tracks the new commit and Links tracks the
+       new file. *)
     | `Key (`Arrow `Up, _)
       when (match peek mvar with Some s -> s.mode = Git | None -> false) ->
       let* () = update mvar (fun s ->
         let g = s.git in
         let git = match g.focus with
           | Branches -> { g with branch_idx = max 0 (g.branch_idx - 1) }
-          | Commits -> { g with commit_idx = max 0 (g.commit_idx - 1) }
-          | Files -> { g with file_idx = max 0 (g.file_idx - 1) }
+          | Commits ->
+            refresh_dependents { g with commit_idx = max 0 (g.commit_idx - 1) }
+          | Files ->
+            refresh_dependents { g with file_idx = max 0 (g.file_idx - 1) }
           | Links -> { g with link_idx = max 0 (g.link_idx - 1) } in
         { s with git }) in
       redraw mvar; loop ()
@@ -2295,8 +2357,10 @@ let run ~config ~project_dir () =
         let g = s.git in
         let git = match g.focus with
           | Branches -> { g with branch_idx = max 0 (g.branch_idx - 1) }
-          | Commits -> { g with commit_idx = prev_linked_commit g g.commit_idx }
-          | Files -> { g with file_idx = prev_linked_file g g.file_idx }
+          | Commits ->
+            refresh_dependents { g with commit_idx = prev_linked_commit g g.commit_idx }
+          | Files ->
+            refresh_dependents { g with file_idx = prev_linked_file g g.file_idx }
           | Links -> { g with link_idx = max 0 (g.link_idx - 1) } in
         { s with git }) in
       redraw mvar; loop ()
@@ -2308,8 +2372,12 @@ let run ~config ~project_dir () =
         let g = s.git in
         let git = match g.focus with
           | Branches -> { g with branch_idx = min (List.length g.branches - 1) (g.branch_idx + 1) }
-          | Commits -> { g with commit_idx = min (List.length g.commits - 1) (g.commit_idx + 1) }
-          | Files -> { g with file_idx = min (List.length g.files - 1) (g.file_idx + 1) }
+          | Commits ->
+            refresh_dependents
+              { g with commit_idx = min (List.length g.commits - 1) (g.commit_idx + 1) }
+          | Files ->
+            refresh_dependents
+              { g with file_idx = min (List.length g.files - 1) (g.file_idx + 1) }
           | Links -> { g with link_idx = min (max 0 (List.length g.link_candidates - 1)) (g.link_idx + 1) } in
         { s with git }) in
       redraw mvar; loop ()
