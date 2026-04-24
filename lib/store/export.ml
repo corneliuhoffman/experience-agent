@@ -25,6 +25,83 @@ let export_project ~project_dir ~path =
   export ~db ~path;
   Schema.close db
 
+(* ---------- Scoped export (branch / commit list) ----------
+
+   Build a fresh [.urmedb] containing only the rows touching the given
+   set of commit SHAs. Intended for PR reviews: the author runs
+   [urme export --branch feat/foo] and hands the resulting file to a
+   reviewer who imports it, so URME (and Claude via MCP) only sees
+   the session context for that branch's changes.
+
+   Inclusion rule:
+   - [edit_links] where [commit_sha] ∈ commits.
+   - [steps] joined to those edit_links by [(session_id, turn_index)] —
+     the turns that actually produced the branch's edits.
+   - [sessions] for those steps.
+   - [meta] is copied whole (schema version etc.).
+
+   FTS5's [steps_fts] rebuilds automatically from its triggers as we
+   insert rows; no manual backfill needed. *)
+
+let sql_escape_list xs =
+  String.concat ", "
+    (List.map (fun s ->
+      "'" ^ String.concat "''" (String.split_on_char '\'' s) ^ "'") xs)
+
+let export_scoped ~project_dir ~commits ~out_path =
+  if commits = [] then
+    failwith "export: no commits in scope";
+  (* Fresh empty target, initialised with current schema. *)
+  (try Sys.remove out_path with _ -> ());
+  List.iter (fun suffix ->
+    let p = out_path ^ suffix in
+    if Sys.file_exists p then (try Sys.remove p with _ -> ())
+  ) ["-wal"; "-shm"];
+  let dst = S.db_open out_path in
+  Schema.init dst;
+  let src_path = Schema.default_path ~project_dir in
+  let attach_sql =
+    Printf.sprintf "ATTACH DATABASE '%s' AS src"
+      (String.concat "''" (String.split_on_char '\'' src_path)) in
+  D.exec dst attach_sql;
+  let commits_csv = sql_escape_list commits in
+  (* Insertion order matters — [steps.session_id] → [sessions.id] is
+     a foreign key, so sessions must land first. Compute scoped steps
+     / sessions via subqueries against [src] rather than the (still
+     empty) local tables. *)
+  let scoped_steps_predicate =
+    Printf.sprintf
+      "s.id IN ( \
+         SELECT DISTINCT st.id FROM src.steps st \
+         JOIN src.edit_links el \
+           ON el.session_id = st.session_id \
+          AND el.turn_idx   = st.turn_index \
+         WHERE el.commit_sha IN (%s) \
+       ) OR s.commit_after IN (%s)"
+      commits_csv commits_csv in
+  (* 1. sessions whose id appears in any scoped step *)
+  D.exec dst (Printf.sprintf
+    "INSERT INTO sessions \
+       SELECT * FROM src.sessions \
+       WHERE id IN ( \
+         SELECT DISTINCT s.session_id FROM src.steps s \
+         WHERE s.session_id IS NOT NULL AND (%s))"
+    scoped_steps_predicate);
+  (* 2. steps in scope *)
+  D.exec dst (Printf.sprintf
+    "INSERT INTO steps SELECT s.* FROM src.steps s WHERE %s"
+    scoped_steps_predicate);
+  (* 3. edit_links landing on scope commits *)
+  D.exec dst (Printf.sprintf
+    "INSERT INTO edit_links \
+       SELECT * FROM src.edit_links WHERE commit_sha IN (%s)"
+    commits_csv);
+  (* keep meta (schema_version etc.) from source where not already set *)
+  D.exec dst
+    "INSERT OR IGNORE INTO meta SELECT * FROM src.meta";
+  D.exec dst "DETACH DATABASE src";
+  ignore (S.db_close dst)
+
 (* Copy a file byte-for-byte. Not using Unix.link — we want a clean copy,
    not a hardlink that would couple source and destination. *)
 let copy_file ~src ~dst =

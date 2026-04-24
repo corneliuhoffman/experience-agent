@@ -420,12 +420,18 @@ let build_answer_prompt ~query ~(candidates : text_candidate list) =
     String.concat "\n" blocks;
     "";
     "Return a JSON object with:";
-    "- `ranked`: array of step_id integers, best first. The ranking \
-     MUST put the candidate that most directly answers the query \
-     FIRST — not the one most lexically similar.";
+    "- `ranked`: array of step_id integers, best first. INCLUDE ONLY \
+     candidates that genuinely support an answer to the query. EXCLUDE \
+     candidates that are merely lexically related, tangentially \
+     mentioned, or describe the OPPOSITE direction (e.g. if the user \
+     asks when a feature was ADDED, exclude turns about REMOVING or \
+     DROPPING it, and vice versa). When in doubt, leave the candidate \
+     OUT. It is better to return 0 or 1 ids than to include unrelated \
+     hits.";
     "- `synthesis`: ONE or TWO sentences answering the query, citing \
-     the top-ranked candidate (session prefix + turn + date). Empty \
-     string if nothing answers.";
+     the top-ranked candidate (session prefix + turn + date). Every \
+     id you include in `ranked` MUST be cited or clearly support the \
+     synthesis. Empty string if nothing answers.";
     "";
     "Output ONLY the JSON object. No prose, no fences.";
   ]

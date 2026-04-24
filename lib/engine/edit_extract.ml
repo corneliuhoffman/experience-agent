@@ -37,7 +37,11 @@ let edits_of_session ?(project_dir="") ~filepath () =
         ) items
   ) lines;
   (* Pass 2: track interaction boundaries, extract edits *)
-  let current_iidx = ref 0 in
+  (* Start at -1 so the first real user message takes idx 0, matching
+     [Jsonl_reader.parse_interactions] which numbers turns 0..N-1.
+     Previously we pre-incremented from 0, giving 1..N and making
+     edit_links.turn_idx one ahead of steps.turn_index. *)
+  let current_iidx = ref (-1) in
   let current_branch = ref "" in
   let edit_in_turn = ref 0 in
   let edits = ref [] in

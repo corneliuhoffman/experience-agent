@@ -166,7 +166,7 @@ let rec take n = function
    with FULL user+assistant text for the first 5. It returns BOTH the
    final ranked order AND a synthesis sentence — unified so the row
    cited in the synthesis is the one ranked first. *)
-let run_deep ~db ~binary ?(limit=20) ?(project_dir=".") query =
+let run_deep ~db ~binary ?(limit=20) ?(project_dir=".") ?(only_ranked=false) query =
   let open Lwt.Syntax in
   let* spec = Urme_claude.Prompts.sql_rewrite ~binary ~query in
   let candidates = run_spec ~db spec in
@@ -206,7 +206,7 @@ let run_deep ~db ~binary ?(limit=20) ?(project_dir=".") query =
     in
     let tail = List.filter (fun (h : hit) ->
       not (List.mem h.step_id ao_ranked_step_ids)) candidates in
-    let ordered = ranked @ tail in
+    let ordered = if only_ranked then ranked else ranked @ tail in
     let cut =
       if List.length ordered <= limit then ordered
       else take limit ordered in

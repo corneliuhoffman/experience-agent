@@ -835,29 +835,31 @@ let render_git_panel ~idx ~height ~title ~focused ~items ~sel_idx ~width =
     top <-> content <-> bot
   end
 
-(* Refresh dependent panels when the current selection changes.
-   Files for the selected commit are derived on the fly from the
-   already-loaded [git_links] hashtable — no git call, no prefetch. *)
-let files_for_commit g sha =
-  Hashtbl.fold (fun (s, fb) _ acc ->
-    if s = sha && not (List.mem fb acc) then fb :: acc else acc
-  ) g.git_links []
-  |> List.sort String.compare
+(* Derive the files list for the currently-selected commit from the
+   already-loaded [git_links] hashtable — recomputed every time
+   anything reads it. No caching, no manual refresh, no staleness. *)
+let current_commit_sha g =
+  match List.nth_opt g.commits g.commit_idx with
+  | Some (s, _, _) -> s
+  | None -> ""
 
-let refresh_dependents g =
-  let sha = match List.nth_opt g.commits g.commit_idx with
-    | Some (s, _, _) -> s | None -> "" in
-  let files = if sha = "" then [] else files_for_commit g sha in
-  let file_idx = if g.file_idx >= List.length files then 0 else g.file_idx in
-  let file = List.nth_opt files file_idx in
-  let link_candidates =
-    match file with
-    | Some fb ->
-      (match Hashtbl.find_opt g.git_links (sha, fb) with
-       | Some l -> l | None -> [])
-    | None -> [] in
-  let link_idx = if g.link_idx >= List.length link_candidates then 0 else g.link_idx in
-  { g with files; file_idx; link_candidates; link_idx }
+let current_files g =
+  let sha = current_commit_sha g in
+  if sha = "" then []
+  else
+    Hashtbl.fold (fun (s, fb) _ acc ->
+      if s = sha && not (List.mem fb acc) then fb :: acc else acc
+    ) g.git_links []
+    |> List.sort String.compare
+
+let current_links g =
+  let sha = current_commit_sha g in
+  let files = current_files g in
+  match List.nth_opt files g.file_idx with
+  | Some fb ->
+    (match Hashtbl.find_opt g.git_links (sha, fb) with
+     | Some l -> l | None -> [])
+  | None -> []
 
 let commit_has_links g sha =
   Hashtbl.fold (fun (s, _) _ found -> found || s = sha) g.git_links false
@@ -917,19 +919,19 @@ let render_git_left_panels state w h =
       found || s = sha) g.git_links false in
     (Printf.sprintf " %s %s" short_sha msg_trunc, false, not has_links)
   ) g.commits in
-  let cur_sha = match List.nth_opt g.commits g.commit_idx with
-    | Some (sha, _, _) -> sha | None -> "" in
-  let file_items = List.map (fun f ->
-    let fb = Filename.basename f in
+  let cur_sha = current_commit_sha g in
+  let cur_files = current_files g in
+  let file_items = List.map (fun fb ->
     let has_links = Hashtbl.mem g.git_links (cur_sha, fb) in
     let has_human = Hashtbl.mem g.human_edits (cur_sha, fb) in
     let is_human = not has_links || has_human in
-    ("  " ^ f, is_human, false)
-  ) g.files in
+    ("  " ^ fb, is_human, false)
+  ) cur_files in
+  let cur_links = current_links g in
   let sorted_links = List.sort (fun (a : git_conv_link) (b : git_conv_link) ->
     let c = Int.compare a.turn_idx b.turn_idx in
     if c <> 0 then c else Int.compare a.entry_idx b.entry_idx
-  ) g.link_candidates in
+  ) cur_links in
   let link_items = List.map (fun (link : git_conv_link) ->
     let is_human_only = let ek = link.edit_key in
       String.length ek > 11 &&
@@ -951,7 +953,7 @@ let render_git_left_panels state w h =
     ("Branches", g.focus = Branches, branch_items, g.branch_idx);
     ("Commits", g.focus = Commits, commit_items, g.commit_idx);
     ("Files", g.focus = Files, file_items, g.file_idx);
-    (Printf.sprintf "Links (%d)" (List.length g.link_candidates),
+    (Printf.sprintf "Links (%d)" (List.length cur_links),
      g.focus = Links, link_items, g.link_idx);
   ] in
   let n_panels = List.length panels in
@@ -2334,19 +2336,18 @@ let run ~config ~project_dir () =
         { s with git = { g with focus = prev; link_candidates; link_idx = 0 } }) in
       redraw mvar; loop ()
 
-    (* Up / k: navigate up. For Commits/Files we refresh dependent
-       panels so Files tracks the new commit and Links tracks the
-       new file. *)
+    (* Up / k / Down / j: navigate. files + link_candidates are
+       derived on read via [current_files] / [current_links], so
+       changing commit_idx or file_idx auto-refreshes dependent
+       panels on the next render. *)
     | `Key (`Arrow `Up, _)
       when (match peek mvar with Some s -> s.mode = Git | None -> false) ->
       let* () = update mvar (fun s ->
         let g = s.git in
         let git = match g.focus with
           | Branches -> { g with branch_idx = max 0 (g.branch_idx - 1) }
-          | Commits ->
-            refresh_dependents { g with commit_idx = max 0 (g.commit_idx - 1) }
-          | Files ->
-            refresh_dependents { g with file_idx = max 0 (g.file_idx - 1) }
+          | Commits -> { g with commit_idx = max 0 (g.commit_idx - 1); file_idx = 0; link_idx = 0 }
+          | Files -> { g with file_idx = max 0 (g.file_idx - 1); link_idx = 0 }
           | Links -> { g with link_idx = max 0 (g.link_idx - 1) } in
         { s with git }) in
       redraw mvar; loop ()
@@ -2357,28 +2358,25 @@ let run ~config ~project_dir () =
         let g = s.git in
         let git = match g.focus with
           | Branches -> { g with branch_idx = max 0 (g.branch_idx - 1) }
-          | Commits ->
-            refresh_dependents { g with commit_idx = prev_linked_commit g g.commit_idx }
-          | Files ->
-            refresh_dependents { g with file_idx = prev_linked_file g g.file_idx }
+          | Commits -> { g with commit_idx = prev_linked_commit g g.commit_idx; file_idx = 0; link_idx = 0 }
+          | Files -> { g with file_idx = prev_linked_file g g.file_idx; link_idx = 0 }
           | Links -> { g with link_idx = max 0 (g.link_idx - 1) } in
         { s with git }) in
       redraw mvar; loop ()
 
-    (* Down / j: navigate down *)
     | `Key (`Arrow `Down, _)
       when (match peek mvar with Some s -> s.mode = Git | None -> false) ->
       let* () = update mvar (fun s ->
         let g = s.git in
+        let files_n = List.length (current_files g) in
         let git = match g.focus with
           | Branches -> { g with branch_idx = min (List.length g.branches - 1) (g.branch_idx + 1) }
           | Commits ->
-            refresh_dependents
-              { g with commit_idx = min (List.length g.commits - 1) (g.commit_idx + 1) }
+            { g with commit_idx = min (List.length g.commits - 1) (g.commit_idx + 1);
+                     file_idx = 0; link_idx = 0 }
           | Files ->
-            refresh_dependents
-              { g with file_idx = min (List.length g.files - 1) (g.file_idx + 1) }
-          | Links -> { g with link_idx = min (max 0 (List.length g.link_candidates - 1)) (g.link_idx + 1) } in
+            { g with file_idx = min (max 0 (files_n - 1)) (g.file_idx + 1); link_idx = 0 }
+          | Links -> { g with link_idx = min (max 0 (List.length (current_links g) - 1)) (g.link_idx + 1) } in
         { s with git }) in
       redraw mvar; loop ()
 

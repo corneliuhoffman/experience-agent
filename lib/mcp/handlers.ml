@@ -171,18 +171,144 @@ let step_select_cols =
    COALESCE(s.prompt_text,''), COALESCE(s.files_touched,'[]'), \
    s.commit_before, s.commit_after"
 
+(* ---------- Push to the running URME TUI (Unix socket) ---------- *)
+
+let send_to_tui ~project_dir ~msg =
+  let socket_path = Urme_core.Paths.tui_socket_path ~project_dir in
+  if not (Sys.file_exists socket_path) then Lwt.return_unit
+  else
+    Lwt.catch (fun () ->
+      let socket = Lwt_unix.socket Unix.PF_UNIX Unix.SOCK_STREAM 0 in
+      let addr = Unix.ADDR_UNIX socket_path in
+      let* () = Lwt_unix.connect socket addr in
+      let oc = Lwt_io.of_fd ~mode:Lwt_io.Output socket in
+      let* () = Lwt_io.write_line oc (Yojson.Safe.to_string msg) in
+      let* () = Lwt_io.flush oc in
+      let ic = Lwt_io.of_fd ~mode:Lwt_io.Input socket in
+      let* _ack = Lwt_io.read_line ic in
+      Lwt_unix.close socket
+    ) (fun _exn -> Lwt.return_unit)
+
 (* ---------- Tool implementations ---------- *)
 
+(* [handle_search_history]
+
+   Two-sink delivery:
+
+   - Push the full enriched payload (hits + assistant_text for top 5)
+     to the running URME TUI over a Unix socket. URME shows results
+     live; zero context cost on Claude.
+   - Return a SLIM summary to the calling Claude: step_id, session
+     prefix, turn, date, one-line summary per hit. Enough for Claude
+     to rank and cite, nothing more.
+
+   If the user needs the full text of a single turn for synthesis,
+   Claude calls [get_turn] on it — pay-per-turn instead of dumping
+   everything. *)
 let handle_search_history st args =
   let open Yojson.Safe.Util in
-  let query = args |> member "query" |> to_string in
-  let n = try args |> member "n" |> to_int with _ -> 5 in
+  let parse_iso_date s =
+    try
+      Scanf.sscanf s "%4d-%2d-%2d" (fun y m d ->
+        let dim = [|31;28;31;30;31;30;31;31;30;31;30;31|] in
+        let leap yr =
+          (yr mod 4 = 0 && yr mod 100 <> 0) || yr mod 400 = 0 in
+        let rec yd acc yr =
+          if yr <= 1970 then acc
+          else yd (acc + if leap (yr - 1) then 366 else 365) (yr - 1) in
+        let md = ref 0 in
+        for mi = 0 to m - 2 do
+          md := !md + dim.(mi);
+          if mi = 1 && leap y then md := !md + 1
+        done;
+        Some (Float.of_int (((yd 0 y + !md + d - 1) * 86400))))
+    with _ -> None in
+  let fts_terms =
+    try args |> member "fts_terms" |> to_string with _ -> "" in
+  let query_fallback =
+    try args |> member "query" |> to_string with _ -> "" in
+  let limit = try args |> member "limit" |> to_int with _ -> 20 in
+  let order_by =
+    match (try args |> member "order_by" |> to_string with _ -> "relevance")
+          |> String.lowercase_ascii with
+    | "earliest" -> Urme_claude.Prompts.Earliest
+    | "latest"   -> Urme_claude.Prompts.Latest
+    | _          -> Urme_claude.Prompts.Relevance in
+  let require_summary =
+    try args |> member "require_summary" |> to_bool with _ -> true in
+  let date_opt key =
+    match args |> member key with
+    | `String d -> parse_iso_date d
+    | _ -> None in
+  let after  = date_opt "after" in
+  let before = date_opt "before" in
   let db = ensure_db st in
-  let hits = Search.run_with_fallback ~db ~limit:n query in
+  let hits =
+    if fts_terms <> "" then
+      let spec : Urme_claude.Prompts.query_spec = {
+        fts_terms; order_by;
+        limit = max 10 (min 200 limit);
+        require_summary; after; before } in
+      let hs = Search.run_spec ~db spec in
+      if hs = [] && query_fallback <> "" then
+        Search.run_with_fallback ~db ~limit query_fallback
+      else hs
+    else if query_fallback <> "" then
+      Search.run_with_fallback ~db ~limit query_fallback
+    else [] in
+  let full_text_count = 5 in
+  let iso_of_ts ts =
+    let tm = Unix.gmtime ts in
+    Printf.sprintf "%04d-%02d-%02d"
+      (tm.Unix.tm_year + 1900) (tm.Unix.tm_mon + 1) tm.Unix.tm_mday in
+  let short_sid s =
+    if String.length s >= 8 then String.sub s 0 8 else s in
+  (* Enriched response for Claude: slim fields for every hit, plus full
+     prompt_text + assistant_text for the top N. Calling-Claude has a
+     wide context window, no clamping. *)
+  let results =
+    List.mapi (fun i (h : Search.hit) ->
+      let sid_opt = match h.session_id with
+        | Some s -> `String (short_sid s)
+        | None -> `Null in
+      let base = [
+        "step_id", `Int h.step_id;
+        "session", sid_opt;
+        "session_id",
+          (match h.session_id with Some s -> `String s | None -> `Null);
+        "turn", `Int h.turn_index;
+        "date", `String (iso_of_ts h.timestamp);
+        "summary", `String h.summary;
+      ] in
+      if i < full_text_count then
+        let assistant_text = match h.session_id with
+          | Some sid ->
+            Search.fetch_assistant_text
+              ~project_dir:st.project_dir
+              ~session_id:sid ~turn_index:h.turn_index
+          | None -> "" in
+        `Assoc (base @ [
+          "prompt_text", `String h.prompt_text;
+          "assistant_text", `String assistant_text;
+        ])
+      else `Assoc base
+    ) hits in
   Lwt.return (json_result (`Assoc [
-    "query", `String query;
-    "n_results", `Int (List.length hits);
-    "results", `List (List.map hit_to_json hits);
+    "fts_terms", `String fts_terms;
+    "query", `String query_fallback;
+    "n_results", `Int (List.length results);
+    "results", `List results;
+    "note",
+      `String
+        "Top 5 results include full prompt_text + assistant_text as \
+         evidence. Rank them yourself: drop tangential, lexical-only, \
+         or opposite-direction hits (if the user asks when a feature \
+         was ADDED, drop turns about REMOVING it, and vice versa). \
+         Prefer 0 or 1 clear citation over several weak ones. After \
+         producing your one-or-two-sentence answer, call \
+         `push_synthesis` with the answer text and the cited \
+         {session_id, turn} pairs so the running URME TUI can show \
+         the user your conclusion and the evidence behind it.";
   ]))
 
 let handle_file_history st args =
@@ -338,34 +464,129 @@ let handle_search_by_file st args =
 
 (* ---------- Push to TUI (unchanged) ---------- *)
 
-let send_to_tui ~project_dir ~msg =
-  let socket_path = Urme_core.Paths.tui_socket_path ~project_dir in
-  if not (Sys.file_exists socket_path) then Lwt.return_unit
-  else
-    Lwt.catch (fun () ->
-      let socket = Lwt_unix.socket Unix.PF_UNIX Unix.SOCK_STREAM 0 in
-      let addr = Unix.ADDR_UNIX socket_path in
-      let* () = Lwt_unix.connect socket addr in
-      let oc = Lwt_io.of_fd ~mode:Lwt_io.Output socket in
-      let* () = Lwt_io.write_line oc (Yojson.Safe.to_string msg) in
-      let* () = Lwt_io.flush oc in
-      let ic = Lwt_io.of_fd ~mode:Lwt_io.Input socket in
-      let* _ack = Lwt_io.read_line ic in
-      Lwt_unix.close socket
-    ) (fun _exn -> Lwt.return_unit)
+(* Fetch one turn's full prompt + assistant text. Cheap, pay-per-turn
+   alternative to dumping everything in [search_history]. *)
+let handle_get_turn st args =
+  let open Yojson.Safe.Util in
+  let session_id = args |> member "session_id" |> to_string in
+  let turn_index = args |> member "turn_index" |> to_int in
+  let assistant_text =
+    Search.fetch_assistant_text
+      ~project_dir:st.project_dir ~session_id ~turn_index in
+  (* Also pull the user prompt from the steps row. *)
+  let db = ensure_db st in
+  let sql =
+    "SELECT COALESCE(prompt_text,''), COALESCE(summary,''), timestamp \
+     FROM steps WHERE session_id = ? AND turn_index = ? LIMIT 1" in
+  let row =
+    D.query_list db sql
+      [S.Data.TEXT session_id; S.Data.INT (Int64.of_int turn_index)]
+      ~f:(fun cols ->
+        `Assoc [
+          "prompt_text", `String (D.data_to_string cols.(0));
+          "summary",     `String (D.data_to_string cols.(1));
+          "timestamp",   `Float  (D.data_to_float  cols.(2));
+        ]) in
+  let base = match row with
+    | x :: _ -> x
+    | [] -> `Assoc [
+      "prompt_text", `String "";
+      "summary", `String "";
+      "timestamp", `Float 0.;
+    ] in
+  let merged = match base with
+    | `Assoc fs ->
+      `Assoc (fs @ [
+        "session_id", `String session_id;
+        "turn_index", `Int turn_index;
+        "assistant_text", `String assistant_text;
+      ])
+    | other -> other in
+  Lwt.return (json_result merged)
+
+(* Push the calling Claude's final synthesis to the running URME TUI,
+   along with the full text of the cited turns (so the user can verify
+   the conclusion against the evidence). This is the only socket push
+   the search pipeline makes — `search_history` itself is silent. *)
+let handle_push_synthesis st args =
+  let open Yojson.Safe.Util in
+  let synthesis =
+    match args |> member "synthesis" with
+    | `String s when String.trim s <> "" -> s
+    | `String _ ->
+      failwith "push_synthesis: 'synthesis' must be a non-empty string"
+    | `Null ->
+      failwith "push_synthesis: missing required field 'synthesis'"
+    | _ ->
+      failwith "push_synthesis: 'synthesis' must be a string" in
+  let cited =
+    match args |> member "cited" with
+    | `Null -> []
+    | `List xs ->
+      List.mapi (fun i j ->
+        let sid =
+          match j |> member "session_id" with
+          | `String s when s <> "" -> s
+          | _ ->
+            failwith (Printf.sprintf
+              "push_synthesis: cited[%d].session_id must be a non-empty string"
+              i) in
+        let turn =
+          match j |> member "turn_index" with
+          | `Int n -> n
+          | _ ->
+            failwith (Printf.sprintf
+              "push_synthesis: cited[%d].turn_index must be an integer" i) in
+        (sid, turn)) xs
+    | _ ->
+      failwith "push_synthesis: 'cited' must be a JSON array" in
+  let cited_results =
+    List.map (fun (session_id, turn_index) ->
+      let assistant_text =
+        Search.fetch_assistant_text
+          ~project_dir:st.project_dir ~session_id ~turn_index in
+      let db = ensure_db st in
+      let sql =
+        "SELECT COALESCE(prompt_text,''), COALESCE(summary,''), timestamp \
+         FROM steps WHERE session_id = ? AND turn_index = ? LIMIT 1" in
+      let row =
+        D.query_list db sql
+          [S.Data.TEXT session_id; S.Data.INT (Int64.of_int turn_index)]
+          ~f:(fun cols ->
+            (D.data_to_string cols.(0),
+             D.data_to_string cols.(1),
+             D.data_to_float  cols.(2))) in
+      let prompt_text, summary, timestamp = match row with
+        | x :: _ -> x
+        | [] -> ("", "", 0.) in
+      `Assoc [
+        "session_id", `String session_id;
+        "turn_index", `Int turn_index;
+        "timestamp", `Float timestamp;
+        "summary", `String summary;
+        "prompt_text", `String prompt_text;
+        "assistant_text", `String assistant_text;
+      ]) cited in
+  let tui_msg = `Assoc [
+    "type", `String "synthesis";
+    "synthesis", `String synthesis;
+    "cited", `List cited_results;
+  ] in
+  let* () = send_to_tui ~project_dir:st.project_dir ~msg:tui_msg in
+  Lwt.return (text_result
+    (Printf.sprintf "Pushed synthesis (%d cited) to TUI."
+       (List.length cited_results)))
 
 (* ---------- Dispatch ---------- *)
 
 let dispatch st name args =
-  let* result = match name with
-    | "search_history" -> handle_search_history st args
-    | "file_history"   -> handle_file_history st args
-    | "region_blame"   -> handle_region_blame st args
-    | "explain_change" -> handle_explain_change st args
-    | "commit_links"   -> handle_commit_links st args
-    | "search_by_file" -> handle_search_by_file st args
-    | _ -> Lwt.return (text_result (Printf.sprintf "Unknown tool: %s" name))
-  in
-  let msg = `Assoc ["type", `String name; "result", result] in
-  Lwt.async (fun () -> send_to_tui ~project_dir:st.project_dir ~msg);
-  Lwt.return result
+  match name with
+  | "search_history" -> handle_search_history st args
+  | "push_synthesis" -> handle_push_synthesis st args
+  | "get_turn"       -> handle_get_turn st args
+  | "file_history"   -> handle_file_history st args
+  | "region_blame"   -> handle_region_blame st args
+  | "explain_change" -> handle_explain_change st args
+  | "commit_links"   -> handle_commit_links st args
+  | "search_by_file" -> handle_search_by_file st args
+  | _ -> Lwt.return (text_result (Printf.sprintf "Unknown tool: %s" name))

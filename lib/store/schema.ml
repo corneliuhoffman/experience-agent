@@ -168,12 +168,61 @@ let migration_5 = [
   {|ALTER TABLE steps ADD COLUMN thinking TEXT|};
 ]
 
+(* Migration 6: persist the turn's full content in the DB. Claude
+   Code prunes old session JSONL files, so anything we used to fetch
+   from them on demand (assistant reply, tool_use blocks, thinking)
+   becomes unrecoverable. Two columns, two distinct roles:
+
+   - [turn_json]      the raw JSONL records for this turn, joined
+                      by '\n'. Fed to [render_full_turn_styled] for
+                      faithful rendering (thinking / text /
+                      tool_use / tool_result with diff colouring).
+   - [assistant_text] flat concatenation of just the assistant's
+                      [text] blocks, for FTS5. FTS5 can't tokenise
+                      only the text nodes of a JSON blob, so this
+                      projection lives in its own column.
+
+   We also rebuild [steps_fts] and its triggers to include the new
+   [assistant_text] column. *)
+let migration_6 = [
+  {|ALTER TABLE steps ADD COLUMN turn_json TEXT|};
+  {|ALTER TABLE steps ADD COLUMN assistant_text TEXT|};
+
+  {|DROP TRIGGER IF EXISTS steps_ai|};
+  {|DROP TRIGGER IF EXISTS steps_ad|};
+  {|DROP TRIGGER IF EXISTS steps_au|};
+  {|DROP TABLE IF EXISTS steps_fts|};
+  {|CREATE VIRTUAL TABLE steps_fts USING fts5(
+      summary, tags, prompt_text, assistant_text,
+      content='steps', content_rowid='id',
+      tokenize='porter unicode61'
+    )|};
+  {|CREATE TRIGGER steps_ai AFTER INSERT ON steps BEGIN
+      INSERT INTO steps_fts (rowid, summary, tags, prompt_text, assistant_text)
+      VALUES (new.id, new.summary, new.tags, new.prompt_text, new.assistant_text);
+    END|};
+  {|CREATE TRIGGER steps_ad AFTER DELETE ON steps BEGIN
+      INSERT INTO steps_fts (steps_fts, rowid, summary, tags, prompt_text, assistant_text)
+      VALUES ('delete', old.id, old.summary, old.tags, old.prompt_text, old.assistant_text);
+    END|};
+  {|CREATE TRIGGER steps_au AFTER UPDATE ON steps BEGIN
+      INSERT INTO steps_fts (steps_fts, rowid, summary, tags, prompt_text, assistant_text)
+      VALUES ('delete', old.id, old.summary, old.tags, old.prompt_text, old.assistant_text);
+      INSERT INTO steps_fts (rowid, summary, tags, prompt_text, assistant_text)
+      VALUES (new.id, new.summary, new.tags, new.prompt_text, new.assistant_text);
+    END|};
+  (* Backfill the rebuilt FTS index from existing rows. *)
+  {|INSERT INTO steps_fts (rowid, summary, tags, prompt_text, assistant_text)
+     SELECT id, summary, tags, prompt_text, assistant_text FROM steps|};
+]
+
 let migrations = [
   1, migration_1;
   2, migration_2;
   3, migration_3;
   4, migration_4;
   5, migration_5;
+  6, migration_6;
 ]
 
 (* --- meta helpers --- *)
@@ -230,8 +279,16 @@ let init db =
 
 (* Default DB path: <project_dir>/.urme/db.sqlite. Mirrors how other
    project-local state gets scoped to the repo. *)
+(* Resolution order:
+   1. [URME_DB_PATH] env var — set by [urme import FILE] so the whole
+      process (TUI, MCP, indexer) reads/writes FILE and never touches
+      the project's own [.urme/db.sqlite]. Purely in-process; does not
+      persist across invocations.
+   2. Project-local default [<project>/.urme/db.sqlite]. *)
 let default_path ~project_dir =
-  Filename.concat project_dir (Filename.concat ".urme" "db.sqlite")
+  match Sys.getenv_opt "URME_DB_PATH" with
+  | Some p when p <> "" -> p
+  | _ -> Filename.concat project_dir (Filename.concat ".urme" "db.sqlite")
 
 let ensure_parent_dir path =
   let dir = Filename.dirname path in

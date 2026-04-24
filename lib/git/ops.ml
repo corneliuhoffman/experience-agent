@@ -13,10 +13,12 @@ let rec waitpid_noeintr pid =
    Uses Unix.create_process (posix_spawn) — safe after Domain.spawn. *)
 let run_process prog argv =
   let rd, wr = Unix.pipe ~cloexec:true () in
-  let devnull = Unix.openfile "/dev/null" [Unix.O_WRONLY] 0 in
-  let pid = Unix.create_process prog argv Unix.stdin wr devnull in
+  let devnull_out = Unix.openfile "/dev/null" [Unix.O_WRONLY] 0 in
+  let devnull_in  = Unix.openfile "/dev/null" [Unix.O_RDONLY] 0 in
+  let pid = Unix.create_process prog argv devnull_in wr devnull_out in
   Unix.close wr;
-  Unix.close devnull;
+  Unix.close devnull_in;
+  Unix.close devnull_out;
   let fd = Lwt_unix.of_unix_file_descr rd in
   let ic = Lwt_io.of_fd ~mode:Lwt_io.input fd in
   let buf = Buffer.create 256 in
@@ -181,11 +183,12 @@ let commit_changed_files ~cwd ~sha =
         (fun _exn -> Lwt.return []))
 
 (* Walk git log — returns list of (sha, timestamp, message) *)
-let walk_log ~cwd ?(since="") ?(max_count=1000) ?(all=false) () =
+let walk_log ~cwd ?(since="") ?(max_count=1000) ?(all=false) ?(branch="") () =
   let args = ["log"; "--format=%H%n%at%n%s%n---"] @
     (if all then ["--all"] else []) @
     (if since <> "" then ["--since=" ^ since] else []) @
-    ["--max-count=" ^ string_of_int max_count] in
+    ["--max-count=" ^ string_of_int max_count] @
+    (if branch <> "" then [branch] else []) in
   let* output = Lwt.catch
     (fun () -> run_git ~cwd args)
     (fun _exn -> Lwt.return "") in

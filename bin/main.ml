@@ -271,32 +271,100 @@ let prune_cmd =
 
 (* --- Subcommand: export --- *)
 
+(* Resolve the commits reachable from [branch] but not from its
+   merge-base with main/master. Same set `gh` uses for a PR's diff.
+   Falls back to the whole branch history if no merge-base is found. *)
+let commits_for_branch ~cwd ~branch =
+  let open Lwt.Syntax in
+  let resolve_ref r =
+    Lwt.catch
+      (fun () ->
+        let+ out = Urme_git.Ops.run_git ~cwd ["rev-parse"; "--verify"; r] in
+        Some (String.trim out))
+      (fun _ -> Lwt.return None) in
+  let* base_ref =
+    let* m = resolve_ref "main" in
+    match m with
+    | Some _ -> Lwt.return (Some "main")
+    | None -> let* ms = resolve_ref "master" in
+      (match ms with Some _ -> Lwt.return (Some "master") | None -> Lwt.return None) in
+  let range_args = match base_ref with
+    | Some base -> ["log"; "--format=%H"; Printf.sprintf "%s..%s" base branch]
+    | None      -> ["log"; "--format=%H"; branch] in
+  let* out = Urme_git.Ops.run_git ~cwd range_args in
+  Lwt.return (String.split_on_char '\n' out
+              |> List.map String.trim
+              |> List.filter (fun s -> s <> ""))
+
 let export_cmd =
-  let path =
-    Arg.(required & pos 0 (some string) None & info [] ~docv:"PATH"
-           ~doc:"Destination file for the SQLite snapshot") in
-  let run path project_dir _chromadb_port =
-    Urme_store.Export.export_project ~project_dir ~path;
-    Printf.printf "exported %s\n" path
+  let branch =
+    Arg.(value & opt (some string) None
+           & info ["branch"; "b"] ~docv:"BRANCH"
+               ~doc:"Export only the rows touching commits on this \
+                     branch (resolves commits between the branch and \
+                     main/master). When omitted, exports the whole DB.") in
+  let out_path =
+    Arg.(value & opt (some string) None
+           & info ["out"; "o"] ~docv:"PATH"
+               ~doc:"Output file (default: <branch>.urmedb or \
+                     urme-snapshot.urmedb).") in
+  let run branch out_path project_dir _chromadb_port =
+    match branch with
+    | None ->
+      let path = Option.value out_path ~default:"urme-snapshot.urmedb" in
+      Urme_store.Export.export_project ~project_dir ~path;
+      Printf.printf "exported (whole DB) → %s\n" path
+    | Some br ->
+      let path = Option.value out_path
+        ~default:(Printf.sprintf "%s.urmedb"
+                    (String.map (fun c -> if c = '/' then '-' else c) br)) in
+      let commits =
+        Lwt_main.run (commits_for_branch ~cwd:project_dir ~branch:br) in
+      if commits = [] then begin
+        Printf.eprintf
+          "export: no commits found for branch %S (is it checked out?)\n" br;
+        exit 1
+      end;
+      Printf.printf "export: %d commits on branch %s\n"
+        (List.length commits) br;
+      Urme_store.Export.export_scoped ~project_dir ~commits ~out_path:path;
+      Printf.printf "exported (branch %s) → %s\n" br path
   in
-  Cmd.v (Cmd.info "export" ~doc:"Write a snapshot of the V2 SQLite store")
-    Term.(const run $ path $ project_dir $ chromadb_port)
+  Cmd.v (Cmd.info "export"
+           ~doc:"Write a snapshot of the urme store. With [--branch], \
+                 writes only the rows for that branch's commits \
+                 (intended for PR reviews).")
+    Term.(const run $ branch $ out_path $ project_dir $ chromadb_port)
 
 (* --- Subcommand: import --- *)
 
 let import_cmd =
   let path =
     Arg.(required & pos 0 (some string) None & info [] ~docv:"PATH"
-           ~doc:"SQLite snapshot to restore") in
-  let force =
-    Arg.(value & flag & info ["force"; "f"]
-           ~doc:"Overwrite an existing store at .urme/db.sqlite") in
-  let run path force project_dir _chromadb_port =
-    Urme_store.Export.import_project ~project_dir ~path ~force ();
-    Printf.printf "imported %s\n" path
+           ~doc:"Path to the .urmedb snapshot to load.") in
+  let run path project_dir _chromadb_port =
+    if not (Sys.file_exists path) then begin
+      Printf.eprintf "import: %s not found\n" path;
+      exit 1
+    end;
+    (* Don't touch the reviewer's own [.urme/db.sqlite]. Instead,
+       point this invocation at the snapshot via [URME_DB_PATH] and
+       boot the TUI — the reviewer gets a normal URME where every
+       view (Git / History / Search) is scoped to the imported data.
+       When they quit, nothing is persisted to their own DB. *)
+    let abs =
+      if Filename.is_relative path then
+        Filename.concat (Sys.getcwd ()) path
+      else path in
+    Unix.putenv "URME_DB_PATH" abs;
+    Printf.printf "urme: loading %s (read-only review session)\n" abs;
+    let _ = Urme_core.Config.load () in
+    Lwt_main.run (Urme_tui.Reactive.run ~project_dir ())
   in
-  Cmd.v (Cmd.info "import" ~doc:"Restore a V2 SQLite snapshot into this project")
-    Term.(const run $ path $ force $ project_dir $ chromadb_port)
+  Cmd.v (Cmd.info "import"
+           ~doc:"Load a .urmedb snapshot and launch URME scoped to it. \
+                 Leaves the project's own store untouched.")
+    Term.(const run $ path $ project_dir $ chromadb_port)
 
 (* --- Subcommand: serve (MCP server) --- *)
 
@@ -307,11 +375,21 @@ let serve_cmd =
   Cmd.v (Cmd.info "serve" ~doc:"Run MCP server over stdio (JSON-RPC 2.0)")
     Term.(const run $ project_dir $ chromadb_port)
 
-(* --- Default command: launch TUI --- *)
+(* --- Default command: launch the reactive (Nottui/Lwd) git TUI --- *)
 
 let default_run project_dir _chromadb_port =
-  let config = Urme_core.Config.load () in
-  Lwt_main.run (Urme_tui.App.run ~config ~project_dir ())
+  let _ = Urme_core.Config.load () in
+  Lwt_main.run (Urme_tui.Reactive.run ~project_dir ())
+
+(* Keep the legacy imperative UI reachable for history/search until
+   those modes are ported too. *)
+let legacy_tui_cmd =
+  let run project_dir _chromadb_port =
+    let config = Urme_core.Config.load () in
+    Lwt_main.run (Urme_tui.App.run ~config ~project_dir ())
+  in
+  Cmd.v (Cmd.info "legacy" ~doc:"Legacy Notty TUI (history/search modes)")
+    Term.(const run $ project_dir $ chromadb_port)
 
 let () =
   Printexc.record_backtrace true;
@@ -328,6 +406,6 @@ let () =
     ask_cmd; search_cmd; init_cmd; history_cmd;
     blame_cmd; explain_cmd; save_cmd; replay_cmd;
     pr_cmd; diff_cmd; wipe_cmd; prune_cmd; serve_cmd;
-    export_cmd; import_cmd;
+    export_cmd; import_cmd; legacy_tui_cmd;
   ] in
   exit (Cmd.eval cmd)

@@ -24,6 +24,39 @@ let jsons_in_range ~filepath ~line_start ~line_end =
   List.filteri (fun i _ -> i >= line_start && i <= line_end) lines
   |> List.filter_map (fun l -> try Some (Yojson.Safe.from_string l) with _ -> None)
 
+(* Raw text of the JSONL records for this turn, joined with '\n'. We
+   persist this in [steps.turn_json] so the TUI can render the turn's
+   full body even after Claude Code prunes the source JSONL. *)
+let raw_lines_in_range ~filepath ~line_start ~line_end =
+  let lines = Jsonl.read_all_lines filepath in
+  List.filteri (fun i _ -> i >= line_start && i <= line_end) lines
+  |> String.concat "\n"
+
+(* Flatten the assistant's [text] blocks across this turn's JSONL
+   records. Concatenated with blank lines between blocks — this is the
+   column FTS5 tokenises for "search across the assistant's reasoning"
+   hits. *)
+let flatten_assistant_text jsons =
+  let open Yojson.Safe.Util in
+  let out = Buffer.create 256 in
+  List.iter (fun j ->
+    match j |> member "type" |> to_string_option with
+    | Some "assistant" ->
+      let blocks =
+        try j |> member "message" |> member "content" |> to_list
+        with _ -> [] in
+      List.iter (fun b ->
+        match b |> member "type" |> to_string_option with
+        | Some "text" ->
+          (match b |> member "text" |> to_string_option with
+           | Some t when t <> "" ->
+             if Buffer.length out > 0 then Buffer.add_char out '\n';
+             Buffer.add_string out t
+           | _ -> ())
+        | _ -> ()) blocks
+    | _ -> ()) jsons;
+  Buffer.contents out
+
 (* Pull thinking blocks from assistant content blocks in this range.
    Returned in original order (one string per block). *)
 let extract_thinking jsons =
@@ -177,7 +210,7 @@ let upsert_session db ~session_id ~started_at ~jsonl_path ~turn_count =
 let upsert_step db
     ~session_id ~turn_index ~timestamp ~prompt_text ~files_touched
     ~commands_run ~thinking ~tokens_in ~tokens_out
-    ~commit_before ~commit_after =
+    ~commit_before ~commit_after ~turn_json ~assistant_text =
   let thinking_json =
     if thinking = [] then S.Data.NULL
     else S.Data.TEXT (json_array_of_strings thinking) in
@@ -185,18 +218,21 @@ let upsert_step db
     "INSERT INTO steps(\
        session_id, turn_index, timestamp, prompt_text, \
        files_touched, commands_run, thinking, tokens_in, tokens_out, \
-       commit_before, commit_after, summary, tags) \
-     VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL) \
+       commit_before, commit_after, summary, tags, \
+       turn_json, assistant_text) \
+     VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?) \
      ON CONFLICT(session_id, turn_index) DO UPDATE SET \
-       timestamp     = excluded.timestamp, \
-       prompt_text   = excluded.prompt_text, \
-       files_touched = excluded.files_touched, \
-       commands_run  = excluded.commands_run, \
-       thinking      = excluded.thinking, \
-       tokens_in     = excluded.tokens_in, \
-       tokens_out    = excluded.tokens_out, \
-       commit_before = excluded.commit_before, \
-       commit_after  = excluded.commit_after"
+       timestamp      = excluded.timestamp, \
+       prompt_text    = excluded.prompt_text, \
+       files_touched  = excluded.files_touched, \
+       commands_run   = excluded.commands_run, \
+       thinking       = excluded.thinking, \
+       tokens_in      = excluded.tokens_in, \
+       tokens_out     = excluded.tokens_out, \
+       commit_before  = excluded.commit_before, \
+       commit_after   = excluded.commit_after, \
+       turn_json      = excluded.turn_json, \
+       assistant_text = excluded.assistant_text"
     [ (match session_id with Some s -> S.Data.TEXT s | None -> S.Data.NULL);
       int_data turn_index;
       S.Data.FLOAT timestamp;
@@ -207,7 +243,9 @@ let upsert_step db
       int_data tokens_in;
       int_data tokens_out;
       (match commit_before with Some s -> S.Data.TEXT s | None -> S.Data.NULL);
-      (match commit_after  with Some s -> S.Data.TEXT s | None -> S.Data.NULL) ]
+      (match commit_after  with Some s -> S.Data.TEXT s | None -> S.Data.NULL);
+      nullable_text turn_json;
+      nullable_text assistant_text ]
 
 (* Delete any rows for [session_id] whose turn_index is no longer in
    [valid_set]. Used when a session JSONL has been edited and some old
@@ -251,6 +289,13 @@ let index_session ~db ~project_dir ~jsonl_path =
       let tokens_in, tokens_out = sum_tokens jsons in
       let commits = branch_commits i.branch in
       let commit_before, commit_after = stamp_bounds commits turn_ts in
+      (* Persist the turn's full content (structured + flattened) so
+         the TUI can still render it after Claude Code prunes the
+         source JSONL, and so FTS matches the assistant's reasoning. *)
+      let turn_json =
+        raw_lines_in_range ~filepath:jsonl_path
+          ~line_start:i.line_start ~line_end:i.line_end in
+      let assistant_text = flatten_assistant_text jsons in
       upsert_step db
         ~session_id:(Some session_id)
         ~turn_index:i.index
@@ -261,6 +306,7 @@ let index_session ~db ~project_dir ~jsonl_path =
         ~thinking
         ~tokens_in ~tokens_out
         ~commit_before ~commit_after
+        ~turn_json ~assistant_text
     ) interactions);
   List.length interactions
 
