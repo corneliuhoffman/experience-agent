@@ -43,18 +43,18 @@ let row_of_edit ~origin ~branch (edit : edit) ~status =
     old_content = edit.old_string;
     new_content = edit.new_string; }
 
-(* Save a completed stack_entry: upsert one row per edit.
-   Pending edits (still unmatched after the walk) are skipped — the
-   entry wouldn't be passed to save() if any were still Pending under
-   the walker's complete() check. *)
+(* Save a stack_entry: upsert one row per edit.
+   Pending edits produce rows with commit_sha = NULL (schema convention
+   for "no matching commit yet"). Callers: flush() passes entries where
+   all edits are non-Pending (row_of_edit sees Committed/Dead), while
+   flush_pending_claude at end-of-walk passes entries that may still
+   contain Pending — those get the NULL commit_sha and can be assigned
+   later once matching commits land. *)
 let save ~db (entry : Git_walk.stack_entry) =
   List.iter (fun (edit, status) ->
-    match (status : Git_walk.edit_status) with
-    | Pending -> ()
-    | _ ->
-      let row = row_of_edit ~origin:entry.origin
-          ~branch:edit.git_branch edit ~status in
-      Urme_store.Edit_links.upsert db row
+    let row = row_of_edit ~origin:entry.origin
+        ~branch:edit.git_branch edit ~status in
+    Urme_store.Edit_links.upsert db row
   ) entry.edits;
   Lwt.return_unit
 

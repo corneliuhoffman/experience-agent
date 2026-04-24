@@ -235,7 +235,21 @@ let process_event ~h st = function
   | EditGroup edits -> process_edit_group ~h st edits
   | CommitEvent ci -> process_commit ~h st ci
 
+(* End-of-walk: flush any Claude stack_entries still carrying Pending
+   edits. Without this, Claude EditGroups whose timestamps fall after
+   the last commit on their branch are silently dropped — every session
+   done on a branch's current tip loses all its attributions. Human
+   reconciliation entries are intentionally NOT flushed: they're pure
+   drift-records, recomputed on the next walk. *)
+let flush_pending_claude ~h stack =
+  Lwt_list.iter_s (fun (e : stack_entry) ->
+    match e.origin with
+    | Claude -> h.save e
+    | Human -> Lwt.return_unit) stack
+
 let walk ~h ~branch ~last_commit events =
-  Lwt_list.fold_left_s (process_event ~h)
+  let* final = Lwt_list.fold_left_s (process_event ~h)
     { file_states = SMap.empty; stack = []; last_commit; branch }
-    events
+    events in
+  let* () = flush_pending_claude ~h final.stack in
+  Lwt.return final

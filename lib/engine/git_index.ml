@@ -90,13 +90,21 @@ let build_events ~cwd ~repo ~branch_edits ~commits =
 
 (* ---------- Per-branch walk ---------- *)
 
-let walk_branch ~cwd ~repo ~db
+let walk_branch ~cwd ~repo ~db ~min_ts
     ~branch ~edits ~since_sha ~until_sha =
   let since = if since_sha = "" then "" else since_sha ^ ".." in
   let range = since ^ until_sha in
+  (* [--since] cuts the git log to commits AT OR AFTER min_ts. Commits
+     older than the earliest JSONL can never be attributed to Claude —
+     walking them only produces noisy human reconciliation rows and
+     burns minutes of CPU per branch. *)
+  let since_args =
+    if min_ts > 0.0
+    then ["--since"; Printf.sprintf "%.0f" min_ts]
+    else [] in
   let* out = Lwt.catch (fun () ->
     Urme_git.Ops.run_git ~cwd
-      ["log"; "--format=%H%n%at%n%s%n---"; range]
+      (["log"; "--format=%H%n%at%n%s%n---"] @ since_args @ [range])
   ) (fun _ -> Lwt.return "") in
   let commits =
     let lines = String.split_on_char '\n' out in
@@ -106,6 +114,8 @@ let walk_branch ~cwd ~repo ~db
       | _ -> []
     in parse lines |> List.rev in
   let branch_edits = List.filter (fun (e : edit) -> e.git_branch = branch) edits in
+  Printf.printf "  walk %s: %d commits, %d edits%!\n"
+    branch (List.length commits) (List.length branch_edits);
   let* events = build_events ~cwd ~repo ~branch_edits ~commits in
   let last_commit = since_sha in
   let h = Walk_handlers.make ~repo ~db in
@@ -139,19 +149,27 @@ let update ~project_dir ~db ~edits =
   let* repo = Urme_store.Project_store.open_repo ~project_dir in
   let saved = Git_state.load ~project_dir in
   let* changes = Branch_diff.diff ~cwd:project_dir ~saved in
+  (* Earliest JSONL-derived edit timestamp — anchor for [--since] pruning
+     in walk_branch. 0.0 means "no edits, walk everything" (first-run
+     safety). *)
+  let min_ts = List.fold_left (fun acc (e : edit) ->
+    if acc = 0.0 || e.timestamp < acc then e.timestamp else acc) 0.0 edits in
+  (if min_ts > 0.0 then
+     Printf.printf "building per-edit git links (since %.0f, %d branches to check)...\n%!"
+       min_ts (List.length changes));
   let new_state = ref saved in
   let needs_cleanup = ref false in
   let* () = Lwt_list.iter_s (fun change ->
     match change with
     | Branch_diff.Unchanged _ -> Lwt.return_unit
     | Branch_diff.NewBranch { name; tip } ->
-      let* last_processed = walk_branch ~cwd:project_dir ~repo ~db
+      let* last_processed = walk_branch ~cwd:project_dir ~repo ~db ~min_ts
           ~branch:name ~edits ~since_sha:"" ~until_sha:tip in
       new_state := Git_state.update_branch !new_state name
           { tip; last_processed };
       Lwt.return_unit
     | Branch_diff.FastForward { name; old_tip; new_tip } ->
-      let* last_processed = walk_branch ~cwd:project_dir ~repo ~db
+      let* last_processed = walk_branch ~cwd:project_dir ~repo ~db ~min_ts
           ~branch:name ~edits
           ~since_sha:old_tip ~until_sha:new_tip in
       new_state := Git_state.update_branch !new_state name
@@ -159,7 +177,7 @@ let update ~project_dir ~db ~edits =
       Lwt.return_unit
     | Branch_diff.Rebased { name; old_tip = _; new_tip } ->
       needs_cleanup := true;
-      let* last_processed = walk_branch ~cwd:project_dir ~repo ~db
+      let* last_processed = walk_branch ~cwd:project_dir ~repo ~db ~min_ts
           ~branch:name ~edits ~since_sha:"" ~until_sha:new_tip in
       new_state := Git_state.update_branch !new_state name
           { tip = new_tip; last_processed };

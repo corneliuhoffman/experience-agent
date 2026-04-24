@@ -121,37 +121,45 @@ let load_branch_commits ~project_dir ~branch =
     else Array.of_list ("git" :: base @ [branch])
   in
   let rd, wr = Unix.pipe ~cloexec:true () in
-  let devnull = Unix.openfile "/dev/null" [Unix.O_WRONLY] 0 in
-  let pid = Unix.create_process "git" argv Unix.stdin wr devnull in
-  Unix.close wr;
-  Unix.close devnull;
-  let ic = Unix.in_channel_of_descr rd in
-  let rec loop acc =
-    match input_line ic with
-    | line ->
-      let acc' =
-        match String.index_opt line ' ' with
-        | Some i ->
-          let sha = String.sub line 0 i in
-          let ts_s = String.sub line (i + 1) (String.length line - i - 1) in
-          (try (sha, float_of_string ts_s) :: acc
-           with _ -> acc)
-        | None -> acc
-      in
-      loop acc'
-    | exception End_of_file -> acc
+  let devnull = Unix.openfile "/dev/null" [Unix.O_WRONLY; Unix.O_CLOEXEC] 0 in
+  let safe_close fd = try Unix.close fd with _ -> () in
+  let pid =
+    try Unix.create_process "git" argv Unix.stdin wr devnull
+    with e -> safe_close rd; safe_close wr; safe_close devnull; raise e
   in
-  let acc = loop [] in
-  close_in ic;
-  (* EINTR-safe waitpid — the TUI's signal handlers (SIGWINCH, etc.)
-     can interrupt the syscall. Retry rather than propagating. *)
+  safe_close wr;
+  safe_close devnull;
+  let ic = Unix.in_channel_of_descr rd in
+  (* EINTR-safe waitpid — TUI signal handlers (SIGWINCH) can interrupt. *)
   let rec reap () =
     try ignore (Unix.waitpid [] pid)
-    with Unix.Unix_error (Unix.EINTR, _, _) -> reap ()
+    with
+    | Unix.Unix_error (Unix.EINTR, _, _) -> reap ()
+    | _ -> ()
   in
-  reap ();
-  (* walk_log order is newest-first; we reverse to append oldest-first. *)
-  List.rev acc
+  (* Wrap read/close/reap so a mid-read exception still reaps the child
+     and closes the fd. Without this, any failure leaks a zombie + fd. *)
+  Fun.protect ~finally:(fun () ->
+    (try close_in ic with _ -> ());
+    reap ())
+    (fun () ->
+      let rec loop acc =
+        match input_line ic with
+        | line ->
+          let acc' =
+            match String.index_opt line ' ' with
+            | Some i ->
+              let sha = String.sub line 0 i in
+              let ts_s = String.sub line (i + 1) (String.length line - i - 1) in
+              (try (sha, float_of_string ts_s) :: acc
+               with _ -> acc)
+            | None -> acc
+          in
+          loop acc'
+        | exception End_of_file -> acc
+      in
+      (* walk_log order is newest-first; we reverse to append oldest-first. *)
+      List.rev (loop []))
 
 (* Given a commits list sorted oldest-first and a turn timestamp,
    return (commit_before, commit_after). *)

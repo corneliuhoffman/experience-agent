@@ -14,17 +14,49 @@ type branch_change =
 
 (* ---------- Git helpers ---------- *)
 
-(* List current branches with their tip SHAs *)
+(* List current branches with their tip SHAs. Enumerates local heads
+   AND remote-tracking refs so branches the user hasn't checked out
+   locally still get walked. For each short branch name, keep the tip
+   with the newest committer date — matches the JSONL's [gitBranch]
+   field (never prefixed with a remote) and picks whichever ref has
+   moved furthest forward. *)
 let current_branches ~cwd =
   let* out = Urme_git.Ops.run_git ~cwd
-      ["for-each-ref"; "--format=%(refname:short)\t%(objectname)"; "refs/heads/"] in
-  let lines = String.split_on_char '\n' out in
-  let branches = List.filter_map (fun line ->
+      ["for-each-ref";
+       "--format=%(refname)\t%(objectname)\t%(committerdate:unix)";
+       "refs/heads/"; "refs/remotes/origin/"] in
+  let strip_prefix ~prefix s =
+    let pl = String.length prefix in
+    if String.length s >= pl && String.sub s 0 pl = prefix
+    then Some (String.sub s pl (String.length s - pl)) else None in
+  let short_of_ref full =
+    match strip_prefix ~prefix:"refs/heads/" full with
+    | Some n -> Some n
+    | None ->
+      match strip_prefix ~prefix:"refs/remotes/" full with
+      | None -> None
+      | Some rest ->
+        (* Strip the remote name (first path component) and skip HEAD
+           symrefs like [origin/HEAD -> origin/main]. *)
+        match String.index_opt rest '/' with
+        | None -> None
+        | Some i ->
+          let name = String.sub rest (i+1) (String.length rest - i - 1) in
+          if name = "HEAD" then None else Some name in
+  let best : (string, string * float) Hashtbl.t = Hashtbl.create 64 in
+  List.iter (fun line ->
     match String.split_on_char '\t' (String.trim line) with
-    | [name; sha] when name <> "" && sha <> "" -> Some (name, sha)
-    | _ -> None
-  ) lines in
-  Lwt.return (List.fold_left (fun acc (n, s) -> SMap.add n s acc) SMap.empty branches)
+    | [full; sha; dt] when full <> "" && sha <> "" ->
+      (match short_of_ref full with
+       | None -> ()
+       | Some name ->
+         let date = try float_of_string dt with _ -> 0.0 in
+         match Hashtbl.find_opt best name with
+         | Some (_, prev) when prev >= date -> ()
+         | _ -> Hashtbl.replace best name (sha, date))
+    | _ -> ()
+  ) (String.split_on_char '\n' out);
+  Lwt.return (Hashtbl.fold (fun n (s, _) acc -> SMap.add n s acc) best SMap.empty)
 
 (* Is [a] an ancestor of [b]?  Returns true iff git exits 0. *)
 let is_ancestor ~cwd a b =
