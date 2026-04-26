@@ -95,8 +95,6 @@ make build   # build + copy binary to bin/urme
 make clean   # remove build artifacts
 ```
 
-Dependencies: `ocaml >= 4.14`, `opam`. See `scripts/setup.sh` for the full package list. Once built, `bin/urme` is the same binary `brew install urme` ships as `urme`.
-
 ## Author
 
 Corneliu Hoffman, 2026
