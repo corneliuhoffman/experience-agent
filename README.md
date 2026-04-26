@@ -34,10 +34,12 @@ Re-indexing later: just run `urme init` again. It skips JSONLs whose mtime hasn'
 
 ## Use as a Claude Code MCP server
 
-Let any Claude Code session pull past-session context on its own and push synthesised answers back into the urme TUI. One-time registration:
+`urme` auto-detects how it was invoked: with a TTY on stdin it opens the TUI, without one it speaks JSON-RPC over stdio (MCP server). So the same `urme` binary works as a CLI for you and as an MCP server for Claude Code — no separate subcommand needed.
+
+One-time registration:
 
 ```sh
-claude mcp add -s user urme urme -- serve
+claude mcp add -s user urme urme
 ```
 
 Or per-project in `.mcp.json`:
@@ -48,7 +50,7 @@ Or per-project in `.mcp.json`:
     "urme": {
       "type": "stdio",
       "command": "urme",
-      "args": ["serve"]
+      "args": []
     }
   }
 }
@@ -67,14 +69,14 @@ urme is a single binary backed by a local SQLite store (`.urme/db.sqlite` at the
 
 Claude access goes exclusively through the `claude` CLI subprocess — no `ANTHROPIC_API_KEY`, no direct API calls. Uses your Max subscription.
 
-## CLI search
+## One-shot questions: `urme ask`
 
 ```sh
-urme search "why did tests fail on new files"
-urme search "how did we detect human edits" --smart
+urme ask "what does this repo do?"
+urme ask "summarise the public API of lib/engine" --model sonnet
 ```
 
-`--smart` adds Claude query rewrite (on sparse hits) and rerank — useful when lexical search returns nothing relevant.
+A thin convenience wrapper around the `claude` CLI: spawns Claude as a one-shot subprocess in the project directory, streams the assistant's text reply to stdout, exits. Doesn't read or write the urme index — useful when you just want a Claude answer with project cwd set, without opening a full Claude Code session.
 
 ## Export / import
 

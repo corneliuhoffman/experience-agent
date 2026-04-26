@@ -30,7 +30,7 @@ let tool_definitions = `List [
           "description", `String
             "Space-separated keywords for a SQLite FTS5 MATCH expression. \
              Use concrete technical nouns, drop filler words. Examples: \
-             \"sqlite\", \"git link\", \"chroma ollama embedding\". \
+             \"sqlite fts5\", \"git link commit\", \"branch walker\". \
              Leave empty and pass `query` to fall back to straight \
              keyword match.";
         ];
