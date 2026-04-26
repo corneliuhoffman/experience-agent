@@ -143,11 +143,29 @@ let cleanup_orphans ~cwd ~db =
   let n = Urme_store.Edit_links.cleanup_orphans db ~reachable_shas:reachable in
   Lwt.return n
 
+(* Branches that still have Claude edits with NULL commit_sha. After
+   re-extracting JSONLs (e.g. with corrected cross-machine paths), the
+   branch tip hasn't moved so Branch_diff returns Unchanged and the
+   walker would skip these branches forever. We treat that case as
+   "needs relinking" and re-walk from scratch. *)
+let branches_with_unlinked_claude_edits db =
+  Urme_store.Db.query_fold db
+    "SELECT DISTINCT branch FROM edit_links \
+     WHERE origin = 'claude' AND commit_sha IS NULL \
+       AND branch IS NOT NULL AND branch != ''"
+    [] ~init:[] ~f:(fun acc cols ->
+      Urme_store.Db.data_to_string cols.(0) :: acc)
+
 (* ---------- Main entry point ---------- *)
 
 let update ~project_dir ~db ~edits =
   let* repo = Urme_store.Project_store.open_repo ~project_dir in
   let saved = Git_state.load ~project_dir in
+  let relink_branches =
+    let s = Hashtbl.create 8 in
+    List.iter (fun b -> Hashtbl.replace s b ())
+      (branches_with_unlinked_claude_edits db);
+    s in
   let* changes = Branch_diff.diff ~cwd:project_dir ~saved in
   (* Earliest JSONL-derived edit timestamp — anchor for [--since] pruning
      in walk_branch. 0.0 means "no edits, walk everything" (first-run
@@ -161,6 +179,13 @@ let update ~project_dir ~db ~edits =
   let needs_cleanup = ref false in
   let* () = Lwt_list.iter_s (fun change ->
     match change with
+    | Branch_diff.Unchanged { name; tip } when Hashtbl.mem relink_branches name ->
+      Printf.printf "  re-linking %s (unlinked claude edits)\n%!" name;
+      let* last_processed = walk_branch ~cwd:project_dir ~repo ~db ~min_ts
+          ~branch:name ~edits ~since_sha:"" ~until_sha:tip in
+      new_state := Git_state.update_branch !new_state name
+          { tip; last_processed };
+      Lwt.return_unit
     | Branch_diff.Unchanged _ -> Lwt.return_unit
     | Branch_diff.NewBranch { name; tip } ->
       let* last_processed = walk_branch ~cwd:project_dir ~repo ~db ~min_ts

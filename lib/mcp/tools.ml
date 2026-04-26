@@ -77,10 +77,17 @@ let tool_definitions = `List [
     "name", `String "push_synthesis";
     "description", `String
       "Push your final answer to the running URME TUI. Call this once \
-       after you have produced your one-or-two-sentence synthesis from \
-       `search_history` candidates, so the user can see the conclusion \
-       and the evidence behind it. The TUI will fetch the cited turns' \
-       full text from disk — you do not need to send it.";
+       after you have produced your synthesis from `search_history` \
+       candidates, so the user can see the conclusion and the evidence \
+       behind it. The TUI will fetch the cited turns' full text from \
+       disk — you do not need to send it.\n\
+       \n\
+       CRITICAL: `synthesis` and `cited` are SIBLING tool arguments. \
+       `synthesis` must be plain prose ONLY — do not embed the cited \
+       array inside it as `<parameter name=\"cited\">[...]</parameter>` \
+       or any other XML/JSON fragment. Pass the citations as the \
+       separate `cited` array argument. If you concatenate them into \
+       one string, the TUI will show no Results pane hits.";
     "inputSchema", `Assoc [
       "type", `String "object";
       "properties", `Assoc [

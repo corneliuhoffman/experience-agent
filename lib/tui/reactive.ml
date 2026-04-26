@@ -2401,14 +2401,17 @@ let run ~project_dir () =
          let* () = Lwt.pause () in
          Lwd.set s.search_hits hits;
          Lwd.set s.search_synthesis synthesis;
+         Lwd.set s.search_query ("", 0);
          Lwd.set s.search_idx 0;
          Lwd.set s.search_scroll 0;
          Lwd.set s.search_view Overview;
          Lwd.set s.search_turn_offset 0;
          Lwd.set s.search_running false;
          Lwd.set s.mode Search;
-         if hits <> [] then Lwd.set s.search_focus Results
-         else Lwd.set s.search_focus Query;
+         (* Always land in Results so 'q' quits and '/' / 'i' returns
+            to the query field. Previously focus went to Query on
+            empty hits, swallowing 'q' into the search string. *)
+         Lwd.set s.search_focus Results;
          Lwt.return_unit)
      | _ -> ());
     Lwt.return_unit in

@@ -13,6 +13,51 @@ let read_lines filepath =
 let parse_json_safe line =
   try Some (Yojson.Safe.from_string line) with _ -> None
 
+(* Last-occurrence substring search. Returns the index of the start of
+   the last match, or None. *)
+let find_last_substring s needle =
+  let nlen = String.length needle in
+  let slen = String.length s in
+  if nlen = 0 || nlen > slen then None
+  else
+    let rec scan i acc =
+      if i > slen - nlen then acc
+      else if String.sub s i nlen = needle
+      then scan (i + 1) (Some i)
+      else scan (i + 1) acc
+    in scan 0 None
+
+(* Map an absolute Edit/Write [file_path] to a repo-relative path. The
+   walker compares this against [git diff --name-only] output (which is
+   repo-relative), so leaving a foreign absolute prefix in place breaks
+   commit attribution.
+
+   Two sources of absolute paths to handle:
+   1. JSONL recorded on this machine: starts with [project_dir/].
+      Strip the prefix.
+   2. JSONL imported from another machine: starts with a foreign
+      absolute prefix (e.g. /Users/dimitris/projects/opengrep/opengrep/...).
+      Find the last "/<basename>/" segment and take the suffix — the
+      repo basename is usually distinctive enough to disambiguate.
+   Paths matching neither (e.g. /tmp/x.ml or another user's
+   ~/.claude/...) are returned unchanged; the linker will skip them. *)
+let normalize_file_path ~project_dir fp =
+  let pd = project_dir ^ "/" in
+  let pdlen = String.length pd in
+  if String.length fp >= pdlen
+     && String.sub fp 0 pdlen = pd
+  then String.sub fp pdlen (String.length fp - pdlen)
+  else
+    let basename = Filename.basename project_dir in
+    if basename = "" then fp
+    else
+      let needle = "/" ^ basename ^ "/" in
+      match find_last_substring fp needle with
+      | Some pos ->
+        let start = pos + String.length needle in
+        String.sub fp start (String.length fp - start)
+      | None -> fp
+
 let edits_of_session ?(project_dir="") ~filepath () =
   let session_id = Filename.basename filepath |> Filename.chop_extension in
   let lines = read_lines filepath in
@@ -104,14 +149,7 @@ let edits_of_session ?(project_dir="") ~filepath () =
                   let ek = make_edit_key ~file_base ~old_string ~new_string in
                   let eidx = !edit_in_turn in
                   incr edit_in_turn;
-                  (* Compute relative path from project_dir if fp is absolute *)
-                  let file_path =
-                    let pd = project_dir ^ "/" in
-                    let pdlen = String.length pd in
-                    if String.length fp >= pdlen
-                       && String.sub fp 0 pdlen = pd
-                    then String.sub fp pdlen (String.length fp - pdlen)
-                    else fp in
+                  let file_path = normalize_file_path ~project_dir fp in
                   edits := { edit_key = ek; file_base; file_path;
                              new_string; old_string;
                              replace_all; timestamp = ts; session_id;

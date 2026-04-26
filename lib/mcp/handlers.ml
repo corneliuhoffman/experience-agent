@@ -508,9 +508,88 @@ let handle_get_turn st args =
    along with the full text of the cited turns (so the user can verify
    the conclusion against the evidence). This is the only socket push
    the search pipeline makes — `search_history` itself is silent. *)
+(* Find substring [needle] in [s], starting at [from]. Returns the
+   index of the first match or None. *)
+let find_substring_from s ~from needle =
+  let nlen = String.length needle in
+  let slen = String.length s in
+  if nlen = 0 || from < 0 || from + nlen > slen then None
+  else
+    let rec scan i =
+      if i + nlen > slen then None
+      else if String.sub s i nlen = needle then Some i
+      else scan (i + 1)
+    in scan from
+
+(* Walk forward from [start] (which must point at '['), tracking bracket
+   depth and string state, return the index just past the matching ']'.
+   Used to extract a complete JSON array from inside a free-text blob. *)
+let json_array_end s start =
+  let len = String.length s in
+  if start >= len || s.[start] <> '[' then None
+  else
+    let depth = ref 0 in
+    let in_str = ref false in
+    let escape = ref false in
+    let i = ref start in
+    let result = ref None in
+    while !result = None && !i < len do
+      let c = s.[!i] in
+      (if !in_str then
+         if !escape then escape := false
+         else if c = '\\' then escape := true
+         else if c = '"' then in_str := false
+         else ()
+       else
+         match c with
+         | '"' -> in_str := true
+         | '[' -> incr depth
+         | ']' ->
+           decr depth;
+           if !depth = 0 then result := Some (!i + 1)
+         | _ -> ());
+      incr i
+    done;
+    !result
+
+(* Salvage a [cited] array that the model embedded in the synthesis
+   string as <parameter name="cited">[...]</parameter> instead of
+   passing it as a sibling JSON argument. Returns (cleaned_synthesis,
+   cited_json) when found, else (synthesis, `Null). *)
+let salvage_embedded_cited synthesis =
+  let tag = "<parameter name=\"cited\">" in
+  match find_substring_from synthesis ~from:0 tag with
+  | None -> (synthesis, `Null)
+  | Some tag_pos ->
+    let arr_start = tag_pos + String.length tag in
+    (* Skip whitespace before the '['. *)
+    let len = String.length synthesis in
+    let rec skip_ws i =
+      if i < len && (synthesis.[i] = ' ' || synthesis.[i] = '\n'
+                     || synthesis.[i] = '\t' || synthesis.[i] = '\r')
+      then skip_ws (i + 1) else i
+    in
+    let arr_start = skip_ws arr_start in
+    match json_array_end synthesis arr_start with
+    | None -> (synthesis, `Null)
+    | Some arr_end ->
+      let arr_text = String.sub synthesis arr_start (arr_end - arr_start) in
+      (match try Some (Yojson.Safe.from_string arr_text) with _ -> None with
+       | Some json ->
+         (* Strip from tag_pos to either end of </parameter> or arr_end. *)
+         let close_tag = "</parameter>" in
+         let strip_end =
+           match find_substring_from synthesis ~from:arr_end close_tag with
+           | Some p -> p + String.length close_tag
+           | None -> arr_end in
+         let before = String.sub synthesis 0 tag_pos in
+         let after = String.sub synthesis strip_end (len - strip_end) in
+         (String.trim (before ^ after), json)
+       | None -> (synthesis, `Null))
+
 let handle_push_synthesis st args =
   let open Yojson.Safe.Util in
-  let synthesis =
+  let synthesis_raw =
     match args |> member "synthesis" with
     | `String s when String.trim s <> "" -> s
     | `String _ ->
@@ -519,8 +598,18 @@ let handle_push_synthesis st args =
       failwith "push_synthesis: missing required field 'synthesis'"
     | _ ->
       failwith "push_synthesis: 'synthesis' must be a string" in
+  let cited_arg = args |> member "cited" in
+  (* If the model leaked the cited array into the synthesis text as
+     <parameter name="cited">[...]</parameter>, recover it and strip
+     the XML from the displayed synthesis. *)
+  let synthesis, cited_arg =
+    match cited_arg with
+    | `List (_ :: _) -> (synthesis_raw, cited_arg)
+    | _ ->
+      let cleaned, salvaged = salvage_embedded_cited synthesis_raw in
+      (cleaned, (match salvaged with `Null -> cited_arg | j -> j)) in
   let cited =
-    match args |> member "cited" with
+    match cited_arg with
     | `Null -> []
     | `List xs ->
       List.mapi (fun i j ->
