@@ -5,9 +5,9 @@ synopsis: "OCaml CLI orchestration layer for Claude + GitHub"
 maintainer: "corneliuhoffman@gmail.com"
 authors: ["Corneliu Hoffman <corneliuhoffman@gmail.com>"]
 license: "MIT"
-homepage: "https://github.com/corneliuhoffman/experience-agent"
-bug-reports: "https://github.com/corneliuhoffman/experience-agent/issues"
-dev-repo: "git+https://github.com/corneliuhoffman/experience-agent.git"
+homepage: "https://github.com/corneliuhoffman/urme"
+bug-reports: "https://github.com/corneliuhoffman/urme/issues"
+dev-repo: "git+https://github.com/corneliuhoffman/urme.git"
 depends: [
   "ocaml" {>= "4.14.0"}
   "dune" {>= "3.0"}

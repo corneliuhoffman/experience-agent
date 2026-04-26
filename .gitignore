@@ -1,6 +1,5 @@
 _build/
 *.install
 .merlin
-bin/experience-agent
-chroma/
+bin/urme
 .urme/
