@@ -18,6 +18,7 @@ depends: [
   "cmdliner" {>= "1.2"}
   "notty" {>= "0.2"}
   "nottui"
+  "nottui-lwt"
   "lwd"
   "patch" {>= "3.1"}
   "domainslib" {>= "0.5"}
