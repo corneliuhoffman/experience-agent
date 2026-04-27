@@ -1,3 +1,4 @@
+<img width="1918" height="1055" alt="Screenshot 2026-04-27 at 08 56 56" src="https://github.com/user-attachments/assets/86c35839-ef6b-4744-8bdb-17fe1e900d82" />
 # urme (romanian for traces)
 
 OCaml TUI + MCP server for linking git history to Claude Code conversations.
@@ -18,7 +19,7 @@ For source builds, see [Build from source](#build-from-source) below.
 ```sh
 cd ~/some/repo-where-you-use-claude-code   # any repo with .claude/ session JSONLs
 
-urme init                                   # one-time: index every JSONL into .urme/db.sqlite
+urme init -j 8                                  # one-time: index every JSONL into .urme/db.sqlite (optionally in parallel)
                                             # (also walks git, links Claude edits to commits)
 
 urme                                        # open the TUI — search, replay, view per-turn diffs
@@ -27,8 +28,14 @@ urme                                        # open the TUI — search, replay, v
 That's it for the standalone tool. The TUI's three modes (cycle with `g` / `h` / `s`):
 
 - **Git** — commit log with Claude / human attribution per file.
+  <img width="1918" height="1055" alt="Screenshot 2026-04-27 at 08 56 56" src="https://github.com/user-attachments/assets/c64fe2ae-703e-4482-9366-7a1de1ee12f0" />
+
 - **History** — every session and turn, navigable.
+<img width="1910" height="1078" alt="Screenshot 2026-04-27 at 09 01 08" src="https://github.com/user-attachments/assets/ce24edaa-751a-4738-b5d4-743a6371828e" />
+
 - **Search** — type a query, hit Enter, get ranked candidates plus a Claude-synthesised answer.
+<img width="1919" height="1070" alt="Screenshot 2026-04-27 at 09 02 40" src="https://github.com/user-attachments/assets/2c6cbd4c-f285-4777-adbc-26b92afce6ed" />
+
 
 Re-indexing later: just run `urme init` again. It skips JSONLs whose mtime hasn't changed and only re-walks branches with new commits or unlinked Claude edits.
 
