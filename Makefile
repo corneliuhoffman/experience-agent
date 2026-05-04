@@ -10,7 +10,7 @@ clean:
 	rm -f bin/urme
 
 setup:
-	opam install yojson cohttp-lwt-unix lwt uuidm irmin-git -y
+	opam install --deps-only -y .
 
 install:
 	dune build
