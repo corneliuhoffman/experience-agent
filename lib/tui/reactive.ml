@@ -54,6 +54,7 @@ type session_info = {
   session_id   : string;
   started_at   : float;
   first_prompt : string;
+  title        : string;
   turns        : turn_info list;
 }
 
@@ -131,22 +132,25 @@ let load_data ~project_dir : data Lwt.t =
         "SELECT s.session_id, MIN(s.timestamp) AS t, \
          (SELECT prompt_text FROM steps \
           WHERE session_id = s.session_id \
-          ORDER BY turn_index LIMIT 1) \
+          ORDER BY turn_index LIMIT 1), \
+         COALESCE(sess.title, '') \
          FROM steps s \
+         LEFT JOIN sessions sess ON sess.id = s.session_id \
          WHERE s.session_id IS NOT NULL \
          GROUP BY s.session_id \
          ORDER BY t DESC"
         [] ~f:(fun cols ->
           (Urme_store.Db.data_to_string cols.(0),
            Urme_store.Db.data_to_float cols.(1),
-           Urme_store.Db.data_to_string cols.(2))) in
+           Urme_store.Db.data_to_string cols.(2),
+           Urme_store.Db.data_to_string cols.(3))) in
       let parse_arr s =
         try match Yojson.Safe.from_string s with
           | `List xs ->
             List.filter_map (function `String s -> Some s | _ -> None) xs
           | _ -> []
         with _ -> [] in
-      let sessions = List.map (fun (sid, started_at, first) ->
+      let sessions = List.map (fun (sid, started_at, first, title) ->
         let first_prompt =
           let t = String.trim first in
           if String.length t > 80 then String.sub t 0 80 ^ "…" else t in
@@ -164,7 +168,7 @@ let load_data ~project_dir : data Lwt.t =
               t_files     = parse_arr (Urme_store.Db.data_to_string cols.(4));
               t_commands  = parse_arr (Urme_store.Db.data_to_string cols.(5)); })
         in
-        { session_id = sid; started_at; first_prompt; turns }
+        { session_id = sid; started_at; first_prompt; title; turns }
       ) session_rows in
       Urme_store.Schema.close db;
       sessions
@@ -1216,7 +1220,8 @@ let sessions_panel s =
           "%04d-%02d-%02d %02d:%02d"
           (tm.tm_year + 1900) (tm.tm_mon + 1) tm.tm_mday
           tm.tm_hour tm.tm_min in
-        Printf.sprintf "%s  %s" date (sanitize si.first_prompt)
+        let label = if si.title <> "" then si.title else si.first_prompt in
+        Printf.sprintf "%s  %s" date (sanitize label)
       ) s.data.sessions in
       render_panel ~idx:1 ~title:"Sessions" ~focused
         ~items ~sel_idx:sel ~w ~h)
