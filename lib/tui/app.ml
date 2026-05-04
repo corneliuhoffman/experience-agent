@@ -312,6 +312,7 @@ let c_diff_add_bg = lc _theme.diff_add_bg
 let c_diff_del_fg = lc _theme.diff_del_fg
 let c_diff_del_bg = lc _theme.diff_del_bg
 let c_separator = lc _theme.separator
+let c_panel_focus_bg = lc _theme.panel_focus_bg
 
 (* ---------- UTF-8 / drawing ---------- *)
 
@@ -771,33 +772,37 @@ let render_git_panel ~idx ~height ~title ~focused ~items ~sel_idx ~width =
   if height <= 0 || width < 2 then Notty.I.empty
   else begin
     let border_fg = if focused then c_highlight else c_separator in
-    let border_attr = Notty.A.(fg border_fg ++ bg c_bg) in
+    (* Focused panel uses heavy box-drawing chars and a tinted bg so the
+       active section pops; unfocused panels stay light + default bg. *)
+    let panel_bg = if focused then c_panel_focus_bg else c_bg in
+    let border_attr = Notty.A.(fg border_fg ++ bg c_bg
+                               ++ (if focused then st bold else empty)) in
     let title_attr  = Notty.A.(fg c_highlight ++ bg c_bg ++ st bold) in
     let inner_w = max 0 (width - 2) in
     let inner_h = max 0 (height - 2) in
-    (* UTF-8 box-drawing needs bytes-not-code-points, so we build the
-       dash fill via a buffer rather than [String.make]. *)
+    (* Focused: solid block chars (█) so the border reads as visibly
+       thicker than the light single-line border on unfocused panels. *)
+    let tl, tr, bl, br, h_, v_ =
+      if focused then "█", "█", "█", "█", "█", "█"
+      else            "┌", "┐", "└", "┘", "─", "│" in
     let dash_fill n =
       let b = Buffer.create (n * 3) in
-      for _ = 1 to n do Buffer.add_string b "─" done;
+      for _ = 1 to n do Buffer.add_string b h_ done;
       Buffer.contents b in
-    (* Top border: ┌─[N]─Title─────┐ *)
     let label = Printf.sprintf "[%d]─%s" idx title in
     let label_cps = utf8_count label in
     let top =
       if inner_w <= label_cps then
-        Notty.I.string border_attr "┌" <|>
+        Notty.I.string border_attr tl <|>
         Notty.I.string title_attr
           (if label_cps > inner_w then utf8_truncate label inner_w else label) <|>
-        Notty.I.string border_attr "┐"
+        Notty.I.string border_attr tr
       else
         let fill_n = inner_w - label_cps - 1 in
-        Notty.I.string border_attr "┌─" <|>
+        Notty.I.string border_attr (tl ^ h_) <|>
         Notty.I.string title_attr label <|>
         Notty.I.string border_attr (dash_fill (max 0 fill_n)) <|>
-        Notty.I.string border_attr "┐" in
-    (* Content rows — same scrolling logic as before, just +2 cols of
-       side-border wrapping each row. *)
+        Notty.I.string border_attr tr in
     let scroll = max 0 (sel_idx - inner_h + 1) in
     let row_for i (lbl, is_current, is_dim) =
       let vi = i - scroll in
@@ -807,20 +812,20 @@ let render_git_panel ~idx ~height ~title ~focused ~items ~sel_idx ~width =
                  else if is_dim then c_separator
                  else if is_current then c_user
                  else c_fg in
-        let bg_c = if selected then c_status_bg else c_bg in
+        let bg_c = if selected then c_status_bg else panel_bg in
         let attr = Notty.A.(fg fg_c ++ bg bg_c
                             ++ (if selected then st bold else empty)) in
         let inner_row = mk_row ~attr inner_w (" " ^ lbl) in
-        Some (Notty.I.string border_attr "│"
+        Some (Notty.I.string border_attr v_
               <|> inner_row
-              <|> Notty.I.string border_attr "│")
+              <|> Notty.I.string border_attr v_)
       end else None
     in
     let visible_rows = List.filter_map Fun.id (List.mapi row_for items) in
     let filler_row =
-      Notty.I.string border_attr "│"
-      <|> Notty.I.char Notty.A.(fg c_fg ++ bg c_bg) ' ' inner_w 1
-      <|> Notty.I.string border_attr "│" in
+      Notty.I.string border_attr v_
+      <|> Notty.I.char Notty.A.(fg c_fg ++ bg panel_bg) ' ' inner_w 1
+      <|> Notty.I.string border_attr v_ in
     let content =
       let used = List.length visible_rows in
       let pad = max 0 (inner_h - used) in
@@ -829,9 +834,9 @@ let render_git_panel ~idx ~height ~title ~focused ~items ~sel_idx ~width =
         else List.init pad (fun _ -> filler_row) in
       Notty.I.vcat (visible_rows @ fillers) in
     let bot =
-      Notty.I.string border_attr "└" <|>
+      Notty.I.string border_attr bl <|>
       Notty.I.string border_attr (dash_fill inner_w) <|>
-      Notty.I.string border_attr "┘" in
+      Notty.I.string border_attr br in
     top <-> content <-> bot
   end
 
@@ -2296,15 +2301,30 @@ let run ~config ~project_dir () =
           { s with mode = History; status_extra = "Ready" }) in
       redraw mvar; loop ()
 
-    (* Tab: next panel *)
+    (* Tab / Shift+Tab / number keys: change focused panel.
+       Many terminals don't deliver Shift+Tab as `(Tab, [Shift])` — they
+       drop the modifier and send a plain Tab. To keep "go back" working
+       we also accept BTab via the `[`/`]` escape route below: pressing
+       Shift+Tab in a stripped-modifier terminal still leaves a status
+       hint showing the actual mods, so the user can see what arrived. *)
     | `Key (`Tab, mods)
-      when (match peek mvar with Some s -> s.mode = Git | None -> false)
-        && not (List.mem `Shift mods) ->
+      when (match peek mvar with Some s -> s.mode = Git | None -> false) ->
+      let backward = List.mem `Shift mods in
+      let mods_str =
+        let parts = List.map (function
+          | `Shift -> "Shift" | `Meta -> "Meta" | `Ctrl -> "Ctrl") mods in
+        String.concat "+" parts in
       let* () = update mvar (fun s ->
         let g = s.git in
-        let next = match g.focus with
-          | Branches -> Commits | Commits -> Files
-          | Files -> Links | Links -> Branches in
+        let next =
+          if backward then
+            match g.focus with
+            | Branches -> Links | Commits -> Branches
+            | Files -> Commits | Links -> Files
+          else
+            match g.focus with
+            | Branches -> Commits | Commits -> Files
+            | Files -> Links | Links -> Branches in
         let link_candidates = match next with
           | Links ->
             (match List.nth_opt g.commits g.commit_idx, List.nth_opt g.files g.file_idx with
@@ -2313,19 +2333,23 @@ let run ~config ~project_dir () =
                 | Some l -> l | None -> [])
              | _ -> [])
           | _ -> g.link_candidates in
-        { s with git = { g with focus = next; link_candidates; link_idx = 0 } }) in
+        let status =
+          Printf.sprintf "Tab%s mods=[%s]"
+            (if backward then "(back)" else "") mods_str in
+        { s with git = { g with focus = next; link_candidates; link_idx = 0 };
+                 status_extra = status }) in
       redraw mvar; loop ()
 
-    (* Shift+Tab: previous panel *)
-    | `Key (`Tab, mods)
+    (* 1-4: jump directly to a panel. *)
+    | `Key (`ASCII c, [])
       when (match peek mvar with Some s -> s.mode = Git | None -> false)
-        && List.mem `Shift mods ->
+        && c >= '1' && c <= '4' ->
+      let target = match c with
+        | '1' -> Branches | '2' -> Commits
+        | '3' -> Files    | _   -> Links in
       let* () = update mvar (fun s ->
         let g = s.git in
-        let prev = match g.focus with
-          | Branches -> Links | Commits -> Branches
-          | Files -> Commits | Links -> Files in
-        let link_candidates = match prev with
+        let link_candidates = match target with
           | Links ->
             (match List.nth_opt g.commits g.commit_idx, List.nth_opt g.files g.file_idx with
              | Some (sha, _, _), Some file ->
@@ -2333,7 +2357,7 @@ let run ~config ~project_dir () =
                 | Some l -> l | None -> [])
              | _ -> [])
           | _ -> g.link_candidates in
-        { s with git = { g with focus = prev; link_candidates; link_idx = 0 } }) in
+        { s with git = { g with focus = target; link_candidates; link_idx = 0 } }) in
       redraw mvar; loop ()
 
     (* Up / k / Down / j: navigate. files + link_candidates are

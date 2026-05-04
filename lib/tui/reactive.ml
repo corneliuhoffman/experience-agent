@@ -545,6 +545,7 @@ let c_diff_del  = A.(rgb_888 ~r:255 ~g:160 ~b:160)
 let c_hunk      = A.lightcyan
 let c_fg_main   = A.(rgb_888 ~r:245 ~g:245 ~b:245)
 let c_bg        = A.black
+let c_panel_focus_bg = A.(rgb_888 ~r:30 ~g:42 ~b:78)
 
 (* Box-bordered panel. No more size_sensor — mutating Lwd.vars from
    inside a sensor callback during sampling deadlocks the Lwd graph
@@ -554,16 +555,16 @@ let c_bg        = A.black
 let render_panel ~idx ~title ~focused ~items ~sel_idx ~w ~h =
   if w < 4 || h < 3 then U.empty
   else
+    (* Focused panel: blue bg tint behind non-selected rows so the active
+       pane is obvious without changing border weight. *)
+    let panel_bg = if focused then c_panel_focus_bg else c_bg in
     let border_attr =
-      if focused then A.(fg lightcyan ++ st bold)
-      else A.(fg (gray 12)) in
-    let t_attr = A.(fg lightcyan ++ st bold) in
+      if focused then A.(fg lightcyan ++ bg c_bg ++ st bold)
+      else A.(fg (gray 12) ++ bg c_bg) in
+    let t_attr = A.(fg lightcyan ++ bg c_bg ++ st bold) in
     let inner_w = max 1 (w - 2) in
     let body_h  = max 0 (h - 2) in
     let label = Printf.sprintf "[%d]─%s" idx title in
-    (* Count UTF-8 code points, not bytes — "─" is 1 display cell
-       but 3 bytes, so String.length over-counts and the top border
-       ends up short by 2 cells per ─ in the label. *)
     let lbl_cells =
       let b = ref 0 and i = ref 0 and n = String.length label in
       while !i < n do
@@ -599,11 +600,9 @@ let render_panel ~idx ~title ~focused ~items ~sel_idx ~w ~h =
         if is_sel && focused then
           A.(fg black ++ bg lightyellow ++ st bold)
         else if is_sel then
-          (* Unfocused selection: dim inverse so it's still visible
-             which row was last selected in each panel. *)
           A.(fg lightyellow ++ bg (gray 4) ++ st bold)
-        else if focused then A.(fg lightwhite)
-        else A.(fg (gray 16)) in
+        else if focused then A.(fg lightwhite ++ bg panel_bg)
+        else A.(fg (gray 16) ++ bg panel_bg) in
       let content = pad_cells ("  " ^ label) inner_w in
       I.hcat [
         I.string border_attr "│";
@@ -618,7 +617,7 @@ let render_panel ~idx ~title ~focused ~items ~sel_idx ~w ~h =
     let filler =
       I.hcat [
         I.string border_attr "│";
-        I.char A.(bg black) ' ' inner_w 1;
+        I.char A.(bg panel_bg) ' ' inner_w 1;
         I.string border_attr "│";
       ] in
     let pads =
@@ -909,14 +908,15 @@ let async_update f = dbg "sync_update: running"; f ()
 (* on_key: pattern-match on (mode, key), defer mutations via
    [async_update]. The Enter-on-Links case scrolls the diff_scroll
    to the line of the link's Edit/Write in the rendered body. *)
-let on_key s (key, _mods) : U.may_handle =
+let on_key s (key, mods) : U.may_handle =
   let kname = match key with
     | `ASCII c -> Printf.sprintf "ASCII %C" c
     | `Tab -> "Tab" | `Enter -> "Enter"
     | `Arrow `Up -> "Up" | `Arrow `Down -> "Down"
     | `Arrow `Left -> "Left" | `Arrow `Right -> "Right"
     | _ -> "?" in
-  dbg (Printf.sprintf "key: %s (mode=%s)" kname
+  let shift = List.mem `Shift mods in
+  dbg (Printf.sprintf "key: %s shift=%b (mode=%s)" kname shift
          (match Lwd.peek s.mode with
           | Git -> "Git" | History -> "History" | Search -> "Search"));
   let defer f = async_update f; `Handled in
@@ -1080,13 +1080,25 @@ let on_key s (key, _mods) : U.may_handle =
      memory. *)
   | Git, `Tab -> defer (fun () ->
       let prev = Lwd.peek s.focus in
-      let next = cycle_focus prev in
-      (match prev with
-       | Branches | Commits | Files -> Lwd.set s.right_kind Right_diff
+      let next = cycle_focus ~back:shift prev in
+      (match next with
        | Links -> Lwd.set s.right_kind Right_link
-       | Right -> ());
+       | Right -> ()
+       | _ -> Lwd.set s.right_kind Right_diff);
       Lwd.set s.focus next;
       if next <> Right then Lwd.set s.diff_scroll 0;
+      Lwd.set s.link_turn_offset 0)
+  (* 1-5: jump directly to a panel. *)
+  | Git, `ASCII ('1' | '2' | '3' | '4' | '5' as c) -> defer (fun () ->
+      let target = match c with
+        | '1' -> Branches | '2' -> Commits | '3' -> Files
+        | '4' -> Links    | _   -> Right in
+      (match target with
+       | Links -> Lwd.set s.right_kind Right_link
+       | Right -> ()
+       | _ -> Lwd.set s.right_kind Right_diff);
+      Lwd.set s.focus target;
+      if target <> Right then Lwd.set s.diff_scroll 0;
       Lwd.set s.link_turn_offset 0)
   | Git, `Arrow `Down when Lwd.peek s.focus = Right ->
     defer (fun () -> Lwd.update (fun i -> i + 1) s.diff_scroll)
@@ -1143,10 +1155,33 @@ let on_key s (key, _mods) : U.may_handle =
     defer (fun () -> Lwd.set s.hist_view Overview; Lwd.set s.hist_scroll 0)
   | History, `Tab ->
     defer (fun () ->
+      let cycle = function
+        | Sessions -> if shift then History_body else Turns
+        | Turns -> if shift then Sessions else History_body
+        | History_body -> if shift then Turns else Sessions in
+      Lwd.update cycle s.hist_focus)
+  (* 1-3: jump directly to a History panel. *)
+  | History, `ASCII ('1' | '2' | '3' as c) -> defer (fun () ->
+      let target = match c with
+        | '1' -> Sessions | '2' -> Turns | _ -> History_body in
+      Lwd.set s.hist_focus target)
+  (* B (Shift+B): backward-cycle as a fallback when the terminal eats
+     Shift+Tab. Maps to backward in whichever mode is active. *)
+  | Git, `ASCII 'B' -> defer (fun () ->
+      let prev = Lwd.peek s.focus in
+      let next = cycle_focus ~back:true prev in
+      (match next with
+       | Links -> Lwd.set s.right_kind Right_link
+       | Right -> ()
+       | _ -> Lwd.set s.right_kind Right_diff);
+      Lwd.set s.focus next;
+      if next <> Right then Lwd.set s.diff_scroll 0;
+      Lwd.set s.link_turn_offset 0)
+  | History, `ASCII 'B' -> defer (fun () ->
       Lwd.update (function
-        | Sessions -> Turns
-        | Turns -> History_body
-        | History_body -> Sessions) s.hist_focus)
+        | Sessions -> History_body
+        | Turns -> Sessions
+        | History_body -> Turns) s.hist_focus)
   (* Arrow keys move within the focused pane: selection on the
      Sessions/Turns lists, scroll on the Body pane. [j]/[k]/[J]/[K]
      mirror this. *)
@@ -1794,6 +1829,9 @@ let styled_panel ?(idx=5) ?(title_text="") ?(focused=Lwd.pure false)
     ~f:(fun ((w, h), foc) (lines, scroll) ->
       if w < 4 || h < 3 then U.empty
       else
+        (* Same focus-bg tint as render_panel so the right pane lights
+           up identically to the four left panels when focused. *)
+        let panel_bg = if foc then c_panel_focus_bg else c_bg in
         let border_attr =
           if foc then A.(fg lightcyan ++ bg c_bg ++ st bold)
           else A.(fg (gray 12) ++ bg c_bg) in
@@ -1802,10 +1840,6 @@ let styled_panel ?(idx=5) ?(title_text="") ?(focused=Lwd.pure false)
         let body_h = max 0 (h - 2) in
         let rec drop n xs = if n <= 0 then xs
           else match xs with [] -> [] | _ :: r -> drop (n - 1) r in
-        (* Soft-wrap each input line to the panel's inner width
-           (minus the 2-cell indent that [make_row] prepends). Each
-           wrapped fragment becomes its own row, inheriting the
-           source line's attr. *)
         let wrap_w = max 1 (inner_w - 2) in
         let wrapped = List.concat_map (fun (attr, l) ->
           let pieces = wrap_to_cells (sanitize l) wrap_w in
@@ -1832,15 +1866,16 @@ let styled_panel ?(idx=5) ?(title_text="") ?(focused=Lwd.pure false)
           let pad_n = max 0 (inner_w - display_width scroll_info) in
           I.hcat [
             I.string border_attr "│";
-            I.char A.(bg c_bg) ' ' pad_n 1;
+            I.char A.(bg panel_bg) ' ' pad_n 1;
             I.string title_attr scroll_info;
             I.string border_attr "│";
           ] in
         let make_row (attr, l) =
           let content = pad_cells ("  " ^ l) inner_w in
+          let row_attr = A.(attr ++ bg panel_bg) in
           I.hcat [
             I.string border_attr "│";
-            I.string attr content;
+            I.string row_attr content;
             I.string border_attr "│";
           ] in
         let rows = List.map make_row
@@ -1848,7 +1883,7 @@ let styled_panel ?(idx=5) ?(title_text="") ?(focused=Lwd.pure false)
         let filler =
           I.hcat [
             I.string border_attr "│";
-            I.char A.(bg c_bg) ' ' inner_w 1;
+            I.char A.(bg panel_bg) ' ' inner_w 1;
             I.string border_attr "│";
           ] in
         let pads = List.init
@@ -2393,8 +2428,8 @@ Lwd.map2 left right ~f:(fun l r ->
         let join parts =
           String.concat " · " (List.filter (fun s -> s <> "") parts) in
         let mode_tail = match mode with
-          | Git -> "Tab pane · h:hist · s:search · q:quit"
-          | History -> "Tab pane · g:git · s:search · q:quit"
+          | Git -> "Tab next · ⇧Tab/B prev · 1-5 jump · h:hist · s:search · q:quit"
+          | History -> "Tab next · ⇧Tab/B prev · 1-3 jump · g:git · s:search · q:quit"
           | Search -> "Tab pane · /:edit · s:new · g:git · h:hist · q:quit"
         in
         let nav_or_scroll = match mode, focus, hfocus, sfocus with

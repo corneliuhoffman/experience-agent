@@ -48,6 +48,7 @@ type theme = {
   diff_del_bg : rgb;
   separator : rgb;
   selection_bg : rgb;
+  panel_focus_bg : rgb;
 }
 
 type config = {
@@ -91,6 +92,7 @@ let tokyo_night = {
   diff_del_bg = rgb 95 0 0;       (* 256-palette dark red *)
   separator   = rgb 59 66 97;     (* #3b4261 *)
   selection_bg = rgb 42 46 54;    (* #2a2e36 *)
+  panel_focus_bg = rgb 30 42 78;  (* #1e2a4e — clearly visible blue tint for focused panel *)
 }
 
 let default_config = {
@@ -147,6 +149,7 @@ let load () =
               diff_del_bg = c "diff_del_bg" tokyo_night.diff_del_bg;
               separator   = c "separator"   tokyo_night.separator;
               selection_bg= c "selection_bg"tokyo_night.selection_bg;
+              panel_focus_bg = c "panel_focus_bg" tokyo_night.panel_focus_bg;
             }
           | _ -> tokyo_night);
       }
