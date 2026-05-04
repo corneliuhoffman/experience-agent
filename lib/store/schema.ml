@@ -14,7 +14,7 @@
 module D = Db
 module S = Sqlite3
 
-let schema_version = 5
+let schema_version = 7
 
 (* Migration 1: initial schema. *)
 let migration_1 = [
@@ -216,6 +216,14 @@ let migration_6 = [
      SELECT id, summary, tags, prompt_text, assistant_text FROM steps|};
 ]
 
+(* Migration 7: store the AI-generated session title.  Claude Code writes
+   a {"type":"ai-title","aiTitle":"…"} record into the JSONL; we extract
+   it during indexing and keep it here so the TUI can show it in the
+   session picker without re-scanning the JSONL file. *)
+let migration_7 = [
+  {|ALTER TABLE sessions ADD COLUMN title TEXT|};
+]
+
 let migrations = [
   1, migration_1;
   2, migration_2;
@@ -223,6 +231,7 @@ let migrations = [
   4, migration_4;
   5, migration_5;
   6, migration_6;
+  7, migration_7;
 ]
 
 (* --- meta helpers --- *)

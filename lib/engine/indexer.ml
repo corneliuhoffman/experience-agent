@@ -198,19 +198,36 @@ let int_data n = S.Data.INT (Int64.of_int n)
 
 (* ---------- Session + step writes ---------- *)
 
-let upsert_session db ~session_id ~started_at ~jsonl_path ~turn_count =
+let extract_ai_title ~filepath =
+  let open Yojson.Safe.Util in
+  let lines = Jsonl.read_all_lines filepath in
+  List.fold_left (fun acc line ->
+    match (try Some (Yojson.Safe.from_string line) with _ -> None) with
+    | Some json ->
+      (match json |> member "type" |> to_string_option with
+       | Some "ai-title" ->
+         (match json |> member "aiTitle" |> to_string_option with
+          | Some t when t <> "" -> t
+          | _ -> acc)
+       | _ -> acc)
+    | None -> acc
+  ) "" lines
+
+let upsert_session db ~session_id ~started_at ~jsonl_path ~turn_count ~title =
   D.exec_params db
-    "INSERT INTO sessions(id, started_at, jsonl_path, turn_count, last_indexed_at) \
-     VALUES(?, ?, ?, ?, ?) \
+    "INSERT INTO sessions(id, started_at, jsonl_path, turn_count, last_indexed_at, title) \
+     VALUES(?, ?, ?, ?, ?, ?) \
      ON CONFLICT(id) DO UPDATE SET \
        jsonl_path = excluded.jsonl_path, \
        turn_count = excluded.turn_count, \
-       last_indexed_at = excluded.last_indexed_at"
+       last_indexed_at = excluded.last_indexed_at, \
+       title = COALESCE(NULLIF(excluded.title, ''), sessions.title)"
     [ S.Data.TEXT session_id;
       S.Data.FLOAT started_at;
       S.Data.TEXT jsonl_path;
       S.Data.INT (Int64.of_int turn_count);
-      S.Data.FLOAT (Unix.gettimeofday ()) ]
+      S.Data.FLOAT (Unix.gettimeofday ());
+      nullable_text title ]
 
 (* Upsert a step row keyed on (session_id, turn_index). Preserves the
    existing summary/tags on re-index so `urme init` can be run again
@@ -283,9 +300,10 @@ let index_session ~db ~project_dir ~jsonl_path =
     | [] -> Unix.gettimeofday ()
   in
   let branch_commits = make_branch_cache ~project_dir in
+  let title = extract_ai_title ~filepath:jsonl_path in
   D.with_txn db (fun () ->
     upsert_session db ~session_id ~started_at ~jsonl_path
-      ~turn_count:(List.length interactions);
+      ~turn_count:(List.length interactions) ~title;
     let valid_turns = List.map (fun (i : interaction) -> i.index) interactions in
     prune_missing_turns db ~session_id ~valid_set:valid_turns;
     List.iter (fun (i : interaction) ->
