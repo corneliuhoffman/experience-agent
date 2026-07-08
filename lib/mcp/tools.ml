@@ -226,6 +226,50 @@ let tool_definitions = `List [
   ];
   (* ---- annotated call graph ---- *)
   `Assoc [
+    "name", `String "graph_init";
+    "description", `String
+      "Initialise the annotated call graph for this repo (\"using urme, \
+       initialise the callgraph\"). Runs the opengrep interfile analyzer \
+       (static analysis — can take minutes on big repos), loads the \
+       resulting nodes+edges into .urme/db.sqlite with SCC/topo order, \
+       and reports how many functions await description. YOU then \
+       produce the annotations: loop graph_next_batch -> write \
+       short-but-comprehensive descriptions -> graph_set_descriptions until \
+       remaining = 0 (parallel subagents are safe: ready units are \
+       independent). Requires the opengrep-interfile-graph binary on \
+       PATH or via URME_OPENGREP_EXPORTER. Replaces any existing graph \
+       for the project.";
+    "inputSchema", `Assoc [
+      "type", `String "object";
+      "properties", `Assoc [
+        "lang", `Assoc [
+          "type", `String "string";
+          "description", `String
+            "Language to analyze (opengrep id: \"ts\", \"js\", \
+             \"python\", \"java\", \"go\", ...). One graph per language.";
+        ];
+        "root", `Assoc [
+          "type", `String "string";
+          "description", `String
+            "Project root to analyze (default: this project). Must be a \
+             standalone repo root — paths nested inside another git repo \
+             yield 0 files.";
+        ];
+        "ncores", `Assoc [
+          "type", `String "integer";
+          "description", `String "Parallelism for the analyzer (default 4).";
+        ];
+        "exporter", `Assoc [
+          "type", `String "string";
+          "description", `String
+            "Path to the opengrep-interfile-graph binary (overrides PATH \
+             / URME_OPENGREP_EXPORTER).";
+        ];
+      ];
+      "required", `List [`String "lang"];
+    ];
+  ];
+  `Assoc [
     "name", `String "graph_status";
     "description", `String
       "Progress of the annotated call graph for this repo. Returns \
@@ -245,8 +289,11 @@ let tool_definitions = `List [
       "Drive the leaves-first describe-loop. Returns up to `limit` \
        SCC-units that are READY to describe: every unit's cross-SCC \
        callees already have descriptions (included, so you can write \
-       informed summaries). For each function in `functions`, write ONE \
-       sentence — what it does, plus its type/signature if clear. A unit \
+       informed summaries). For each function in `functions`, write a \
+       SHORT BUT COMPREHENSIVE description (usually 1-2 sentences) — what \
+       it does and its type/signature, plus anything non-obvious a caller \
+       must know (side effects, security relevance, error behaviour). \
+       Favour completeness over brevity when they conflict. A unit \
        with `recursive:true` holds mutually-recursive functions: describe \
        them together. Functions with synthetic names (e.g. _tmp_lambda) \
        are lambdas: START their description with the real binding name \

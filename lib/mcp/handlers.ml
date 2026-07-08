@@ -669,6 +669,93 @@ let handle_push_synthesis st args =
 
 (* ---------- Annotated call graph ---------- *)
 
+(* Build the call graph by running the opengrep interfile exporter (the
+   static analyzer — descriptions still come from the calling session),
+   then load the JSON into the store. *)
+let handle_graph_init st args =
+  let open Yojson.Safe.Util in
+  let lang = args |> member "lang" |> to_string in
+  let root =
+    match args |> member "root" with
+    | `String r when r <> "" ->
+      if Filename.is_relative r then Filename.concat st.project_dir r else r
+    | _ -> st.project_dir in
+  let ncores = try args |> member "ncores" |> to_int with _ -> 4 in
+  let exporter =
+    match args |> member "exporter" with
+    | `String e when e <> "" -> e
+    | _ ->
+      (match Sys.getenv_opt "URME_OPENGREP_EXPORTER" with
+       | Some p when p <> "" -> p
+       | _ -> "opengrep-interfile-graph") in
+  let urme_dir = Filename.concat st.project_dir ".urme" in
+  if not (Sys.file_exists urme_dir) then Unix.mkdir urme_dir 0o755;
+  let out_json =
+    Filename.concat urme_dir (Printf.sprintf "callgraph-%s.json" lang) in
+  let cmd =
+    (exporter,
+     [| exporter; "export"; "--lang"; lang; "-r"; root;
+        "-o"; out_json; "-j"; string_of_int ncores |]) in
+  let tail s =
+    let n = String.length s in
+    if n > 800 then String.sub s (n - 800) 800 else s in
+  Lwt.catch
+    (fun () ->
+      let proc = Lwt_process.open_process_full cmd in
+      let* out = Lwt_io.read proc#stdout in
+      let* err = Lwt_io.read proc#stderr in
+      let* status = proc#close in
+      match status with
+      | Unix.WEXITED 0 ->
+        let db = ensure_db st in
+        let (nn, ne) =
+          Urme_engine.Callgraph_load.build ~db ~json_path:out_json in
+        let (total, described, ready) = Cg.status db in
+        let note =
+          if nn = 0 then
+            "0 nodes: the analyzer found no files — check `lang`, and \
+             point `root` at a standalone repo root (target discovery \
+             skips paths nested inside another git repo)."
+          else
+            "Graph loaded. Now annotate leaves-first: call \
+             graph_next_batch, write a short but comprehensive \
+             description for every returned function (lead with the \
+             binding name for _tmp_lambda nodes), post them with \
+             graph_set_descriptions, \
+             and repeat until remaining = 0. For large graphs, split \
+             batches across parallel subagents — ready units are \
+             independent." in
+        Lwt.return (json_result (`Assoc [
+          "lang", `String lang;
+          "root", `String root;
+          "json", `String out_json;
+          "nodes", `Int nn;
+          "edges", `Int ne;
+          "total", `Int total;
+          "described", `Int described;
+          "remaining", `Int (total - described);
+          "ready_units", `Int ready;
+          "note", `String note;
+        ]))
+      | _ ->
+        let code = match status with
+          | Unix.WEXITED c -> Printf.sprintf "exit %d" c
+          | Unix.WSIGNALED s -> Printf.sprintf "signal %d" s
+          | Unix.WSTOPPED s -> Printf.sprintf "stopped %d" s in
+        Lwt.return (text_result (Printf.sprintf
+          "graph_init: %s failed (%s)%s.\nstdout: %s\nstderr: %s"
+          exporter code
+          (if code = "exit 127" then
+             " — binary not found; set URME_OPENGREP_EXPORTER or put \
+              opengrep-interfile-graph on PATH"
+           else "")
+          (tail out) (tail err))))
+    (fun exn ->
+      Lwt.return (text_result (Printf.sprintf
+        "graph_init: could not run %s (%s). Set URME_OPENGREP_EXPORTER \
+         to the opengrep-interfile-graph binary or put it on PATH."
+        exporter (Printexc.to_string exn))))
+
 let handle_graph_status st _args =
   let db = ensure_db st in
   let (total, described, ready) = Cg.status db in
@@ -718,8 +805,10 @@ let handle_graph_next_batch st args =
     "ready_units", `Int ready;
     "batch", `List batch;
     "note", `String
-      "Describe every function in `functions` (one sentence: what it does \
-       + type if clear), using `callees` descriptions for context. \
+      "Describe every function in `functions` — a short but comprehensive \
+       description (usually 1-2 sentences: what it does, its \
+       type/signature, and anything non-obvious a caller must know), \
+       using `callees` descriptions for context. \
        Recursive units: describe the group together. Then call \
        graph_set_descriptions with {id, description} for each, and call \
        graph_next_batch again until remaining = 0.";
@@ -835,6 +924,7 @@ let dispatch st name args =
   | "explain_change" -> handle_explain_change st args
   | "commit_links"   -> handle_commit_links st args
   | "search_by_file" -> handle_search_by_file st args
+  | "graph_init"             -> handle_graph_init st args
   | "graph_status"           -> handle_graph_status st args
   | "graph_next_batch"       -> handle_graph_next_batch st args
   | "graph_set_descriptions" -> handle_graph_set_descriptions st args
