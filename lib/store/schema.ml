@@ -14,7 +14,7 @@
 module D = Db
 module S = Sqlite3
 
-let schema_version = 7
+let schema_version = 8
 
 (* Migration 1: initial schema. *)
 let migration_1 = [
@@ -224,6 +224,54 @@ let migration_7 = [
   {|ALTER TABLE sessions ADD COLUMN title TEXT|};
 ]
 
+(* Migration 8: annotated call graph. Nodes + edges loaded from an
+   opengrep-callgraph/v1 export; [scc]/[topo] filled by SCC condensation
+   + leaves-first topological order; [description] filled leaves-first by
+   the MCP describe-loop (each node described once all its cross-SCC
+   callees are). Lives in the same DB so the MCP can both drive the loop
+   and answer questions about the graph. *)
+let migration_8 = [
+  {|CREATE TABLE IF NOT EXISTS cg_nodes (
+      id           TEXT PRIMARY KEY,     -- name|file|line|col (opengrep id)
+      name         TEXT NOT NULL,
+      file         TEXT NOT NULL,
+      start_line   INTEGER NOT NULL,
+      end_line     INTEGER NOT NULL,
+      end_exact    INTEGER NOT NULL DEFAULT 0,
+      kind         TEXT NOT NULL,        -- normal|toplevel|lambda
+      lang         TEXT,
+      scc          INTEGER,              -- SCC group id (Tarjan)
+      topo         INTEGER,              -- leaves-first order of the SCC
+      code_hash    TEXT,                 -- hash of extracted source (for re-desc)
+      description  TEXT,                 -- filled by the describe-loop
+      described_at REAL
+    )|};
+  {|CREATE INDEX IF NOT EXISTS cg_nodes_scc_idx  ON cg_nodes(scc)|};
+  {|CREATE INDEX IF NOT EXISTS cg_nodes_topo_idx ON cg_nodes(topo)|};
+  {|CREATE INDEX IF NOT EXISTS cg_nodes_name_idx ON cg_nodes(name)|};
+
+  {|CREATE TABLE IF NOT EXISTS cg_edges (
+      src        TEXT NOT NULL,          -- caller node id
+      dst        TEXT NOT NULL,          -- callee node id
+      kind       TEXT NOT NULL,          -- call|dispatch
+      call_file  TEXT,
+      call_line  INTEGER,
+      call_col   INTEGER,
+      UNIQUE(src, dst, call_line, call_col)
+    )|};
+  {|CREATE INDEX IF NOT EXISTS cg_edges_src_idx ON cg_edges(src)|};
+  {|CREATE INDEX IF NOT EXISTS cg_edges_dst_idx ON cg_edges(dst)|};
+
+  (* FTS5 over the function summaries so natural-language questions can be
+     answered by searching descriptions + traversing edges, rather than
+     re-reading the repo. Standalone (own content): kept in sync by
+     Callgraph_store on insert / describe. *)
+  {|CREATE VIRTUAL TABLE IF NOT EXISTS cg_fts USING fts5(
+      node_id UNINDEXED, name, description,
+      tokenize='porter unicode61'
+    )|};
+]
+
 let migrations = [
   1, migration_1;
   2, migration_2;
@@ -232,6 +280,7 @@ let migrations = [
   5, migration_5;
   6, migration_6;
   7, migration_7;
+  8, migration_8;
 ]
 
 (* --- meta helpers --- *)

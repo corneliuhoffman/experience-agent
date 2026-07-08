@@ -9,6 +9,7 @@ open Urme_engine.Git_link_types
 module D = Urme_store.Db
 module Schema = Urme_store.Schema
 module Search = Urme_search.Search
+module Cg = Urme_store.Callgraph_store
 module S = Sqlite3
 
 type state = {
@@ -666,6 +667,162 @@ let handle_push_synthesis st args =
     (Printf.sprintf "Pushed synthesis (%d cited) to TUI."
        (List.length cited_results)))
 
+(* ---------- Annotated call graph ---------- *)
+
+let handle_graph_status st _args =
+  let db = ensure_db st in
+  let (total, described, ready) = Cg.status db in
+  Lwt.return (json_result (`Assoc [
+    "total", `Int total;
+    "described", `Int described;
+    "remaining", `Int (total - described);
+    "ready_units", `Int ready;
+  ]))
+
+let desc_pair (nm, d) =
+  `Assoc [ "name", `String nm;
+           "description", (match d with Some s -> `String s | None -> `Null) ]
+
+let handle_graph_next_batch st args =
+  let open Yojson.Safe.Util in
+  let limit = try args |> member "limit" |> to_int with _ -> 5 in
+  let db = ensure_db st in
+  let sccs = Cg.ready_sccs db ~limit:(max 1 limit) in
+  let unit_json scc =
+    let members = Cg.scc_members db ~scc in
+    let callees = Cg.scc_callee_descriptions db ~scc in
+    let fns = List.map (fun (m : Cg.node) ->
+      let code = Urme_engine.Callgraph_load.extract_code
+          ~file:m.file ~start_line:m.start_line ~end_line:m.end_line in
+      `Assoc [
+        "id", `String m.id;
+        "name", `String m.name;
+        "file", `String m.file;
+        "start_line", `Int m.start_line;
+        "end_line", `Int m.end_line;
+        "kind", `String m.kind;
+        "code", `String code;
+      ]) members in
+    `Assoc [
+      "scc", `Int scc;
+      "recursive", `Bool (List.length members > 1);
+      "functions", `List fns;
+      "callees", `List (List.map desc_pair callees);
+    ] in
+  let batch = List.map unit_json sccs in
+  let (total, described, ready) = Cg.status db in
+  Lwt.return (json_result (`Assoc [
+    "total", `Int total;
+    "described", `Int described;
+    "remaining", `Int (total - described);
+    "ready_units", `Int ready;
+    "batch", `List batch;
+    "note", `String
+      "Describe every function in `functions` (one sentence: what it does \
+       + type if clear), using `callees` descriptions for context. \
+       Recursive units: describe the group together. Then call \
+       graph_set_descriptions with {id, description} for each, and call \
+       graph_next_batch again until remaining = 0.";
+  ]))
+
+let handle_graph_set_descriptions st args =
+  let open Yojson.Safe.Util in
+  let db = ensure_db st in
+  let items = try args |> member "descriptions" |> to_list with _ -> [] in
+  let written =
+    List.fold_left (fun acc j ->
+      match (try Some (j |> member "id" |> to_string) with _ -> None),
+            (try Some (j |> member "description" |> to_string) with _ -> None)
+      with
+      | Some id, Some d when String.trim d <> "" ->
+        Cg.set_description db ~id ~description:d ~code_hash:None;
+        acc + 1
+      | _ -> acc) 0 items in
+  let (total, described, ready) = Cg.status db in
+  Lwt.return (json_result (`Assoc [
+    "written", `Int written;
+    "total", `Int total;
+    "described", `Int described;
+    "remaining", `Int (total - described);
+    "ready_units", `Int ready;
+  ]))
+
+let handle_graph_describe st args =
+  let open Yojson.Safe.Util in
+  let db = ensure_db st in
+  let query = args |> member "query" |> to_string in
+  let include_code =
+    try args |> member "include_code" |> to_bool with _ -> false in
+  let match_json (m : Cg.found) =
+    let base = [
+      "id", `String m.fid;
+      "name", `String m.fname;
+      "file", `String m.ffile;
+      "start_line", `Int m.fstart;
+      "end_line", `Int m.fend;
+      "kind", `String m.fkind;
+      "description",
+        (match m.fdesc with Some s -> `String s | None -> `Null);
+      "callees", `List (List.map desc_pair (Cg.callees db ~id:m.fid));
+      "callers", `List (List.map desc_pair (Cg.callers db ~id:m.fid));
+    ] in
+    let base =
+      if include_code then
+        base @ [ "code", `String (Urme_engine.Callgraph_load.extract_code
+                                    ~file:m.ffile ~start_line:m.fstart
+                                    ~end_line:m.fend) ]
+      else base in
+    `Assoc base in
+  (* Lambdas carry synthetic node names (e.g. _tmp_lambda), so an exact
+     name miss falls back to FTS over name+description — the described
+     graph usually knows the binding name from the summary text. *)
+  let matches =
+    match Cg.lookup db ~query with
+    | [] -> (try Cg.search db ~fts:query ~limit:10 with _ -> [])
+    | ms -> ms in
+  Lwt.return (json_result (`Assoc [
+    "query", `String query;
+    "n_matches", `Int (List.length matches);
+    "matches", `List (List.map match_json matches);
+  ]))
+
+let handle_graph_search st args =
+  let open Yojson.Safe.Util in
+  let db = ensure_db st in
+  let fts = try args |> member "fts_terms" |> to_string with _ -> "" in
+  let limit = try args |> member "limit" |> to_int with _ -> 15 in
+  let neighbors = try args |> member "neighbors" |> to_bool with _ -> true in
+  (* FTS MATCH can raise on odd syntax; degrade to no hits rather than fail. *)
+  let hits =
+    if String.trim fts = "" then []
+    else try Cg.search db ~fts ~limit:(max 1 (min 100 limit)) with _ -> [] in
+  let hit_json (m : Cg.found) =
+    let base = [
+      "id", `String m.fid;
+      "name", `String m.fname;
+      "file", `String m.ffile;
+      "start_line", `Int m.fstart;
+      "end_line", `Int m.fend;
+      "description",
+        (match m.fdesc with Some s -> `String s | None -> `Null);
+    ] in
+    let base =
+      if neighbors then
+        base @ [
+          "callees", `List (List.map desc_pair (Cg.callees db ~id:m.fid));
+          "callers", `List (List.map desc_pair (Cg.callers db ~id:m.fid));
+        ]
+      else base in
+    `Assoc base in
+  Lwt.return (json_result (`Assoc [
+    "fts_terms", `String fts;
+    "n_results", `Int (List.length hits);
+    "results", `List (List.map hit_json hits);
+    "note", `String
+      "Rank these yourself and answer in 1-2 sentences. For change-impact, \
+       follow callers/callees from the most relevant hits.";
+  ]))
+
 (* ---------- Dispatch ---------- *)
 
 let dispatch st name args =
@@ -678,4 +835,9 @@ let dispatch st name args =
   | "explain_change" -> handle_explain_change st args
   | "commit_links"   -> handle_commit_links st args
   | "search_by_file" -> handle_search_by_file st args
+  | "graph_status"           -> handle_graph_status st args
+  | "graph_next_batch"       -> handle_graph_next_batch st args
+  | "graph_set_descriptions" -> handle_graph_set_descriptions st args
+  | "graph_describe"         -> handle_graph_describe st args
+  | "graph_search"           -> handle_graph_search st args
   | _ -> Lwt.return (text_result (Printf.sprintf "Unknown tool: %s" name))

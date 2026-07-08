@@ -193,6 +193,36 @@ let import_cmd =
                  Leaves the project's own store untouched.")
     Term.(const run $ path $ project_dir)
 
+(* --- Subcommand: graph-build --- *)
+
+let graph_build_cmd =
+  let json =
+    Arg.(required & pos 0 (some string) None & info [] ~docv:"CALLGRAPH_JSON"
+           ~doc:"Path to an opengrep-callgraph/v1 JSON export.") in
+  let run json project_dir =
+    let project_dir =
+      if project_dir = "." then Sys.getcwd ()
+      else if Filename.is_relative project_dir
+      then Filename.concat (Sys.getcwd ()) project_dir
+      else project_dir in
+    if not (Sys.file_exists json) then begin
+      Printf.eprintf "graph-build: %s not found\n" json;
+      exit 1
+    end;
+    let db = Urme_store.Schema.open_or_create ~project_dir in
+    let (nn, ne) = Urme_engine.Callgraph_load.build ~db ~json_path:json in
+    let (total, described, ready) = Urme_store.Callgraph_store.status db in
+    Urme_store.Schema.close db;
+    Printf.printf
+      "loaded call graph: %d nodes, %d edges (described %d/%d, \
+       %d SCC-units ready)\n" nn ne described total ready
+  in
+  Cmd.v (Cmd.info "graph-build"
+           ~doc:"Load an opengrep-callgraph/v1 export into the urme store \
+                 (nodes + edges + SCC/topo). The MCP describe-loop then \
+                 fills in per-function descriptions.")
+    Term.(const run $ json $ project_dir)
+
 (* --- Default command: launch TUI on a TTY, MCP server otherwise.
        Claude Code spawns `urme` over stdio (no TTY), which trips the
        MCP branch. Humans running `urme` in a terminal get the TUI. *)
@@ -216,6 +246,6 @@ let () =
   let info = Cmd.info "urme" ~doc ~version:"0.1.2" in
   let default = Term.(const default_run $ project_dir) in
   let cmd = Cmd.group ~default info [
-    ask_cmd; init_cmd; export_cmd; import_cmd;
+    ask_cmd; init_cmd; export_cmd; import_cmd; graph_build_cmd;
   ] in
   exit (Cmd.eval cmd)

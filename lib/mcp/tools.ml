@@ -224,4 +224,131 @@ let tool_definitions = `List [
       "required", `List [`String "file_path"];
     ];
   ];
+  (* ---- annotated call graph ---- *)
+  `Assoc [
+    "name", `String "graph_status";
+    "description", `String
+      "Progress of the annotated call graph for this repo. Returns \
+       {total, described, remaining, ready_units}. `ready_units` is how \
+       many SCC-units can be described right now (all their cross-SCC \
+       callees already have descriptions). remaining=0 means fully \
+       annotated.";
+    "inputSchema", `Assoc [
+      "type", `String "object";
+      "properties", `Assoc [];
+      "required", `List [];
+    ];
+  ];
+  `Assoc [
+    "name", `String "graph_next_batch";
+    "description", `String
+      "Drive the leaves-first describe-loop. Returns up to `limit` \
+       SCC-units that are READY to describe: every unit's cross-SCC \
+       callees already have descriptions (included, so you can write \
+       informed summaries). For each function in `functions`, write ONE \
+       sentence — what it does, plus its type/signature if clear. A unit \
+       with `recursive:true` holds mutually-recursive functions: describe \
+       them together. Functions with synthetic names (e.g. _tmp_lambda) \
+       are lambdas: START their description with the real binding name \
+       visible in the code (e.g. \"notSolved: (challenge) => ...\") so \
+       name searches can find them. Then call `graph_set_descriptions` \
+       with a {id, description} for every function returned, and call \
+       this again. Repeat until `graph_status` shows remaining=0.";
+    "inputSchema", `Assoc [
+      "type", `String "object";
+      "properties", `Assoc [
+        "limit", `Assoc [
+          "type", `String "integer";
+          "description", `String "Max SCC-units to return (default 5).";
+        ];
+      ];
+      "required", `List [];
+    ];
+  ];
+  `Assoc [
+    "name", `String "graph_set_descriptions";
+    "description", `String
+      "Write function descriptions back into the graph. Pass \
+       `descriptions` as an array of {id, description}, using the exact \
+       `id` values from `graph_next_batch`. Returns updated progress \
+       counts.";
+    "inputSchema", `Assoc [
+      "type", `String "object";
+      "properties", `Assoc [
+        "descriptions", `Assoc [
+          "type", `String "array";
+          "description", `String "One {id, description} per function.";
+          "items", `Assoc [
+            "type", `String "object";
+            "properties", `Assoc [
+              "id", `Assoc ["type", `String "string"];
+              "description", `Assoc ["type", `String "string"];
+            ];
+            "required", `List [`String "id"; `String "description"];
+          ];
+        ];
+      ];
+      "required", `List [`String "descriptions"];
+    ];
+  ];
+  `Assoc [
+    "name", `String "graph_describe";
+    "description", `String
+      "Ask the annotated call graph about a function instead of \
+       re-reading the repo. Given a function `query` (its name, or exact \
+       node id), returns each match's stored description, source span, \
+       callees and callers (each with their descriptions). Use it to \
+       answer 'what does X do?', 'what calls X?', and to scope \
+       change-impact ('to change X, what else is affected?').";
+    "inputSchema", `Assoc [
+      "type", `String "object";
+      "properties", `Assoc [
+        "query", `Assoc [
+          "type", `String "string";
+          "description", `String "Function name or exact node id.";
+        ];
+        "include_code", `Assoc [
+          "type", `String "boolean";
+          "description", `String
+            "Include the function source in each match (default false).";
+        ];
+      ];
+      "required", `List [`String "query"];
+    ];
+  ];
+  `Assoc [
+    "name", `String "graph_search";
+    "description", `String
+      "Answer a natural-language question about the code by searching the \
+       function summaries and traversing the call graph — no repo re-read. \
+       Same pattern as `search_history`: YOU turn the question into \
+       `fts_terms` (concrete technical nouns), the server runs FTS5 over \
+       the stored descriptions and returns the top functions, each with \
+       its description and (optionally) callers/callees so you can follow \
+       the structure. Rank the hits yourself and answer in 1-2 sentences. \
+       For change-impact ('to do X, what do I touch?'), start from the \
+       hits and walk callers/callees.";
+    "inputSchema", `Assoc [
+      "type", `String "object";
+      "properties", `Assoc [
+        "fts_terms", `Assoc [
+          "type", `String "string";
+          "description", `String
+            "Space-separated FTS5 keywords over the function summaries. \
+             Concrete technical nouns, drop filler words.";
+        ];
+        "limit", `Assoc [
+          "type", `String "integer";
+          "description", `String "Max functions to return, 1-100 (default 15).";
+        ];
+        "neighbors", `Assoc [
+          "type", `String "boolean";
+          "description", `String
+            "Include each hit's callers and callees with descriptions \
+             (default true) — needed for change-impact reasoning.";
+        ];
+      ];
+      "required", `List [`String "fts_terms"];
+    ];
+  ];
 ]
