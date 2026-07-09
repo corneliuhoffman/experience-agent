@@ -342,11 +342,21 @@ let tool_definitions = `List [
     "name", `String "graph_describe";
     "description", `String
       "Ask the annotated call graph about a function instead of \
-       re-reading the repo. Given a function `query` (its name, or exact \
-       node id), returns each match's stored description, source span, \
-       callees and callers (each with their descriptions). Use it to \
+       re-reading the repo. Given a function `query` (its name), returns \
+       each match's stored description, file:line, and its callers as \
+       compact strings — bare \"name\" when in the same file as the \
+       match, \"name (file)\" otherwise; describe a caller by name when \
+       you need its summary. Callee knowledge is already embedded in the \
+       description (summaries are written with callee context and name \
+       the ones that matter); pass include_callees for the exhaustive \
+       list. Use it to \
        answer 'what does X do?', 'what calls X?', and to scope \
-       change-impact ('to change X, what else is affected?').";
+       change-impact ('to change X, what else is affected?'). When a \
+       match has no static callers, a `mentioned_by` list is attached: \
+       functions whose summaries name it — usually its dynamic \
+       dispatchers (task queues, plugin registries, event/signal \
+       systems). Treat those as probable callers and keep walking from \
+       them.";
     "inputSchema", `Assoc [
       "type", `String "object";
       "properties", `Assoc [
@@ -358,6 +368,12 @@ let tool_definitions = `List [
           "type", `String "boolean";
           "description", `String
             "Include the function source in each match (default false).";
+        ];
+        "include_callees", `Assoc [
+          "type", `String "boolean";
+          "description", `String
+            "Include each match's exhaustive callee list (default false \
+             — the description already names the callees that matter).";
         ];
       ];
       "required", `List [`String "query"];
@@ -371,10 +387,16 @@ let tool_definitions = `List [
        Same pattern as `search_history`: YOU turn the question into \
        `fts_terms` (concrete technical nouns), the server runs FTS5 over \
        the stored descriptions and returns the top functions, each with \
-       its description and (optionally) callers/callees so you can follow \
-       the structure. Rank the hits yourself and answer in 1-2 sentences. \
+       its description and (optionally) caller names so you can walk \
+       upward (describe a caller when you need its summary; \
+       \"name (file)\" marks callers in a different file; callee \
+       knowledge is already embedded in each description). Rank the hits yourself and answer in 1-2 sentences. \
        For change-impact ('to do X, what do I touch?'), start from the \
-       hits and walk callers/callees.";
+       hits and walk callers/callees. Dynamic dispatch (task queues, \
+       plugin registries, event/signal systems, reflection) has no graph \
+       edge — when a function's callers list looks suspiciously empty, \
+       search its NAME: dispatch sites are usually named in the \
+       summaries.";
     "inputSchema", `Assoc [
       "type", `String "object";
       "properties", `Assoc [
@@ -391,11 +413,148 @@ let tool_definitions = `List [
         "neighbors", `Assoc [
           "type", `String "boolean";
           "description", `String
-            "Include each hit's callers and callees with descriptions \
-             (default true) — needed for change-impact reasoning.";
+            "Include each hit's callers as name strings (default true) \
+             — needed for walking upward in change-impact reasoning.";
         ];
       ];
       "required", `List [`String "fts_terms"];
+    ];
+  ];
+  `Assoc [
+    "name", `String "graph_overview";
+    "description", `String
+      "Bulk-pull annotated function summaries in ONE call — the \
+       comprehension primitive. Use this INSTEAD OF many graph_describe \
+       calls when you need the summaries of a subsystem (understanding a \
+       package, writing a walkthrough, gathering context before an \
+       edit). Pull the WHOLE scope in a single call: pass `paths` with \
+       every file/dir you care about at once (e.g. the module dir, or a \
+       list of the exact files), or `names` for a known set of \
+       functions. Do NOT call this once per file — pass them all in the \
+       one `paths` list. Test files are excluded by default so a \
+       directory pull is clean. Returns each function's description + \
+       file:line, leaves-first; no callers/callees (callee context is \
+       already in each description — use graph_describe for a specific \
+       function's callers/mentioned_by). One round-trip replaces N, \
+       which is both faster and markedly cheaper (fewer cache writes).";
+    "inputSchema", `Assoc [
+      "type", `String "object";
+      "properties", `Assoc [
+        "paths", `Assoc [
+          "type", `String "array";
+          "items", `Assoc [ "type", `String "string" ];
+          "description", `String
+            "Repo-relative files and/or directories — every annotated \
+             function under ALL of them, in one call. Put the entire \
+             scope here (e.g. [\"lemur/plugins/lemur_acme\", \
+             \"lemur/common/celery.py\"]) rather than making one call \
+             per file.";
+        ];
+        "names", `Assoc [
+          "type", `String "array";
+          "items", `Assoc [ "type", `String "string" ];
+          "description", `String
+            "Exact function names to pull (surgical — just these). Name \
+             collisions across files all return; disambiguate by the \
+             file field. Takes precedence over `paths`.";
+        ];
+        "path", `Assoc [
+          "type", `String "string";
+          "description", `String
+            "Single file/dir shorthand; merged with `paths`. Prefer \
+             `paths` when you want more than one.";
+        ];
+        "exclude_tests", `Assoc [
+          "type", `String "boolean";
+          "description", `String
+            "Skip test files — files under a tests/ dir, named \
+             test_*.py, or conftest.py (default true). Set false to \
+             include them.";
+        ];
+        "detail", `Assoc [
+          "type", `String "string";
+          "description", `String
+            "\"full\" (whole descriptions) or \"brief\" (first-sentence \
+             gists). Default auto: a wide pull (>60 functions) returns \
+             brief so it fits one response — then narrow the `paths`/ \
+             `names` for full text on the parts you need. Response echoes \
+             the `detail` actually used.";
+        ];
+        "include_code", `Assoc [
+          "type", `String "boolean";
+          "description", `String
+            "Include each function's source (default false — descriptions \
+             usually suffice).";
+        ];
+        "limit", `Assoc [
+          "type", `String "integer";
+          "description", `String "Max functions to return (default 600).";
+        ];
+      ];
+      "required", `List [];
+    ];
+  ];
+  `Assoc [
+    "name", `String "graph_neighborhood";
+    "description", `String
+      "Turn a question into exactly the functions it needs. Seed from one \
+       or more `roots` (function names — the entry points or anchors) and \
+       walk the call edges `depth` hops to get only the reachable \
+       subgraph, with descriptions, in ONE call. Use this instead of \
+       dumping a whole file/package when the task is about specific \
+       flows: 'how does issuance work' -> roots the create_certificate \
+       entry points, direction callees; 'what breaks if I change X' -> \
+       roots [X], direction callers. Typical flow: graph_search to find \
+       the seed name(s), then graph_neighborhood to pull their relevant \
+       slice. Returns a bounded, task-shaped set (auto-briefs if wide) — \
+       far smaller and cheaper than graph_overview on a whole module.";
+    "inputSchema", `Assoc [
+      "type", `String "object";
+      "properties", `Assoc [
+        "roots", `Assoc [
+          "type", `String "array";
+          "items", `Assoc [ "type", `String "string" ];
+          "description", `String
+            "Seed function names to start the walk from (entry points / \
+             anchors). Name collisions all seed the walk.";
+        ];
+        "direction", `Assoc [
+          "type", `String "string";
+          "description", `String
+            "\"callees\" (downstream — how the seeds work; default), \
+             \"callers\" (upstream — what reaches the seeds / \
+             change-impact), or \"both\".";
+        ];
+        "depth", `Assoc [
+          "type", `String "integer";
+          "description", `String
+            "Max hops from the seeds (default 3, max 8). Start small; \
+             widen if the slice is missing pieces.";
+        ];
+        "follow_dispatch", `Assoc [
+          "type", `String "boolean";
+          "description", `String
+            "Also traverse dynamic-dispatch edges (Celery .delay/ \
+             .apply_async, plugin registries, signals) recovered from the \
+             summaries — so async paths are in the closure without a \
+             separate mentioned_by chase (default true).";
+        ];
+        "detail", `Assoc [
+          "type", `String "string";
+          "description", `String
+            "\"full\" or \"brief\" (first-sentence gists); default auto \
+             (brief above 60 functions).";
+        ];
+        "include_code", `Assoc [
+          "type", `String "boolean";
+          "description", `String "Include each function's source (default false).";
+        ];
+        "limit", `Assoc [
+          "type", `String "integer";
+          "description", `String "Max functions to return (default 250).";
+        ];
+      ];
+      "required", `List [`String "roots"];
     ];
   ];
 ]

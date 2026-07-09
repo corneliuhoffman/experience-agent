@@ -233,16 +233,182 @@ let search db ~fts ~limit =
      WHERE cg_fts MATCH ? ORDER BY bm25(cg_fts) LIMIT ?"
     [ t fts; ib limit ] ~f:found_of_cols
 
+(* Functions whose *descriptions* mention [name] — dynamic-dispatch
+   recovery. A Celery .delay, plugin-registry lookup, or signal has no
+   static call edge, but the dispatcher's summary names its target
+   (annotators read the dispatch site). Phrase-quoted and restricted to
+   the description column, so the unicode61 tokenizer matches the
+   identifier's token sequence exactly and a hit on the node's own name
+   row can't qualify. *)
+let mentioned_by db ~name ~exclude_id ~limit =
+  let quoted =
+    "description:\"" ^ String.concat "\"\"" (String.split_on_char '"' name) ^ "\"" in
+  D.query_list db
+    "SELECT n.id,n.name,n.file,n.start_line,n.end_line,n.kind,n.description \
+     FROM cg_fts f JOIN cg_nodes n ON n.id = f.node_id \
+     WHERE cg_fts MATCH ? AND n.id <> ? \
+     ORDER BY bm25(cg_fts) LIMIT ?"
+    [ t quoted; t exclude_id; ib limit ] ~f:found_of_cols
+
+(* Neighbour lists are name+file only: full summaries are read on demand
+   via lookup/graph_describe, instead of re-sent with every hit. *)
+(* Every node under any of several files/directories, ONE call — the
+   coarse primitive for whole-subsystem comprehension. Each path is
+   repo-relative: an exact file, or a directory whose contents match via
+   GLOB (case-sensitive, treats '_' literally, unlike LIKE — important
+   since paths contain underscores). [exclude_tests] drops test files so a
+   directory pull isn't polluted (files under a tests/ dir or named
+   test_*.py). Leaves-first within each file so callees precede callers. *)
+let nodes_in_paths db ~paths ~exclude_tests ~limit =
+  match paths with
+  | [] -> []
+  | _ ->
+    let clause = "(file = ? OR file GLOB ?)" in
+    let where = "(" ^ String.concat " OR " (List.map (fun _ -> clause) paths) ^ ")" in
+    let params = List.concat_map (fun p -> [ t p; t (p ^ "/*") ]) paths in
+    let excl =
+      if exclude_tests then
+        " AND NOT (file GLOB '*/tests/*' OR file GLOB '*/test_*.py' \
+         OR file GLOB 'test_*.py' OR file GLOB '*/conftest.py')"
+      else "" in
+    D.query_list db
+      (Printf.sprintf
+         "SELECT id,name,file,start_line,end_line,kind,description \
+          FROM cg_nodes WHERE %s%s ORDER BY file, topo, start_line LIMIT ?"
+         where excl)
+      (params @ [ ib limit ]) ~f:found_of_cols
+
+(* Single-path convenience (kept for callers that pass one path). *)
+let nodes_in_path db ~path ~limit =
+  nodes_in_paths db ~paths:[path] ~exclude_tests:false ~limit
+
+(* Exactly the named functions, one call — the surgical complement to
+   nodes_in_path: when you know which functions you need, pull just those
+   instead of a whole module. Name collisions (same name in several files)
+   all come back; the caller disambiguates by file. *)
+let nodes_by_names db ~names ~limit =
+  match names with
+  | [] -> []
+  | _ ->
+    let placeholders = String.concat "," (List.map (fun _ -> "?") names) in
+    D.query_list db
+      (Printf.sprintf
+         "SELECT id,name,file,start_line,end_line,kind,description \
+          FROM cg_nodes WHERE name IN (%s) ORDER BY file, topo, start_line \
+          LIMIT ?" placeholders)
+      (List.map t names @ [ ib limit ]) ~f:found_of_cols
+
+(* Reachable subgraph from seed functions — the query that turns a
+   question into exactly the nodes it needs, instead of dumping a whole
+   package. Seeds are matched by name; the recursive walk follows call
+   edges up to [depth] hops. Direction: Callees (downstream — "how does X
+   work"), Callers (upstream — "what reaches X / change-impact"), or Both.
+   Returns the closure's nodes (deduped, topo-ordered) with descriptions.
+   Bounded by [depth] and [limit] so it stays small and one-call. *)
+type direction = Callees | Callers | Both
+
+(* [follow_dispatch] also walks cg_dispatch (materialised dynamic-dispatch
+   edges — see populate_dispatch_edges) so a single traversal recovers
+   async/plugin/signal paths that have no static call edge. *)
+let neighborhood db ~roots ~direction ~depth ~follow_dispatch ~limit =
+  match roots with
+  | [] -> []
+  | _ ->
+    let seeds = String.concat "," (List.map (fun _ -> "?") roots) in
+    let tables = if follow_dispatch then ["cg_edges"; "cg_dispatch"] else ["cg_edges"] in
+    let oriented tbl = match direction with
+      | Callees -> Printf.sprintf "SELECT src AS a, dst AS b FROM %s" tbl
+      | Callers -> Printf.sprintf "SELECT dst AS a, src AS b FROM %s" tbl
+      | Both ->
+        Printf.sprintf
+          "SELECT src AS a, dst AS b FROM %s \
+           UNION SELECT dst AS a, src AS b FROM %s" tbl tbl in
+    let und = String.concat " UNION " (List.map oriented tables) in
+    let sql = Printf.sprintf
+      "WITH RECURSIVE und(a,b) AS (%s), \
+       reach(id,depth) AS ( \
+         SELECT id, 0 FROM cg_nodes WHERE name IN (%s) \
+         UNION \
+         SELECT und.b, reach.depth + 1 FROM reach JOIN und ON und.a = reach.id \
+           WHERE reach.depth < ?) \
+       SELECT n.id,n.name,n.file,n.start_line,n.end_line,n.kind,n.description \
+       FROM reach JOIN cg_nodes n ON n.id = reach.id \
+       GROUP BY n.id ORDER BY n.topo, n.file, n.start_line LIMIT ?"
+      und seeds in
+    D.query_list db sql
+      (List.map t roots @ [ ib depth; ib limit ]) ~f:found_of_cols
+
+(* Materialise dynamic-dispatch edges into cg_dispatch from the FTS
+   index. For every node with NO static caller (the dispatch-only
+   functions — Celery tasks, plugin hooks, signal handlers) and a real
+   (non-synthetic) name, record the functions whose descriptions name it
+   as its dispatchers. Bounded per target so a generic name can't
+   explode. Idempotent: clears and repopulates. *)
+let dispatch_edge_count db =
+  count db "SELECT COUNT(*) FROM cg_dispatch"
+
+let contains_sub hay needle =
+  let hl = String.length hay and nl = String.length needle in
+  if nl = 0 then true
+  else
+    let rec go i =
+      if i + nl > hl then false
+      else if String.sub hay i nl = needle then true
+      else go (i + 1) in
+    go 0
+
+(* A dispatch edge requires more than a mention: the dispatcher's summary
+   must name the target next to an actual dispatch token (Celery
+   .delay/.apply_async/.s/.si/.apply). This keeps precision high — plain
+   references ("similar to fetch_acme_cert") don't become edges. *)
+let dispatch_cues tname =
+  [ tname ^ ".delay"; tname ^ ".apply_async"; tname ^ ".apply(";
+    tname ^ ".s("; tname ^ ".si("; tname ^ ".signature(" ]
+
+let populate_dispatch_edges ?(per_target = 20) db =
+  D.exec db "DELETE FROM cg_dispatch";
+  let targets =
+    D.query_list db
+      "SELECT id, name FROM cg_nodes n \
+       WHERE NOT EXISTS (SELECT 1 FROM cg_edges e WHERE e.dst = n.id) \
+         AND name <> '' AND substr(name,1,1) <> '<' \
+         AND substr(name,1,5) <> '_tmp_'"
+      [] ~f:(fun c -> (D.data_to_string c.(0), D.data_to_string c.(1))) in
+  D.with_txn db (fun () ->
+    List.iter (fun (tid, tname) ->
+      let quoted =
+        "description:\"" ^
+        String.concat "\"\"" (String.split_on_char '"' tname) ^ "\"" in
+      let candidates =
+        try
+          D.query_list db
+            "SELECT n.id, n.description FROM cg_fts f \
+             JOIN cg_nodes n ON n.id = f.node_id \
+             WHERE cg_fts MATCH ? AND n.id <> ? ORDER BY bm25(cg_fts) LIMIT ?"
+            [ t quoted; t tid; ib per_target ]
+            ~f:(fun c -> (D.data_to_string c.(0),
+                          match D.data_to_string_opt c.(1) with
+                          | Some s -> s | None -> ""))
+        with _ -> [] in
+      let cues = dispatch_cues tname in
+      List.iter (fun (sid, sdesc) ->
+        if List.exists (contains_sub sdesc) cues then
+          D.exec_params db
+            "INSERT OR IGNORE INTO cg_dispatch(src,dst) VALUES(?,?)"
+            [ t sid; t tid ])
+        candidates)
+      targets)
+
 let callees db ~id =
   D.query_list db
-    "SELECT DISTINCT d.name, d.description FROM cg_edges e \
+    "SELECT DISTINCT d.name, d.file FROM cg_edges e \
      JOIN cg_nodes d ON d.id=e.dst WHERE e.src=? ORDER BY d.name"
     [ t id ]
-    ~f:(fun c -> (D.data_to_string c.(0), D.data_to_string_opt c.(1)))
+    ~f:(fun c -> (D.data_to_string c.(0), D.data_to_string c.(1)))
 
 let callers db ~id =
   D.query_list db
-    "SELECT DISTINCT s.name, s.description FROM cg_edges e \
+    "SELECT DISTINCT s.name, s.file FROM cg_edges e \
      JOIN cg_nodes s ON s.id=e.src WHERE e.dst=? ORDER BY s.name"
     [ t id ]
-    ~f:(fun c -> (D.data_to_string c.(0), D.data_to_string_opt c.(1)))
+    ~f:(fun c -> (D.data_to_string c.(0), D.data_to_string c.(1)))

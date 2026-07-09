@@ -73,7 +73,9 @@ let text_result text =
     ];
   ]
 
-let json_result j = text_result (Yojson.Safe.pretty_to_string j)
+(* Compact, not pretty-printed: MCP results are read by a model, and
+   pretty-printing spends tokens on indentation in every response. *)
+let json_result j = text_result (Yojson.Safe.to_string j)
 
 let rec provenance_to_json = function
   | DirectEdit e ->
@@ -770,6 +772,39 @@ let desc_pair (nm, d) =
   `Assoc [ "name", `String nm;
            "description", (match d with Some s -> `String s | None -> `Null) ]
 
+(* Neighbour lists carry names only — an agent that needs a neighbour's
+   summary describes it directly, instead of every hit re-sending full
+   paragraphs for its whole fan-out. Rendered as compact strings: bare
+   "name" when the neighbour lives in the same file as the hit,
+   "name (file)" otherwise. *)
+let neighbor_str ~hit_file (nm, file) =
+  if file = hit_file then `String nm
+  else `String (Printf.sprintf "%s (%s)" nm file)
+
+(* First sentence of a description — the "gist" for wide bulk pulls where
+   full paragraphs would blow the tool-result size budget. Cuts at the
+   first ". " (or the whole string if none), capped so a runaway summary
+   can't dominate. *)
+let first_sentence s =
+  let n = String.length s in
+  let stop = ref n in
+  let i = ref 0 in
+  while !i < n - 1 && !stop = n do
+    (if s.[!i] = '.' && s.[!i + 1] = ' ' then stop := !i + 1);
+    incr i
+  done;
+  let stop = if !stop > 220 then 220 else !stop in
+  if stop >= n then s else String.sub s 0 stop
+
+(* Node paths are stored relative to the analyzed root (meta cg_root);
+   resolve before reading source off disk. *)
+let cg_abs_file db file =
+  if file <> "" && Filename.is_relative file then
+    match Schema.get_meta db "cg_root" with
+    | Some root when root <> "" -> Filename.concat root file
+    | _ -> file
+  else file
+
 let handle_graph_next_batch st args =
   let open Yojson.Safe.Util in
   let limit = try args |> member "limit" |> to_int with _ -> 5 in
@@ -780,7 +815,8 @@ let handle_graph_next_batch st args =
     let callees = Cg.scc_callee_descriptions db ~scc in
     let fns = List.map (fun (m : Cg.node) ->
       let code = Urme_engine.Callgraph_load.extract_code
-          ~file:m.file ~start_line:m.start_line ~end_line:m.end_line in
+          ~file:(cg_abs_file db m.file)
+          ~start_line:m.start_line ~end_line:m.end_line in
       `Assoc [
         "id", `String m.id;
         "name", `String m.name;
@@ -828,6 +864,11 @@ let handle_graph_set_descriptions st args =
         acc + 1
       | _ -> acc) 0 items in
   let (total, described, ready) = Cg.status db in
+  (* Dispatch edges are derived from the descriptions; once every function
+     is annotated, (re)materialise them so graph_neighborhood can traverse
+     dynamic-dispatch paths. *)
+  if total > 0 && described >= total then
+    (try Cg.populate_dispatch_edges db with _ -> ());
   Lwt.return (json_result (`Assoc [
     "written", `Int written;
     "total", `Int total;
@@ -842,23 +883,65 @@ let handle_graph_describe st args =
   let query = args |> member "query" |> to_string in
   let include_code =
     try args |> member "include_code" |> to_bool with _ -> false in
+  (* A dispatched-to function (task queue, plugin registry, signal) has
+     no static caller edge, but its dispatchers' summaries name it: when
+     the callers list is empty, attach the functions whose descriptions
+     mention this one. Synthetic names (<top_level>, _tmp_lambda) would
+     only phrase-match noise, so skip them. *)
+  let mentions (m : Cg.found) =
+    let synthetic =
+      m.fname = "" || m.fname.[0] = '<'
+      || (String.length m.fname >= 5 && String.sub m.fname 0 5 = "_tmp_") in
+    if synthetic then []
+    else
+      try Cg.mentioned_by db ~name:m.fname ~exclude_id:m.fid ~limit:5
+      with _ -> [] in
+  let mention_json (h : Cg.found) =
+    `Assoc [
+      "name", `String h.fname;
+      "file", `String h.ffile;
+      "line", `Int h.fstart;
+      "description",
+        (match h.fdesc with Some s -> `String s | None -> `Null);
+    ] in
+  let include_callees =
+    try args |> member "include_callees" |> to_bool with _ -> false in
+  (* No `id`: it only restates name|file|line, and consumers query by
+     name. No end_line/normal-kind either — dead weight per match.
+     Callees are omitted by default: descriptions are written leaves-first
+     with callee summaries in hand, so the ones that matter are already
+     named in the prose. Callers can't be embedded that way (they don't
+     exist yet at annotation time), so they are always returned. *)
   let match_json (m : Cg.found) =
+    let callers = Cg.callers db ~id:m.fid in
+    let nb = neighbor_str ~hit_file:m.ffile in
     let base = [
-      "id", `String m.fid;
       "name", `String m.fname;
       "file", `String m.ffile;
-      "start_line", `Int m.fstart;
-      "end_line", `Int m.fend;
-      "kind", `String m.fkind;
+      "line", `Int m.fstart;
+    ] in
+    let base =
+      if m.fkind = "normal" then base
+      else base @ [ "kind", `String m.fkind ] in
+    let base = base @ [
       "description",
         (match m.fdesc with Some s -> `String s | None -> `Null);
-      "callees", `List (List.map desc_pair (Cg.callees db ~id:m.fid));
-      "callers", `List (List.map desc_pair (Cg.callers db ~id:m.fid));
     ] in
+    let base =
+      if include_callees then
+        base @ [ "callees", `List (List.map nb (Cg.callees db ~id:m.fid)) ]
+      else base in
+    let base = base @ [ "callers", `List (List.map nb callers) ] in
+    let base =
+      match (if callers = [] then mentions m else []) with
+      | [] -> base
+      | ms ->
+        base @ [ "mentioned_by", `List (List.map mention_json ms) ] in
     let base =
       if include_code then
         base @ [ "code", `String (Urme_engine.Callgraph_load.extract_code
-                                    ~file:m.ffile ~start_line:m.fstart
+                                    ~file:(cg_abs_file db m.ffile)
+                                    ~start_line:m.fstart
                                     ~end_line:m.fend) ]
       else base in
     `Assoc base in
@@ -875,6 +958,157 @@ let handle_graph_describe st args =
     "matches", `List (List.map match_json matches);
   ]))
 
+(* Bulk annotated-function pull in ONE call — collapses the
+   ~N-round-trip comprehension pattern (describe each function
+   separately) into a single request; the graph aggregates instead of
+   the agent repeating calls. Two granularities: `names` for exactly the
+   functions you need (surgical), or `path` for every function in a file
+   or directory (module comprehension). No neighbor lists — callee
+   context is already embedded in each description. *)
+let handle_graph_overview st args =
+  let open Yojson.Safe.Util in
+  let db = ensure_db st in
+  let str_list key =
+    try args |> member key |> to_list |> List.filter_map (fun j ->
+      try Some (to_string j) with _ -> None)
+    with _ -> [] in
+  (* Accept a single `path`, a `paths` list, or both — merged. *)
+  let paths =
+    let single = try [args |> member "path" |> to_string] with _ -> [] in
+    List.filter (fun s -> String.trim s <> "") (single @ str_list "paths") in
+  let names = str_list "names" in
+  let exclude_tests =
+    try args |> member "exclude_tests" |> to_bool with _ -> true in
+  let limit = try args |> member "limit" |> to_int with _ -> 600 in
+  let include_code =
+    try args |> member "include_code" |> to_bool with _ -> false in
+  let detail = try args |> member "detail" |> to_string with _ -> "" in
+  let capped = max 1 (min 6000 limit) in
+  let nodes =
+    if names <> [] then
+      (try Cg.nodes_by_names db ~names ~limit:capped with _ -> [])
+    else if paths <> [] then
+      (try Cg.nodes_in_paths db ~paths ~exclude_tests ~limit:capped with _ -> [])
+    else [] in
+  (* Auto-brief: a wide pull's full descriptions can exceed the tool-result
+     size budget, forcing the agent to split back into many calls. Above a
+     node threshold, return first-sentence gists instead so the whole scope
+     still fits in one response. `detail:"full"`/`"brief"` overrides. *)
+  let brief =
+    detail = "brief"
+    || (detail <> "full" && not include_code && List.length nodes > 60) in
+  let node_json (m : Cg.found) =
+    let base = [
+      "name", `String m.fname;
+      "file", `String m.ffile;
+      "line", `Int m.fstart;
+    ] in
+    let base =
+      if m.fkind = "normal" then base
+      else base @ [ "kind", `String m.fkind ] in
+    let base = base @ [
+      "description",
+        (match m.fdesc with
+         | Some s -> `String (if brief then first_sentence s else s)
+         | None -> `Null);
+    ] in
+    if include_code then
+      base @ [ "code", `String (Urme_engine.Callgraph_load.extract_code
+                                  ~file:(cg_abs_file db m.ffile)
+                                  ~start_line:m.fstart ~end_line:m.fend) ]
+    else base in
+  let note =
+    if brief then
+      "Bulk pull (tests excluded unless exclude_tests=false). Descriptions \
+       truncated to first sentence because this pull is wide — for a \
+       function's full summary, re-call graph_overview with a narrower \
+       `paths`/`names` (or detail:\"full\"), or graph_describe it."
+    else
+      "Bulk pull, leaves-first per file (tests excluded unless \
+       exclude_tests=false). Callee context is embedded in each \
+       description; use graph_describe for a specific function's \
+       callers/mentioned_by." in
+  Lwt.return (json_result (`Assoc [
+    "paths", `List (List.map (fun p -> `String p) paths);
+    "n_nodes", `Int (List.length nodes);
+    "detail", `String (if brief then "brief" else "full");
+    "nodes", `List (List.map (fun m -> `Assoc (node_json m)) nodes);
+    "note", `String note;
+  ]))
+
+(* Reachable-subgraph query: seed from named functions, walk call edges
+   `depth` hops in a direction, return only the closure. Turns a question
+   ("how does issuance work") into exactly the relevant nodes — the
+   entry points' callee-closure — instead of a whole-package dump. *)
+let handle_graph_neighborhood st args =
+  let open Yojson.Safe.Util in
+  let db = ensure_db st in
+  let roots =
+    try args |> member "roots" |> to_list |> List.filter_map (fun j ->
+      try Some (to_string j) with _ -> None)
+    with _ -> [] in
+  let direction =
+    match (try args |> member "direction" |> to_string with _ -> "callees") with
+    | "callers" -> Cg.Callers | "both" -> Cg.Both | _ -> Cg.Callees in
+  let depth =
+    let d = try args |> member "depth" |> to_int with _ -> 3 in
+    max 1 (min 8 d) in
+  let limit = try args |> member "limit" |> to_int with _ -> 250 in
+  let include_code =
+    try args |> member "include_code" |> to_bool with _ -> false in
+  let detail = try args |> member "detail" |> to_string with _ -> "" in
+  let follow_dispatch =
+    try args |> member "follow_dispatch" |> to_bool with _ -> true in
+  (* Lazy backfill: a graph annotated before dispatch edges existed has an
+     empty cg_dispatch; populate it once so this (and later) traversals
+     can follow dynamic dispatch. *)
+  (if follow_dispatch && Cg.dispatch_edge_count db = 0
+      && (let (t, d, _) = Cg.status db in t > 0 && d >= t)
+   then try Cg.populate_dispatch_edges db with _ -> ());
+  let capped = max 1 (min 2000 limit) in
+  let nodes =
+    if roots = [] then []
+    else try Cg.neighborhood db ~roots ~direction ~depth ~follow_dispatch
+               ~limit:capped
+         with _ -> [] in
+  let brief =
+    detail = "brief"
+    || (detail <> "full" && not include_code && List.length nodes > 60) in
+  let node_json (m : Cg.found) =
+    let base = [
+      "name", `String m.fname;
+      "file", `String m.ffile;
+      "line", `Int m.fstart;
+    ] in
+    let base =
+      if m.fkind = "normal" then base else base @ [ "kind", `String m.fkind ] in
+    let base = base @ [
+      "description",
+        (match m.fdesc with
+         | Some s -> `String (if brief then first_sentence s else s)
+         | None -> `Null);
+    ] in
+    if include_code then
+      base @ [ "code", `String (Urme_engine.Callgraph_load.extract_code
+                                  ~file:(cg_abs_file db m.ffile)
+                                  ~start_line:m.fstart ~end_line:m.fend) ]
+    else base in
+  let dir_s = match direction with
+    | Cg.Callees -> "callees" | Cg.Callers -> "callers" | Cg.Both -> "both" in
+  Lwt.return (json_result (`Assoc [
+    "roots", `List (List.map (fun r -> `String r) roots);
+    "direction", `String dir_s;
+    "depth", `Int depth;
+    "n_nodes", `Int (List.length nodes);
+    "detail", `String (if brief then "brief" else "full");
+    "nodes", `List (List.map (fun m -> `Assoc (node_json m)) nodes);
+    "note", `String
+      "The reachable subgraph from the seed functions (deduped, \
+       leaves-first). This is the task-relevant slice — not a whole-file \
+       dump. Widen with a larger `depth`; use graph_describe for a \
+       specific function's callers/mentioned_by.";
+  ]))
+
 let handle_graph_search st args =
   let open Yojson.Safe.Util in
   let db = ensure_db st in
@@ -885,31 +1119,26 @@ let handle_graph_search st args =
   let hits =
     if String.trim fts = "" then []
     else try Cg.search db ~fts ~limit:(max 1 (min 100 limit)) with _ -> [] in
+  (* Callers only: callee knowledge is already embedded in the
+     description (written leaves-first with callee summaries in hand). *)
   let hit_json (m : Cg.found) =
+    let nb = neighbor_str ~hit_file:m.ffile in
     let base = [
-      "id", `String m.fid;
       "name", `String m.fname;
       "file", `String m.ffile;
-      "start_line", `Int m.fstart;
-      "end_line", `Int m.fend;
+      "line", `Int m.fstart;
       "description",
         (match m.fdesc with Some s -> `String s | None -> `Null);
     ] in
     let base =
       if neighbors then
-        base @ [
-          "callees", `List (List.map desc_pair (Cg.callees db ~id:m.fid));
-          "callers", `List (List.map desc_pair (Cg.callers db ~id:m.fid));
-        ]
+        base @ [ "callers", `List (List.map nb (Cg.callers db ~id:m.fid)) ]
       else base in
     `Assoc base in
   Lwt.return (json_result (`Assoc [
     "fts_terms", `String fts;
     "n_results", `Int (List.length hits);
     "results", `List (List.map hit_json hits);
-    "note", `String
-      "Rank these yourself and answer in 1-2 sentences. For change-impact, \
-       follow callers/callees from the most relevant hits.";
   ]))
 
 (* ---------- Dispatch ---------- *)
@@ -930,4 +1159,6 @@ let dispatch st name args =
   | "graph_set_descriptions" -> handle_graph_set_descriptions st args
   | "graph_describe"         -> handle_graph_describe st args
   | "graph_search"           -> handle_graph_search st args
+  | "graph_overview"         -> handle_graph_overview st args
+  | "graph_neighborhood"     -> handle_graph_neighborhood st args
   | _ -> Lwt.return (text_result (Printf.sprintf "Unknown tool: %s" name))

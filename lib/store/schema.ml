@@ -272,6 +272,43 @@ let migration_8 = [
     )|};
 ]
 
+(* Migration 9: store call-graph paths relative to the analyzed root
+   (meta key [cg_root]). The node id embeds the file path, so absolute
+   paths repeated the repo prefix in every id, file, and edge endpoint of
+   every MCP response. New graphs are relativized at load time
+   (Callgraph_load.relativize); this strips the prefix from existing rows
+   and rebuilds the FTS mirror. replace() with an empty pattern is a
+   no-op, so databases without a cg_root pass through unchanged. *)
+let migration_9 = [
+  {|UPDATE cg_nodes SET
+      id   = replace(id,   COALESCE((SELECT value||'/' FROM meta WHERE key='cg_root'), ''), ''),
+      file = replace(file, COALESCE((SELECT value||'/' FROM meta WHERE key='cg_root'), ''), '')|};
+  {|UPDATE cg_edges SET
+      src       = replace(src,       COALESCE((SELECT value||'/' FROM meta WHERE key='cg_root'), ''), ''),
+      dst       = replace(dst,       COALESCE((SELECT value||'/' FROM meta WHERE key='cg_root'), ''), ''),
+      call_file = replace(call_file, COALESCE((SELECT value||'/' FROM meta WHERE key='cg_root'), ''), '')|};
+  {|DELETE FROM cg_fts|};
+  {|INSERT INTO cg_fts(node_id, name, description)
+     SELECT id, name, COALESCE(description, '') FROM cg_nodes|};
+]
+
+(* Migration 10: dynamic-dispatch edges. Celery .delay/.apply_async,
+   plugin-registry lookups, and signal handlers have no static call edge,
+   but the dispatcher's summary names its target. We materialise those
+   name-mentions as edges (src dispatches dst) so graph_neighborhood can
+   traverse them alongside real call edges — recovering async paths in
+   one query instead of a per-hop mentioned_by chase. Populated from the
+   FTS index by Callgraph_store.populate_dispatch_edges. *)
+let migration_10 = [
+  {|CREATE TABLE IF NOT EXISTS cg_dispatch (
+      src TEXT NOT NULL,   -- dispatcher (its summary names the target)
+      dst TEXT NOT NULL,   -- dispatched-to function
+      UNIQUE(src, dst)
+    )|};
+  {|CREATE INDEX IF NOT EXISTS cg_dispatch_dst_idx ON cg_dispatch(dst)|};
+  {|CREATE INDEX IF NOT EXISTS cg_dispatch_src_idx ON cg_dispatch(src)|};
+]
+
 let migrations = [
   1, migration_1;
   2, migration_2;
@@ -281,6 +318,8 @@ let migrations = [
   6, migration_6;
   7, migration_7;
   8, migration_8;
+  9, migration_9;
+  10, migration_10;
 ]
 
 (* --- meta helpers --- *)
