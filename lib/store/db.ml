@@ -63,6 +63,23 @@ let query_fold db sql params ~init ~f =
 let query_list db sql params ~f =
   List.rev (query_fold db sql params ~init:[] ~f:(fun acc cols -> f cols :: acc))
 
+(* Generic no-params query: returns column names and rows (Data.t arrays),
+   capped at [max_rows]. For running caller-supplied read-only SELECTs. *)
+let query_rows ?(max_rows = 500) db sql =
+  let stmt = S.prepare db sql in
+  let ncol = S.column_count stmt in
+  let headers = Array.to_list (Array.init ncol (S.column_name stmt)) in
+  let rec loop n acc =
+    if n >= max_rows then (acc, true)
+    else match S.step stmt with
+      | S.Rc.ROW -> loop (n + 1) (Array.init ncol (S.column stmt) :: acc)
+      | S.Rc.DONE -> (acc, false)
+      | _ -> fail db (Printf.sprintf "query failed: %s" sql)
+  in
+  let (rows_rev, truncated) = loop 0 [] in
+  ignore (S.finalize stmt);
+  (headers, List.rev rows_rev, truncated)
+
 (* Transaction wrapper — rolls back on exception. *)
 let with_txn db f =
   exec db "BEGIN";

@@ -1141,6 +1141,58 @@ let handle_graph_search st args =
     "results", `List (List.map hit_json hits);
   ]))
 
+(* Run a caller-supplied read-only SELECT over the graph schema and return
+   columns + rows. The model writes the query for its question — one tool
+   subsumes search / describe / overview / neighborhood / trace. Safety:
+   PRAGMA query_only makes any write fail at runtime (real enforcement,
+   no keyword heuristics), rows are capped, and only SELECT/WITH start. *)
+let handle_graph_query st args =
+  let open Yojson.Safe.Util in
+  let db = ensure_db st in
+  let sql = try args |> member "sql" |> to_string with _ -> "" in
+  let limit =
+    let l = try args |> member "max_rows" |> to_int with _ -> 300 in
+    max 1 (min 1000 l) in
+  let low = String.lowercase_ascii (String.trim sql) in
+  let starts p =
+    String.length low >= String.length p && String.sub low 0 (String.length p) = p in
+  if String.trim sql = "" then
+    Lwt.return (json_result (`Assoc [ "error", `String "graph_query: empty sql" ]))
+  else if not (starts "select" || starts "with") then
+    Lwt.return (json_result (`Assoc [
+      "error", `String
+        "graph_query: only a single read-only SELECT/WITH query is allowed." ]))
+  else begin
+    (try D.exec db "PRAGMA query_only=ON" with _ -> ());
+    let result =
+      try Ok (D.query_rows ~max_rows:limit db sql)
+      with e -> Error (Printexc.to_string e) in
+    (try D.exec db "PRAGMA query_only=OFF" with _ -> ());
+    match result with
+    | Error msg ->
+      Lwt.return (json_result (`Assoc [
+        "error", `String ("SQL error: " ^ msg);
+        "hint", `String
+          "Schema: cg_nodes(id,name,file,start_line,end_line,kind,scc,topo,\
+           description); cg_edges(src,dst) caller->callee; cg_dispatch(src,dst) \
+           dynamic dispatcher->target; cg_fts(node_id,name,description) FTS5 \
+           (use: cg_fts MATCH 'description:\"term\"'). Paths are repo-relative.";
+      ]))
+    | Ok (headers, rows, truncated) ->
+      let data_json = function
+        | S.Data.NULL | S.Data.NONE -> `Null
+        | S.Data.INT i -> `Int (Int64.to_int i)
+        | S.Data.FLOAT f -> `Float f
+        | S.Data.TEXT s | S.Data.BLOB s -> `String s in
+      let row_json r = `List (Array.to_list (Array.map data_json r)) in
+      Lwt.return (json_result (`Assoc [
+        "columns", `List (List.map (fun h -> `String h) headers);
+        "n_rows", `Int (List.length rows);
+        "truncated", `Bool truncated;
+        "rows", `List (List.map row_json rows);
+      ]))
+  end
+
 (* ---------- Dispatch ---------- *)
 
 let dispatch st name args =
@@ -1161,4 +1213,5 @@ let dispatch st name args =
   | "graph_search"           -> handle_graph_search st args
   | "graph_overview"         -> handle_graph_overview st args
   | "graph_neighborhood"     -> handle_graph_neighborhood st args
+  | "graph_query"            -> handle_graph_query st args
   | _ -> Lwt.return (text_result (Printf.sprintf "Unknown tool: %s" name))

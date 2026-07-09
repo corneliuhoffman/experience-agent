@@ -344,6 +344,40 @@ let neighborhood db ~roots ~direction ~depth ~follow_dispatch ~limit =
    (non-synthetic) name, record the functions whose descriptions name it
    as its dispatchers. Bounded per target so a generic name can't
    explode. Idempotent: clears and repopulates. *)
+(* Call paths from any `from` function down to any `to` function, via
+   callee edges (+ dispatch when following). Answers "how does X reach Y".
+   Carries the id-path in a US-delimited string (0x1f — never in an id)
+   with a cycle guard; returns the shortest few as ordered id lists. *)
+let trace_paths db ~froms ~tos ~follow_dispatch ~max_depth ~max_paths =
+  match froms, tos with
+  | [], _ | _, [] -> []
+  | _ ->
+    let sep = "char(31)" in
+    let edges =
+      if follow_dispatch then
+        "SELECT src AS a, dst AS b FROM cg_edges \
+         UNION SELECT src, dst FROM cg_dispatch"
+      else "SELECT src AS a, dst AS b FROM cg_edges" in
+    let ph names = String.concat "," (List.map (fun _ -> "?") names) in
+    let sql = Printf.sprintf
+      "WITH RECURSIVE e(a,b) AS (%s), \
+       walk(id, depth, path) AS ( \
+         SELECT id, 0, %s||id||%s FROM cg_nodes WHERE name IN (%s) \
+         UNION ALL \
+         SELECT e.b, w.depth+1, w.path||e.b||%s \
+           FROM walk w JOIN e ON e.a = w.id \
+           WHERE w.depth < ? AND instr(w.path, %s||e.b||%s) = 0) \
+       SELECT w.path FROM walk w JOIN cg_nodes n ON n.id = w.id \
+       WHERE n.name IN (%s) ORDER BY w.depth LIMIT ?"
+      edges sep sep (ph froms) sep sep sep (ph tos) in
+    let paths =
+      D.query_list db sql
+        (List.map t froms @ [ ib max_depth ] @ List.map t tos @ [ ib max_paths ])
+        ~f:(fun c -> D.data_to_string c.(0)) in
+    List.map (fun p ->
+      String.split_on_char '\031' p |> List.filter (fun s -> s <> ""))
+      paths
+
 let dispatch_edge_count db =
   count db "SELECT COUNT(*) FROM cg_dispatch"
 

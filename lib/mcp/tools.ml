@@ -557,4 +557,60 @@ let tool_definitions = `List [
       "required", `List [`String "roots"];
     ];
   ];
+  `Assoc [
+    "name", `String "graph_query";
+    "description", `String
+      "Run a read-only SQL query over the annotated call graph and get \
+       back rows — the general primitive. YOU write the SELECT for your \
+       question; one query does what would otherwise be several \
+       graph_search/describe/neighborhood calls. Use it whenever the \
+       other tools don't fit the exact shape (filter, join, aggregate, \
+       recursive closure, multi-condition). Read-only (writes are \
+       rejected); rows capped — add your own LIMIT.\n\n\
+       SCHEMA (paths are repo-relative):\n\
+       - cg_nodes(id, name, file, start_line, end_line, kind, scc, topo, \
+       description) — one row per function; `description` is the \
+       annotator summary; `kind` is normal|<top_level>|lambda.\n\
+       - cg_edges(src, dst) — a static call edge, src=caller id, \
+       dst=callee id (join to cg_nodes.id).\n\
+       - cg_dispatch(src, dst) — a dynamic-dispatch edge (Celery \
+       .delay/.apply_async etc.), src=dispatcher, dst=target.\n\
+       - cg_fts(node_id, name, description) — FTS5 full-text index; match \
+       with  WHERE cg_fts MATCH 'description:\"send email\"'  and join \
+       node_id to cg_nodes.id, ORDER BY bm25(cg_fts).\n\n\
+       RECIPES:\n\
+       - Search summaries:  SELECT n.name,n.file,n.start_line,n.description \
+       FROM cg_fts f JOIN cg_nodes n ON n.id=f.node_id WHERE cg_fts MATCH \
+       'description:\"revoke certificate\"' ORDER BY bm25(cg_fts) LIMIT 15;\n\
+       - Direct callers of X:  SELECT s.name,s.file FROM cg_edges e JOIN \
+       cg_nodes s ON s.id=e.src JOIN cg_nodes d ON d.id=e.dst WHERE \
+       d.name='revoke';\n\
+       - Everything in a file/dir:  SELECT name,start_line,description FROM \
+       cg_nodes WHERE file='lemur/certificates/service.py' ORDER BY topo;\n\
+       - Transitive callers incl. dynamic dispatch (blast radius):\n\
+       \  WITH RECURSIVE up(id) AS (\n\
+       \    SELECT id FROM cg_nodes WHERE name='send_default_notification'\n\
+       \    UNION SELECT e.src FROM up JOIN (SELECT src,dst FROM cg_edges \
+       UNION SELECT src,dst FROM cg_dispatch) e ON e.dst=up.id)\n\
+       \  SELECT n.name,n.file,n.description FROM up JOIN cg_nodes n ON \
+       n.id=up.id;\n\
+       Swap e.dst=up.id -> e.src=... and select e.dst for downstream \
+       (callees). Filter entry points with e.g. description LIKE \
+       '%@celery.task%'.";
+    "inputSchema", `Assoc [
+      "type", `String "object";
+      "properties", `Assoc [
+        "sql", `Assoc [
+          "type", `String "string";
+          "description", `String
+            "A single read-only SELECT/WITH query over the schema above.";
+        ];
+        "max_rows", `Assoc [
+          "type", `String "integer";
+          "description", `String "Row cap (default 300, max 1000).";
+        ];
+      ];
+      "required", `List [`String "sql"];
+    ];
+  ];
 ]
