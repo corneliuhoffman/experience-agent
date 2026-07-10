@@ -37,6 +37,37 @@ let ensure_db st =
     st.db <- Some db;
     db
 
+(* The MCP [instructions] string, injected into the client's system prompt
+   at connect. When an annotated call graph exists we advertise it and how
+   to route to it — this is what makes a fresh session reach for the graph
+   tools on structural/impact/aggregate questions instead of defaulting to
+   grep (which, on those questions, means hand-building a worse analyzer).
+   Empty when there is no graph, so nothing is advertised that can't be
+   used. *)
+let server_instructions st =
+  match (try Some (Cg.status (ensure_db st)) with _ -> None) with
+  | Some (total, described, _) when total > 0 ->
+    let coverage =
+      if described >= total then Printf.sprintf "%d functions, all annotated" total
+      else Printf.sprintf "%d functions, %d annotated" total described
+    in
+    Printf.sprintf
+      "This project has a prebuilt call graph of its whole codebase (%s), \
+       queryable through this server's graph_* tools. Prefer them over grep \
+       or manual file reading whenever a question is about call STRUCTURE \
+       spread across files: change-impact / blast radius, cross-file \
+       execution flows, dynamic dispatch (Celery tasks, plugin registries, \
+       signals), or codebase-wide aggregates ('which functions...', counts, \
+       rankings, deepest/widest). graph_query runs a read-only SQL SELECT \
+       over the graph and answers in ONE call what would otherwise mean \
+       building your own AST analyzer; graph_search (full-text over \
+       summaries), graph_neighborhood (reachable subgraph from seeds), and \
+       graph_describe (one function with its callers) cover the rest. Do \
+       NOT hand-roll a call-graph analyzer when these tools exist. For a \
+       purely localized single-function lookup, ordinary reading is fine."
+      coverage
+  | _ -> ""
+
 let ensure_repo st =
   match st.repo with
   | Some r -> Lwt.return r
