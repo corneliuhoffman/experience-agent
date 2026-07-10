@@ -310,7 +310,7 @@ type direction = Callees | Callers | Both
 (* [follow_dispatch] also walks cg_dispatch (materialised dynamic-dispatch
    edges — see populate_dispatch_edges) so a single traversal recovers
    async/plugin/signal paths that have no static call edge. *)
-let neighborhood db ~roots ~direction ~depth ~follow_dispatch ~limit =
+let neighborhood db ~roots ~direction ~depth ~follow_dispatch ~limit ~seed_file =
   match roots with
   | [] -> []
   | _ ->
@@ -324,19 +324,25 @@ let neighborhood db ~roots ~direction ~depth ~follow_dispatch ~limit =
           "SELECT src AS a, dst AS b FROM %s \
            UNION SELECT dst AS a, src AS b FROM %s" tbl tbl in
     let und = String.concat " UNION " (List.map oriented tables) in
+    (* Optional file glob scopes the SEED set only — lets a trace pin an
+       ambiguous method name (create_certificate exists in every issuer
+       plugin) to one file, so the one-shot fires cleanly. *)
+    let seed_filter = if seed_file = "" then "" else " AND file GLOB ?" in
     let sql = Printf.sprintf
       "WITH RECURSIVE und(a,b) AS (%s), \
        reach(id,depth) AS ( \
-         SELECT id, 0 FROM cg_nodes WHERE name IN (%s) \
+         SELECT id, 0 FROM cg_nodes WHERE name IN (%s)%s \
          UNION \
          SELECT und.b, reach.depth + 1 FROM reach JOIN und ON und.a = reach.id \
            WHERE reach.depth < ?) \
        SELECT n.id,n.name,n.file,n.start_line,n.end_line,n.kind,n.description \
        FROM reach JOIN cg_nodes n ON n.id = reach.id \
        GROUP BY n.id ORDER BY n.topo, n.file, n.start_line LIMIT ?"
-      und seeds in
+      und seeds seed_filter in
+    let seed_params =
+      List.map t roots @ (if seed_file = "" then [] else [ t seed_file ]) in
     D.query_list db sql
-      (List.map t roots @ [ ib depth; ib limit ]) ~f:found_of_cols
+      (seed_params @ [ ib depth; ib limit ]) ~f:found_of_cols
 
 (* Materialise dynamic-dispatch edges into cg_dispatch from the FTS
    index. For every node with NO static caller (the dispatch-only

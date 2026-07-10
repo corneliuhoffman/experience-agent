@@ -60,11 +60,19 @@ let server_instructions st =
        signals), or codebase-wide aggregates ('which functions...', counts, \
        rankings, deepest/widest). graph_query runs a read-only SQL SELECT \
        over the graph and answers in ONE call what would otherwise mean \
-       building your own AST analyzer; graph_search (full-text over \
-       summaries), graph_neighborhood (reachable subgraph from seeds), and \
-       graph_describe (one function with its callers) cover the rest. Do \
-       NOT hand-roll a call-graph analyzer when these tools exist. For a \
-       purely localized single-function lookup, ordinary reading is fine."
+       building your own AST analyzer. Do NOT hand-roll a call-graph \
+       analyzer when these tools exist. \
+       For an UNDERSTAND / DEBUG / REVIEW / 'how does X work' question, \
+       start with graph_search on a few concrete nouns (small limit) and \
+       answer from the top summaries: each summary was written \
+       leaves-first, so it already folds in what its callees do — a \
+       high-level summary is a self-contained account of the whole \
+       downstream flow. Do NOT reflexively pull graph_neighborhood, dump \
+       the file, or open the source; reach for graph_neighborhood (the \
+       reachable subgraph) or the actual source only when a specific \
+       detail is genuinely missing from the summaries. Use graph_query \
+       for structural FACTS (counts, rankings, caller sets, transitive \
+       closures). graph_describe covers one named function."
       coverage
   | _ -> ""
 
@@ -1003,13 +1011,20 @@ let handle_graph_neighborhood st args =
   let direction =
     match (try args |> member "direction" |> to_string with _ -> "callees") with
     | "callers" -> Cg.Callers | "both" -> Cg.Both | _ -> Cg.Callees in
-  let depth =
-    let d = try args |> member "depth" |> to_int with _ -> 3 in
-    max 1 (min 8 d) in
-  let limit = try args |> member "limit" |> to_int with _ -> 250 in
   let include_code =
     try args |> member "include_code" |> to_bool with _ -> false in
+  let depth =
+    (* A code-trace pulls source for every node reached, and each new
+       function's source is billed at the cache-WRITE rate — so an extra
+       hop is expensive. Default include_code traces to a tight 2 hops
+       (the direct flow) unless the caller asked for more; plain
+       (description-only) walks stay at 3. *)
+    let default_depth = if include_code then 2 else 3 in
+    let d = try args |> member "depth" |> to_int with _ -> default_depth in
+    max 1 (min 8 d) in
+  let limit = try args |> member "limit" |> to_int with _ -> 250 in
   let detail = try args |> member "detail" |> to_string with _ -> "" in
+  let seed_file = try args |> member "file" |> to_string with _ -> "" in
   let follow_dispatch =
     try args |> member "follow_dispatch" |> to_bool with _ -> true in
   (* Lazy backfill: a graph annotated before dispatch edges existed has an
@@ -1022,11 +1037,16 @@ let handle_graph_neighborhood st args =
   let nodes =
     if roots = [] then []
     else try Cg.neighborhood db ~roots ~direction ~depth ~follow_dispatch
-               ~limit:capped
+               ~limit:capped ~seed_file
          with _ -> [] in
+  (* With code present, the source is the detail — full paragraph summaries
+     alongside it are largely redundant tokens, so brief the descriptions to
+     a one-line gist unless the caller explicitly asked for "full". Without
+     code, only brief once the slice is wide. *)
   let brief =
     detail = "brief"
-    || (detail <> "full" && not include_code && List.length nodes > 60) in
+    || (detail <> "full"
+        && (include_code || List.length nodes > 60)) in
   let node_json (m : Cg.found) =
     let base = [
       "name", `String m.fname;

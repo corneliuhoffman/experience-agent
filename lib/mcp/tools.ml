@@ -382,22 +382,23 @@ let tool_definitions = `List [
   `Assoc [
     "name", `String "graph_search";
     "description", `String
-      "Answer a natural-language question about the code by searching the \
-       function summaries and traversing the call graph — no repo re-read. \
-       Same pattern as `search_history`: YOU turn the question into \
-       `fts_terms` (concrete technical nouns), the server runs FTS5 over \
-       the stored descriptions and returns the top functions, each with \
-       its description and (optionally) caller names so you can walk \
-       upward (describe a caller when you need its summary; \
-       \"name (file)\" marks callers in a different file; callee \
-       knowledge is already embedded in each description). Rank the hits yourself and answer in 1-2 sentences. \
-       For change-impact ('to do X, what do I touch?'), start from the \
-       hits and walk callers/callees. Dynamic dispatch (task queues, \
-       plugin registries, event/signal systems, reflection) has no graph \
-       edge — when a function's callers list looks suspiciously empty, \
-       search its NAME: dispatch sites are usually named in the \
-       summaries. For a whole file/dir's summaries, a transitive \
-       closure, or any filtered/aggregate lookup, use graph_query.";
+      "START HERE for any 'how does X work' / debug / review / \
+       understand / where-should-I question. YOU turn the question into \
+       `fts_terms` (concrete technical nouns); FTS5 runs over the stored \
+       summaries and returns the top functions with their descriptions. \
+       KEY: each summary was written leaves-first, so it already folds in \
+       what its callees do — a high-level function's description is a \
+       self-contained account of the whole downstream flow. So the top \
+       few hits usually already contain the answer: read them and answer, \
+       DO NOT reflexively pull the neighborhood, dump the file, or open \
+       the source. Use a SMALL `limit` (5-8) and `neighbors:false` unless \
+       you need callers. Only if a SPECIFIC detail is genuinely missing \
+       from the summaries do one more targeted graph_search or a \
+       graph_describe. Dynamic dispatch (task queues, plugin registries, \
+       signals) has no static edge — if a function's callers look \
+       empty, search its NAME; dispatch sites are named in the summaries. \
+       For a count / ranking / caller-set / transitive closure (a \
+       structural FACT, not an explanation), use graph_query instead.";
     "inputSchema", `Assoc [
       "type", `String "object";
       "properties", `Assoc [
@@ -409,13 +410,19 @@ let tool_definitions = `List [
         ];
         "limit", `Assoc [
           "type", `String "integer";
-          "description", `String "Max functions to return, 1-100 (default 15).";
+          "description", `String
+            "Max functions to return, 1-100 (default 15). For \
+             understand/debug questions prefer a SMALL limit (5-8) — the \
+             top summaries embed their callees, so a few is usually \
+             enough.";
         ];
         "neighbors", `Assoc [
           "type", `String "boolean";
           "description", `String
-            "Include each hit's callers as name strings (default true) \
-             — needed for walking upward in change-impact reasoning.";
+            "Include each hit's callers as name strings (default true). \
+             Set false to save tokens when you only need the summaries \
+             (the common case); true only when walking upward for \
+             change-impact.";
         ];
       ];
       "required", `List [`String "fts_terms"];
@@ -424,18 +431,21 @@ let tool_definitions = `List [
   `Assoc [
     "name", `String "graph_neighborhood";
     "description", `String
-      "Turn a question into exactly the functions it needs. Seed from one \
-       or more `roots` (function names — the entry points or anchors) and \
-       walk the call edges `depth` hops to get only the reachable \
-       subgraph, with descriptions, in ONE call. Use this instead of \
-       dumping a whole file/package when the task is about specific \
-       flows: 'how does issuance work' -> roots the create_certificate \
-       entry points, direction callees; 'what breaks if I change X' -> \
-       roots [X], direction callers. Typical flow: graph_search to find \
-       the seed name(s), then graph_neighborhood to pull their relevant \
-       slice. Returns a bounded, task-shaped set (auto-briefs if wide) — \
-       far smaller and cheaper than dumping a whole module. (For a custom \
-       shape the fixed depth/direction doesn't fit, write it as a \
+      "Get the actual reachable SUBGRAPH from seed functions — the set of \
+       nodes and how they connect, in ONE call. Use this when you need \
+       the STRUCTURE itself, not an explanation: an exhaustive caller/ \
+       callee set for change-impact ('everything that breaks if I change \
+       X' -> roots [X], direction callers), a specific dispatch-aware \
+       closure, or the exact source of a flow (`include_code:true`). \
+       NOTE: for a plain 'how does X work' / understand / debug question, \
+       DON'T start here — graph_search is cheaper, because each summary \
+       already embeds its callees, so a few top summaries usually answer \
+       the question without walking the whole subgraph. Reach for \
+       graph_neighborhood only when the summaries aren't enough and you \
+       need the concrete node set or source. Seed from `roots` (function \
+       names; scope an ambiguous name with `file`), walk `depth` hops. \
+       Returns a bounded, task-shaped set (auto-briefs if wide, briefs \
+       the prose when code is included). (For a custom shape, write a \
        recursive CTE with graph_query.)";
     "inputSchema", `Assoc [
       "type", `String "object";
@@ -445,7 +455,17 @@ let tool_definitions = `List [
           "items", `Assoc [ "type", `String "string" ];
           "description", `String
             "Seed function names to start the walk from (entry points / \
-             anchors). Name collisions all seed the walk.";
+             anchors). Bare name collisions ALL seed the walk — scope them \
+             with `file` when a method name (e.g. create_certificate) \
+             exists in many files.";
+        ];
+        "file", `Assoc [
+          "type", `String "string";
+          "description", `String
+            "Optional glob (e.g. \"*lemur_digicert*\") restricting which \
+             seed nodes match `roots` — pins an ambiguous seed to one \
+             file/plugin so the trace stays on the intended flow. Only \
+             filters the seeds, not the reachable subgraph.";
         ];
         "direction", `Assoc [
           "type", `String "string";
