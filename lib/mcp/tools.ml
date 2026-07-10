@@ -396,7 +396,8 @@ let tool_definitions = `List [
        plugin registries, event/signal systems, reflection) has no graph \
        edge — when a function's callers list looks suspiciously empty, \
        search its NAME: dispatch sites are usually named in the \
-       summaries.";
+       summaries. For a whole file/dir's summaries, a transitive \
+       closure, or any filtered/aggregate lookup, use graph_query.";
     "inputSchema", `Assoc [
       "type", `String "object";
       "properties", `Assoc [
@@ -421,80 +422,6 @@ let tool_definitions = `List [
     ];
   ];
   `Assoc [
-    "name", `String "graph_overview";
-    "description", `String
-      "Bulk-pull annotated function summaries in ONE call — the \
-       comprehension primitive. Use this INSTEAD OF many graph_describe \
-       calls when you need the summaries of a subsystem (understanding a \
-       package, writing a walkthrough, gathering context before an \
-       edit). Pull the WHOLE scope in a single call: pass `paths` with \
-       every file/dir you care about at once (e.g. the module dir, or a \
-       list of the exact files), or `names` for a known set of \
-       functions. Do NOT call this once per file — pass them all in the \
-       one `paths` list. Test files are excluded by default so a \
-       directory pull is clean. Returns each function's description + \
-       file:line, leaves-first; no callers/callees (callee context is \
-       already in each description — use graph_describe for a specific \
-       function's callers/mentioned_by). One round-trip replaces N, \
-       which is both faster and markedly cheaper (fewer cache writes).";
-    "inputSchema", `Assoc [
-      "type", `String "object";
-      "properties", `Assoc [
-        "paths", `Assoc [
-          "type", `String "array";
-          "items", `Assoc [ "type", `String "string" ];
-          "description", `String
-            "Repo-relative files and/or directories — every annotated \
-             function under ALL of them, in one call. Put the entire \
-             scope here (e.g. [\"lemur/plugins/lemur_acme\", \
-             \"lemur/common/celery.py\"]) rather than making one call \
-             per file.";
-        ];
-        "names", `Assoc [
-          "type", `String "array";
-          "items", `Assoc [ "type", `String "string" ];
-          "description", `String
-            "Exact function names to pull (surgical — just these). Name \
-             collisions across files all return; disambiguate by the \
-             file field. Takes precedence over `paths`.";
-        ];
-        "path", `Assoc [
-          "type", `String "string";
-          "description", `String
-            "Single file/dir shorthand; merged with `paths`. Prefer \
-             `paths` when you want more than one.";
-        ];
-        "exclude_tests", `Assoc [
-          "type", `String "boolean";
-          "description", `String
-            "Skip test files — files under a tests/ dir, named \
-             test_*.py, or conftest.py (default true). Set false to \
-             include them.";
-        ];
-        "detail", `Assoc [
-          "type", `String "string";
-          "description", `String
-            "\"full\" (whole descriptions) or \"brief\" (first-sentence \
-             gists). Default auto: a wide pull (>60 functions) returns \
-             brief so it fits one response — then narrow the `paths`/ \
-             `names` for full text on the parts you need. Response echoes \
-             the `detail` actually used.";
-        ];
-        "include_code", `Assoc [
-          "type", `String "boolean";
-          "description", `String
-            "Include each function's source (default false — descriptions \
-             usually suffice).";
-        ];
-        "limit", `Assoc [
-          "type", `String "integer";
-          "description", `String "Max functions to return (default 600).";
-        ];
-      ];
-      "required", `List [];
-    ];
-  ];
-  `Assoc [
     "name", `String "graph_neighborhood";
     "description", `String
       "Turn a question into exactly the functions it needs. Seed from one \
@@ -507,7 +434,9 @@ let tool_definitions = `List [
        roots [X], direction callers. Typical flow: graph_search to find \
        the seed name(s), then graph_neighborhood to pull their relevant \
        slice. Returns a bounded, task-shaped set (auto-briefs if wide) — \
-       far smaller and cheaper than graph_overview on a whole module.";
+       far smaller and cheaper than dumping a whole module. (For a custom \
+       shape the fixed depth/direction doesn't fit, write it as a \
+       recursive CTE with graph_query.)";
     "inputSchema", `Assoc [
       "type", `String "object";
       "properties", `Assoc [

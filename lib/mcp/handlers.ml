@@ -958,84 +958,6 @@ let handle_graph_describe st args =
     "matches", `List (List.map match_json matches);
   ]))
 
-(* Bulk annotated-function pull in ONE call — collapses the
-   ~N-round-trip comprehension pattern (describe each function
-   separately) into a single request; the graph aggregates instead of
-   the agent repeating calls. Two granularities: `names` for exactly the
-   functions you need (surgical), or `path` for every function in a file
-   or directory (module comprehension). No neighbor lists — callee
-   context is already embedded in each description. *)
-let handle_graph_overview st args =
-  let open Yojson.Safe.Util in
-  let db = ensure_db st in
-  let str_list key =
-    try args |> member key |> to_list |> List.filter_map (fun j ->
-      try Some (to_string j) with _ -> None)
-    with _ -> [] in
-  (* Accept a single `path`, a `paths` list, or both — merged. *)
-  let paths =
-    let single = try [args |> member "path" |> to_string] with _ -> [] in
-    List.filter (fun s -> String.trim s <> "") (single @ str_list "paths") in
-  let names = str_list "names" in
-  let exclude_tests =
-    try args |> member "exclude_tests" |> to_bool with _ -> true in
-  let limit = try args |> member "limit" |> to_int with _ -> 600 in
-  let include_code =
-    try args |> member "include_code" |> to_bool with _ -> false in
-  let detail = try args |> member "detail" |> to_string with _ -> "" in
-  let capped = max 1 (min 6000 limit) in
-  let nodes =
-    if names <> [] then
-      (try Cg.nodes_by_names db ~names ~limit:capped with _ -> [])
-    else if paths <> [] then
-      (try Cg.nodes_in_paths db ~paths ~exclude_tests ~limit:capped with _ -> [])
-    else [] in
-  (* Auto-brief: a wide pull's full descriptions can exceed the tool-result
-     size budget, forcing the agent to split back into many calls. Above a
-     node threshold, return first-sentence gists instead so the whole scope
-     still fits in one response. `detail:"full"`/`"brief"` overrides. *)
-  let brief =
-    detail = "brief"
-    || (detail <> "full" && not include_code && List.length nodes > 60) in
-  let node_json (m : Cg.found) =
-    let base = [
-      "name", `String m.fname;
-      "file", `String m.ffile;
-      "line", `Int m.fstart;
-    ] in
-    let base =
-      if m.fkind = "normal" then base
-      else base @ [ "kind", `String m.fkind ] in
-    let base = base @ [
-      "description",
-        (match m.fdesc with
-         | Some s -> `String (if brief then first_sentence s else s)
-         | None -> `Null);
-    ] in
-    if include_code then
-      base @ [ "code", `String (Urme_engine.Callgraph_load.extract_code
-                                  ~file:(cg_abs_file db m.ffile)
-                                  ~start_line:m.fstart ~end_line:m.fend) ]
-    else base in
-  let note =
-    if brief then
-      "Bulk pull (tests excluded unless exclude_tests=false). Descriptions \
-       truncated to first sentence because this pull is wide — for a \
-       function's full summary, re-call graph_overview with a narrower \
-       `paths`/`names` (or detail:\"full\"), or graph_describe it."
-    else
-      "Bulk pull, leaves-first per file (tests excluded unless \
-       exclude_tests=false). Callee context is embedded in each \
-       description; use graph_describe for a specific function's \
-       callers/mentioned_by." in
-  Lwt.return (json_result (`Assoc [
-    "paths", `List (List.map (fun p -> `String p) paths);
-    "n_nodes", `Int (List.length nodes);
-    "detail", `String (if brief then "brief" else "full");
-    "nodes", `List (List.map (fun m -> `Assoc (node_json m)) nodes);
-    "note", `String note;
-  ]))
-
 (* Reachable-subgraph query: seed from named functions, walk call edges
    `depth` hops in a direction, return only the closure. Turns a question
    ("how does issuance work") into exactly the relevant nodes — the
@@ -1211,7 +1133,6 @@ let dispatch st name args =
   | "graph_set_descriptions" -> handle_graph_set_descriptions st args
   | "graph_describe"         -> handle_graph_describe st args
   | "graph_search"           -> handle_graph_search st args
-  | "graph_overview"         -> handle_graph_overview st args
   | "graph_neighborhood"     -> handle_graph_neighborhood st args
   | "graph_query"            -> handle_graph_query st args
   | _ -> Lwt.return (text_result (Printf.sprintf "Unknown tool: %s" name))
