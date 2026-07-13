@@ -411,18 +411,16 @@ let tool_definitions = `List [
         "limit", `Assoc [
           "type", `String "integer";
           "description", `String
-            "Max functions to return, 1-100 (default 15). For \
-             understand/debug questions prefer a SMALL limit (5-8) — the \
-             top summaries embed their callees, so a few is usually \
-             enough.";
+            "Max functions to return, 1-100 (default 6). The top summaries \
+             embed their callees, so a few is usually enough — only raise \
+             it if the answer is genuinely spread wider.";
         ];
         "neighbors", `Assoc [
           "type", `String "boolean";
           "description", `String
-            "Include each hit's callers as name strings (default true). \
-             Set false to save tokens when you only need the summaries \
-             (the common case); true only when walking upward for \
-             change-impact.";
+            "Include each hit's callers as name strings (default false). \
+             Leave off — the summaries are self-contained; set true only \
+             when walking upward for change-impact.";
         ];
       ];
       "required", `List [`String "fts_terms"];

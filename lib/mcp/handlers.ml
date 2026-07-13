@@ -1086,8 +1086,12 @@ let handle_graph_search st args =
   let open Yojson.Safe.Util in
   let db = ensure_db st in
   let fts = try args |> member "fts_terms" |> to_string with _ -> "" in
-  let limit = try args |> member "limit" |> to_int with _ -> 15 in
-  let neighbors = try args |> member "neighbors" |> to_bool with _ -> true in
+  (* Lean defaults: the leaves-first summaries are self-contained, so a few
+     hits usually answer the question; return no caller lists unless asked
+     (they're only for change-impact). Keeps the response — and the context
+     every later turn re-reads — small. *)
+  let limit = try args |> member "limit" |> to_int with _ -> 6 in
+  let neighbors = try args |> member "neighbors" |> to_bool with _ -> false in
   (* FTS MATCH can raise on odd syntax; degrade to no hits rather than fail. *)
   let hits =
     if String.trim fts = "" then []
