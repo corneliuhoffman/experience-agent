@@ -64,15 +64,21 @@ let server_instructions st =
        analyzer when these tools exist. \
        For an UNDERSTAND / DEBUG / REVIEW / 'how does X work' question, \
        start with graph_search on a few concrete nouns (small limit) and \
-       answer from the top summaries: each summary was written \
-       leaves-first, so it already folds in what its callees do — a \
-       high-level summary is a self-contained account of the whole \
-       downstream flow. Do NOT reflexively pull graph_neighborhood, dump \
-       the file, or open the source; reach for graph_neighborhood (the \
-       reachable subgraph) or the actual source only when a specific \
-       detail is genuinely missing from the summaries. Use graph_query \
-       for structural FACTS (counts, rankings, caller sets, transitive \
-       closures). graph_describe covers one named function."
+       answer from the top summaries. TRUST THE SUMMARIES: each was \
+       written directly from the source, leaves-first, and is accurate \
+       and comprehensive — it already folds in what the callees do and \
+       calls out the specific behaviours, edge cases, gotchas, and bugs \
+       that matter (it carries file:line, so you can cite locations \
+       without opening the file). Do NOT read the source to VERIFY or \
+       double-check a summary — that is wasted work; the summary was \
+       built from that exact source. Read the actual source ONLY to quote \
+       verbatim code the answer specifically requires, or when a summary \
+       explicitly lacks a concrete fact you need — not by default, and \
+       never 'just to be sure'. Likewise don't reach for \
+       graph_neighborhood on a plain 'how does X work' — the top \
+       summaries already contain the flow. Use graph_query for structural \
+       FACTS (counts, rankings, caller sets, transitive closures); \
+       graph_describe for one named function."
       coverage
   | _ -> ""
 

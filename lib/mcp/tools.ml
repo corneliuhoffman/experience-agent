@@ -525,25 +525,35 @@ let tool_definitions = `List [
        - cg_fts(node_id, name, description) — FTS5 full-text index; match \
        with  WHERE cg_fts MATCH 'description:\"send email\"'  and join \
        node_id to cg_nodes.id, ORDER BY bm25(cg_fts).\n\n\
-       RECIPES:\n\
-       - Search summaries:  SELECT n.name,n.file,n.start_line,n.description \
-       FROM cg_fts f JOIN cg_nodes n ON n.id=f.node_id WHERE cg_fts MATCH \
-       'description:\"revoke certificate\"' ORDER BY bm25(cg_fts) LIMIT 15;\n\
-       - Direct callers of X:  SELECT s.name,s.file FROM cg_edges e JOIN \
-       cg_nodes s ON s.id=e.src JOIN cg_nodes d ON d.id=e.dst WHERE \
-       d.name='revoke';\n\
-       - Everything in a file/dir:  SELECT name,start_line,description FROM \
-       cg_nodes WHERE file='lemur/certificates/service.py' ORDER BY topo;\n\
-       - Transitive callers incl. dynamic dispatch (blast radius):\n\
+       SEMANTICS (what the data MEANS — you write your own SQL from this, \
+       these are not canned recipes):\n\
+       - Direction: edges are CALLER -> CALLEE (src=caller, dst=callee). \
+       'who calls X' = rows WHERE dst=X.id; 'what X calls' = WHERE src=X.id; \
+       a function with NO callers is one that is never a dst. (Note: the \
+       raw opengrep export is callee->caller; urme stores the reverse, so \
+       reason with caller->callee here.)\n\
+       - cg_dispatch has the SAME orientation and carries the DYNAMIC calls \
+       (Celery .delay/.apply_async, plugin registry, signals) that have no \
+       static edge. Whenever callers / reachability / blast-radius matter, \
+       UNION cg_edges with cg_dispatch or you silently miss every async \
+       path.\n\
+       - 'No caller' is NOT the same as dead code: test functions, \
+       framework entry points (views / celery tasks / cli commands / \
+       marshmallow schema+field hooks), and anything reached only via \
+       cg_dispatch all look uncalled but are live — exclude them for a real \
+       dead-code answer.\n\
+       - Summaries are leaves-first, so cg_nodes.description already folds \
+       in what the callees do; cg_fts is the FTS index over them.\n\
+       One worked example of the recursive shape (transitive callers / \
+       blast radius, dispatch-inclusive); compose everything else from the \
+       direction rule above:\n\
        \  WITH RECURSIVE up(id) AS (\n\
        \    SELECT id FROM cg_nodes WHERE name='send_default_notification'\n\
        \    UNION SELECT e.src FROM up JOIN (SELECT src,dst FROM cg_edges \
        UNION SELECT src,dst FROM cg_dispatch) e ON e.dst=up.id)\n\
-       \  SELECT n.name,n.file,n.description FROM up JOIN cg_nodes n ON \
-       n.id=up.id;\n\
-       Swap e.dst=up.id -> e.src=... and select e.dst for downstream \
-       (callees). Filter entry points with e.g. description LIKE \
-       '%@celery.task%'.";
+       \  SELECT n.name,n.file FROM up JOIN cg_nodes n ON n.id=up.id;\n\
+       (flip e.dst=up.id -> e.src=up.id and select e.dst for callees / \
+       downstream reach.)";
     "inputSchema", `Assoc [
       "type", `String "object";
       "properties", `Assoc [
