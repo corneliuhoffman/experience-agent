@@ -391,10 +391,17 @@ let tool_definitions = `List [
        self-contained account of the whole downstream flow. So the top \
        few hits usually already contain the answer: read them and answer, \
        DO NOT reflexively pull the neighborhood, dump the file, or open \
-       the source. Use a SMALL `limit` (5-8) and `neighbors:false` unless \
-       you need callers. Only if a SPECIFIC detail is genuinely missing \
-       from the summaries do one more targeted graph_search or a \
-       graph_describe. Dynamic dispatch (task queues, plugin registries, \
+       the source. Answering from summaries alone is the norm, not a \
+       shortcut — flow traces, authz/ordering walks, change-impact \
+       reviews, plugin registration, and how an HTTP/SSH call is built are \
+       ALL fully answerable here without reading a single source file. \
+       Opening source to 'verify', 'confirm', or 'see the exact code' is \
+       wasted work; the summary was written from that exact source. Use a \
+       SMALL `limit` (5-8) and `neighbors:false` unless you need callers. \
+       Read a source file ONLY when the answer needs a literal token no \
+       summary gives (an exact regex, constant, or operator) AND you have \
+       already found the relevant summary lacks it — then graph_describe \
+       that one function, don't dump a file. Dynamic dispatch (task queues, plugin registries, \
        signals) has no static edge — if a function's callers look \
        empty, search its NAME; dispatch sites are named in the summaries. \
        For a count / ranking / caller-set / transitive closure (a \

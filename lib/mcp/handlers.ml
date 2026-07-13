@@ -69,14 +69,27 @@ let server_instructions st =
        and comprehensive — it already folds in what the callees do and \
        calls out the specific behaviours, edge cases, gotchas, and bugs \
        that matter (it carries file:line, so you can cite locations \
-       without opening the file). Do NOT read the source to VERIFY or \
-       double-check a summary — that is wasted work; the summary was \
-       built from that exact source. Read the actual source ONLY to quote \
-       verbatim code the answer specifically requires, or when a summary \
-       explicitly lacks a concrete fact you need — not by default, and \
-       never 'just to be sure'. Likewise don't reach for \
-       graph_neighborhood on a plain 'how does X work' — the top \
-       summaries already contain the flow. Use graph_query for structural \
+       without opening the file). \
+       DEFAULT: answer WITHOUT opening any source file. The summaries are \
+       the primary source of truth, not a lossy index of it. Whole \
+       question classes that FEEL like they need code do NOT — a flow \
+       trace, an authorization/ordering walk, a 'what breaks if I change \
+       X' impact review, how a plugin registers, how an HTTP/SSH call is \
+       built: the summaries already state the order, the guards, the \
+       behaviours and the file:line for each step. Compose the answer from \
+       them and cite file:line. Do NOT read source to VERIFY, to \
+       double-check, to 'confirm the layer', to 'see the exact checks', or \
+       to 'be thorough' — that is the single biggest waste in this repo; \
+       the summary was built from that exact source and is not less \
+       trustworthy than your own re-reading. Open a source file ONLY when \
+       the answer is impossible without a literal token that no summary \
+       gives — an exact regex, a magic constant/string, a precise operator \
+       — AND you have already read the relevant summary and found it truly \
+       absent. When that rare case hits, graph_describe the ONE function \
+       and read only it; never pull graph_neighborhood or dump a file to \
+       get there. If you catch yourself about to read source, first ask \
+       'which summary have I read that fails to answer this?' — if you \
+       can't name it, don't open the file. Use graph_query for structural \
        FACTS (counts, rankings, caller sets, transitive closures); \
        graph_describe for one named function."
       coverage
