@@ -429,15 +429,6 @@ let tool_definitions = `List [
              Leave off — the summaries are self-contained; set true only \
              when walking upward for change-impact.";
         ];
-        "full_summaries", `Assoc [
-          "type", `String "boolean";
-          "description", `String
-            "Default false: the top 3 hits return their full summary, the \
-             rest only the first-sentence gist (every full paragraph \
-             returned is re-read on every later turn). Set true only if you \
-             genuinely need full prose for all hits; otherwise graph_describe \
-             the one name whose full summary you want.";
-        ];
       ];
       "required", `List [`String "fts_terms"];
     ];
@@ -580,20 +571,7 @@ let tool_definitions = `List [
         ];
         "max_rows", `Assoc [
           "type", `String "integer";
-          "description", `String
-            "Row cap (default 50, max 1000). For a count/ranking prefer \
-             SELECT COUNT(*) or a small LIMIT — every row returned is re-read \
-             on every later turn.";
-        ];
-        "full_text", `Assoc [
-          "type", `String "boolean";
-          "description", `String
-            "Default false: long text cells (i.e. description) are trimmed to \
-             the first sentence, since selecting full descriptions across many \
-             rows dominates context. Structural questions want name/file/ \
-             counts — don't select description in bulk; graph_describe one \
-             function for its full prose. Set true only when you truly need \
-             full descriptions inline.";
+          "description", `String "Row cap (default 300, max 1000).";
         ];
       ];
       "required", `List [`String "sql"];

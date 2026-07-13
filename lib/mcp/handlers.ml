@@ -1111,53 +1111,31 @@ let handle_graph_search st args =
      every later turn re-reads — small. *)
   let limit = try args |> member "limit" |> to_int with _ -> 6 in
   let neighbors = try args |> member "neighbors" |> to_bool with _ -> false in
-  let full_summaries =
-    try args |> member "full_summaries" |> to_bool with _ -> false in
   (* FTS MATCH can raise on odd syntax; degrade to no hits rather than fail. *)
   let hits =
     if String.trim fts = "" then []
     else try Cg.search db ~fts ~limit:(max 1 (min 100 limit)) with _ -> [] in
-  (* The top few hits usually answer the question, so return their full
-     summary; give the tail only the first-sentence gist — every full
-     paragraph returned is re-read on every later turn (calls are ~free,
-     retained text is the cost). graph_describe a name for its full summary. *)
-  let full_n = 3 in
-  let gisted = ref false in
   (* Callers only: callee knowledge is already embedded in the
      description (written leaves-first with callee summaries in hand). *)
-  let hit_json i (m : Cg.found) =
+  let hit_json (m : Cg.found) =
     let nb = neighbor_str ~hit_file:m.ffile in
-    let desc = match m.fdesc with
-      | None -> `Null
-      | Some s ->
-        if full_summaries || i < full_n then `String s
-        else (gisted := true; `String (first_sentence s ^ " …")) in
     let base = [
       "name", `String m.fname;
       "file", `String m.ffile;
       "line", `Int m.fstart;
-      "description", desc;
+      "description",
+        (match m.fdesc with Some s -> `String s | None -> `Null);
     ] in
     let base =
       if neighbors then
         base @ [ "callers", `List (List.map nb (Cg.callers db ~id:m.fid)) ]
       else base in
     `Assoc base in
-  let results = List.mapi hit_json hits in
-  let base = [
+  Lwt.return (json_result (`Assoc [
     "fts_terms", `String fts;
     "n_results", `Int (List.length hits);
-    "results", `List results;
-  ] in
-  let base =
-    if !gisted then
-      base @ [ "note", `String
-        (Printf.sprintf
-          "summaries past the top %d trimmed to the first sentence to save \
-           context — graph_describe a name for its full summary, or pass \
-           full_summaries:true." full_n) ]
-    else base in
-  Lwt.return (json_result (`Assoc base))
+    "results", `List (List.map hit_json hits);
+  ]))
 
 (* Run a caller-supplied read-only SELECT over the graph schema and return
    columns + rows. The model writes the query for its question — one tool
@@ -1169,13 +1147,8 @@ let handle_graph_query st args =
   let db = ensure_db st in
   let sql = try args |> member "sql" |> to_string with _ -> "" in
   let limit =
-    let l = try args |> member "max_rows" |> to_int with _ -> 50 in
+    let l = try args |> member "max_rows" |> to_int with _ -> 300 in
     max 1 (min 1000 l) in
-  (* Description cells are the graph's biggest text objects; selected across
-     many rows they dominate the tool result and every later turn re-reads
-     them. Trim long cells to the first-sentence gist unless full_text:true.
-     Structural questions want name/file/counts; full prose is graph_describe. *)
-  let full_text = try args |> member "full_text" |> to_bool with _ -> false in
   let low = String.lowercase_ascii (String.trim sql) in
   let starts p =
     String.length low >= String.length p && String.sub low 0 (String.length p) = p in
@@ -1202,30 +1175,18 @@ let handle_graph_query st args =
            (use: cg_fts MATCH 'description:\"term\"'). Paths are repo-relative.";
       ]))
     | Ok (headers, rows, truncated) ->
-      let trimmed = ref false in
       let data_json = function
         | S.Data.NULL | S.Data.NONE -> `Null
         | S.Data.INT i -> `Int (Int64.to_int i)
         | S.Data.FLOAT f -> `Float f
-        | S.Data.TEXT s | S.Data.BLOB s ->
-          if (not full_text) && String.length s > 240 then
-            (trimmed := true; `String (first_sentence s ^ " …"))
-          else `String s in
+        | S.Data.TEXT s | S.Data.BLOB s -> `String s in
       let row_json r = `List (Array.to_list (Array.map data_json r)) in
-      let base = [
+      Lwt.return (json_result (`Assoc [
         "columns", `List (List.map (fun h -> `String h) headers);
         "n_rows", `Int (List.length rows);
         "truncated", `Bool truncated;
         "rows", `List (List.map row_json rows);
-      ] in
-      let base =
-        if !trimmed then
-          base @ [ "note", `String
-            "long text cells trimmed to the first sentence to save context — \
-             pass full_text:true for the full prose, or graph_describe a \
-             function for its complete summary." ]
-        else base in
-      Lwt.return (json_result (`Assoc base))
+      ]))
   end
 
 (* ---------- Dispatch ---------- *)
