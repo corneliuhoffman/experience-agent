@@ -932,7 +932,9 @@ let owner_token args =
 
 let handle_graph_next_batch st args =
   let open Yojson.Safe.Util in
-  let limit = try args |> member "limit" |> to_int with _ -> 5 in
+  (* Bigger default batch: in a single-session loop, fewer/larger batches
+     mean fewer round-trips (the whole cost is turns × growing context). *)
+  let limit = try args |> member "limit" |> to_int with _ -> 25 in
   let db = ensure_db st in
   (* Claim the units as we hand them out: this call used to be a pure
      read, so every concurrent annotator got the identical batch and
