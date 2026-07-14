@@ -46,6 +46,35 @@ let ensure_db st =
    used. *)
 let server_instructions st =
   match (try Some (Cg.status (ensure_db st)) with _ -> None) with
+  | Some (total, described, _) when total > 0 && described < total ->
+    (* Graph exists but is still being ANNOTATED — teach the describe loop
+       (a weak model otherwise flails on the workflow). *)
+    Printf.sprintf
+      "This project's call graph is built but only %d of %d functions are \
+       ANNOTATED. Your job in this session is to annotate more of it. Do \
+       exactly this loop ONCE, then stop:\n\
+       1. Call graph_next_batch. It leases you a batch of functions whose \
+       callees are ALREADY described (their summaries come back in \
+       `callees`, so you can write informed descriptions).\n\
+       2. For EVERY function in the returned `functions`, read its `code` \
+       and write one `description`: 1-3 sentences covering (a) what it does \
+       and its signature, and (b) everything non-obvious a caller must know \
+       — side effects, security relevance, error/empty/edge behaviour, and \
+       BUGS. CRUCIAL: fold in the load-bearing GOTCHAS of its callees. If \
+       this function's behaviour depends on a callee that silently fails, \
+       swallows errors, matches by strict equality, skips on a missed run, \
+       etc., SAY SO HERE — the summary must be self-contained so a future \
+       reader never has to open the callee. Descriptions are the product; \
+       they are trusted without reading source, so be accurate and \
+       comprehensive.\n\
+       3. Call graph_set_descriptions with an array of {id, description}, \
+       one per function, using the EXACT id from the batch.\n\
+       4. STOP. Do NOT call graph_next_batch again in this session — a \
+       fresh short-lived agent takes the next batch (re-reading a growing \
+       history per batch is what makes annotation expensive).\n\
+       Check graph_set_descriptions' `unknown_ids` and repost any that \
+       didn't store."
+      described total
   | Some (total, described, _) when total > 0 ->
     let coverage =
       if described >= total then Printf.sprintf "%d functions, all annotated" total
@@ -943,16 +972,28 @@ let handle_graph_next_batch st args =
     "ready_units", `Int ready;
     "batch", `List batch;
     "note", `String
-      "Describe every function in `functions` — a short but comprehensive \
-       description (usually 1-2 sentences: what it does, its \
-       type/signature, and anything non-obvious a caller must know), \
-       using `callees` descriptions for context. \
-       Recursive units: describe the group together. Post them with \
-       graph_set_descriptions, then STOP — do not loop back for another \
-       batch. To annotate the rest, start a fresh agent per batch: each \
-       call leases what it returns, so concurrent agents get disjoint \
-       work, and a short-lived agent doesn't re-read a growing history on \
-       every batch.";
+      "STEPS: (1) For EVERY function in `functions`, read its `code` and \
+       write a `description`: 1-3 sentences = what it does + signature + \
+       everything non-obvious a caller must know (side effects, security \
+       relevance, error/empty/edge behaviour, BUGS). (2) FOLD IN CALLEE \
+       GOTCHAS: use the `callees` summaries — if this function's behaviour \
+       hinges on a callee that silently fails / swallows errors / matches \
+       by strict equality / skips on a missed run, state that gotcha HERE \
+       so the summary stands alone (a reader must never need to open the \
+       callee). (3) Post ALL of them in ONE graph_set_descriptions call: \
+       descriptions=[{\"id\": <exact id from this batch>, \"description\": \
+       <your text>}, ...]. (4) STOP — do not call graph_next_batch again; a \
+       fresh agent takes the next batch. \
+       recursive:true units are mutually-recursive — describe them \
+       together. Synthetic names (_tmp_lambda) are lambdas — START the \
+       description with the real binding name from the code so searches \
+       find it. \
+       EXAMPLE description (note the folded-in callee gotcha): \"Sends \
+       expiration emails for due certs: groups eligible certs by owner and \
+       dispatches plugin.send per notification. GOTCHA: eligibility runs \
+       through needs_notification, which matches days-to-expiry by STRICT \
+       equality, so a missed daily run skips that cert permanently; plugin \
+       send errors are swallowed (metrics+Sentry only).\"";
   ]))
 
 let handle_graph_set_descriptions st args =
