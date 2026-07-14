@@ -944,10 +944,10 @@ let handle_graph_next_batch st args =
   let db = ensure_db st in
   let by_file = try args |> member "by_file" |> to_bool with _ -> false in
   if by_file then begin
-    (* File-granularity: one whole module (or cyclic file-group) per unit,
-       read once, all its functions described together. Fewer round-trips,
-       better locality, self-contained. Default 6 files/batch. *)
-    let flimit = max 1 (try args |> member "limit" |> to_int with _ -> 6) in
+    (* File-granularity: whole files, `limit` of them per batch (default 3),
+       line-budgeted in the store so a pathologically huge file can't
+       overflow (it chunks). Normal files come whole. *)
+    let flimit = max 1 (try args |> member "limit" |> to_int with _ -> 3) in
     let units = try Cg.next_ready_file_units db ~limit:flimit with _ -> [] in
     let file_unit_json (u : Cg.file_unit) =
       let fns = List.map (fun (m : Cg.node) ->

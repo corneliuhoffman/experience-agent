@@ -287,18 +287,21 @@ let next_ready_file_units db ~limit =
       && List.for_all fully (try Hashtbl.find out c with Not_found -> []))
       comps
     |> List.sort compare in
-  let rec take n = function
-    | [] -> [] | _ when n <= 0 -> [] | x :: r -> x :: take (n - 1) r in
-  List.map (fun c ->
-    let cfiles = List.filter (fun f -> comp_of f = c) files in
+  let take_k k lst =
+    let rec go k = function
+      | [] -> [] | _ when k <= 0 -> [] | x :: r -> x :: go (k - 1) r in
+    go k lst in
+  let undesc_fns cfiles =
     let ph = String.concat "," (List.map (fun _ -> "?") cfiles) in
-    let ufns = D.query_list db
+    D.query_list db
       (Printf.sprintf
         "SELECT id,name,file,start_line,end_line,end_exact,kind FROM cg_nodes \
          WHERE description IS NULL AND file IN (%s) ORDER BY file,topo,start_line"
         ph)
       (List.map t cfiles) ~f:node_of_cols in
-    let ucallees = D.query_list db
+  let callees_of cfiles =
+    let ph = String.concat "," (List.map (fun _ -> "?") cfiles) in
+    D.query_list db
       (Printf.sprintf
         "SELECT DISTINCT d.name, d.description FROM cg_edges e \
            JOIN cg_nodes s ON s.id=e.src JOIN cg_nodes d ON d.id=e.dst \
@@ -307,7 +310,36 @@ let next_ready_file_units db ~limit =
         ph ph)
       (List.map t cfiles @ List.map t cfiles)
       ~f:(fun c -> (D.data_to_string c.(0), D.data_to_string_opt c.(1))) in
-    { ufiles = cfiles; ufns; ucallees }) (take limit ready)
+  let lines (m : node) = max 1 (m.end_line - m.start_line + 1) in
+  let total_lines fns = List.fold_left (fun a m -> a + lines m) 0 fns in
+  (* Whole files, [limit] of them per batch (default 3), bounded by a
+     generous line budget so a pathologically huge file can't overflow the
+     turn — normal files come whole. If ONE file exceeds the budget it is
+     chunked (its remaining functions stay undescribed, handed out again
+     next call). *)
+  let file_cap = limit and line_cap = 1500 in
+  let rec gather acc nfiles nl = function
+    | [] -> List.rev acc
+    | _ when nfiles >= file_cap -> List.rev acc
+    | c :: rest ->
+      let cfiles = List.filter (fun f -> comp_of f = c) files in
+      let all = undesc_fns cfiles in
+      let tl = total_lines all in
+      if acc <> [] && nl + tl > line_cap then List.rev acc   (* leave for next batch *)
+      else if tl <= line_cap then
+        let u = { ufiles = cfiles; ufns = all; ucallees = callees_of cfiles } in
+        gather (u :: acc) (nfiles + 1) (nl + tl) rest
+      else begin
+        (* single file bigger than the budget: take one chunk, stop here *)
+        let rec fit taken tll = function
+          | [] -> List.rev taken
+          | m :: r ->
+            if taken <> [] && tll + lines m > line_cap then List.rev taken
+            else fit (m :: taken) (tll + lines m) r in
+        let chosen = match fit [] 0 all with [] -> take_k 1 all | xs -> xs in
+        List.rev ({ ufiles = cfiles; ufns = chosen; ucallees = callees_of cfiles } :: acc)
+      end in
+  gather [] 0 0 ready
 
 (* Cross-SCC callees (already described) of any member of this SCC. *)
 let scc_callee_descriptions db ~scc =
