@@ -309,9 +309,11 @@ let annotate_cmd =
       let* pool = Urme_claude.Prompts.spawn_pool
           ~model ~size:(max 1 parallel)
           ~system_prompt:annotate_system ~binary:config.claude_binary () in
+      let last = ref min_int in
       let rec loop () =
         let (total, described, _) = Cg.status db in
-        Printf.printf "\rannotating: %d/%d%!" described total;
+        if described - !last >= 100 || described >= total then
+          (Printf.printf "annotated %d/%d\n%!" described total; last := described);
         if described >= total then Lwt.return_unit
         else begin
           let units = Cg.next_ready_file_units db ~limit:(max 1 parallel) in
