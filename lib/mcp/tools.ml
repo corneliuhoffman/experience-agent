@@ -560,7 +560,12 @@ let tool_definitions = `List [
        UNION SELECT src,dst FROM cg_dispatch) e ON e.dst=up.id)\n\
        \  SELECT n.name,n.file FROM up JOIN cg_nodes n ON n.id=up.id;\n\
        (flip e.dst=up.id -> e.src=up.id and select e.dst for callees / \
-       downstream reach.)";
+       downstream reach.)\n\
+       KEEP RESULTS SMALL: every row you return stays in context and is \
+       re-read on every later turn. For a count/ranking answer with \
+       COUNT(*) or GROUP BY, not the raw rows; SELECT name/file, not \
+       description, in bulk; cap with LIMIT. Answer each question in ONE \
+       query where you can — don't split into search+describe+query.";
     "inputSchema", `Assoc [
       "type", `String "object";
       "properties", `Assoc [
