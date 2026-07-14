@@ -1039,30 +1039,13 @@ let handle_graph_describe st args =
                                     ~end_line:m.fend) ]
       else base in
     `Assoc base in
-  (* A file-path query ("show me this module") returns every function in the
-     file as its own match — with code_only, a set of surgical spans instead
-     of a whole-file Read. The model sometimes appends a node-id-ish tail
-     ("...plugin.py|1|0"); strip from '|' and glob the tail so a repo-
-     relative path matches the stored (root-relative) file. A plain function
-     name has no '/', so this only fires for real paths. *)
-  let query_clean =
-    let q = match String.index_opt query '|' with
-      | Some i -> String.sub query 0 i | None -> query in
-    String.trim q in
-  let is_file = String.contains query_clean '/' in
   (* Lambdas carry synthetic node names (e.g. _tmp_lambda), so an exact
      name miss falls back to FTS over name+description — the described
      graph usually knows the binding name from the summary text. *)
   let matches =
-    if is_file then
-      match (try Cg.by_file db ~file_glob:("*" ^ query_clean) ~limit:60
-             with _ -> []) with
-      | [] -> (try Cg.search db ~fts:query ~limit:10 with _ -> [])
-      | ms -> ms
-    else
-      match Cg.lookup db ~query with
-      | [] -> (try Cg.search db ~fts:query ~limit:10 with _ -> [])
-      | ms -> ms in
+    match Cg.lookup db ~query with
+    | [] -> (try Cg.search db ~fts:query ~limit:10 with _ -> [])
+    | ms -> ms in
   Lwt.return (json_result (`Assoc [
     "query", `String query;
     "n_matches", `Int (List.length matches);

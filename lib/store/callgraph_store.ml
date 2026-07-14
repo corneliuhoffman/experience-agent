@@ -229,16 +229,6 @@ let lookup db ~query =
      WHERE id=? OR name=? ORDER BY topo LIMIT 25"
     [ t query; t query ] ~f:found_of_cols
 
-(* Every function defined in a file (GLOB pattern, so a repo-relative tail
-   like "*plugins/lemur_slack/plugin.py" matches). Lets graph_describe take
-   a file path — "show me this module's functions" — and hand each back as
-   a surgical span, instead of the model falling to a whole-file Read. *)
-let by_file db ~file_glob ~limit =
-  D.query_list db
-    "SELECT id,name,file,start_line,end_line,kind,description FROM cg_nodes \
-     WHERE file GLOB ? ORDER BY start_line LIMIT ?"
-    [ t file_glob; ib limit ] ~f:found_of_cols
-
 (* Full-text search over the function summaries (name + description),
    ranked by BM25. The "searches in the summaries" half of a NL query;
    callers/callees supply the "db formula" half. *)

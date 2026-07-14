@@ -369,13 +369,7 @@ let tool_definitions = `List [
       "properties", `Assoc [
         "query", `Assoc [
           "type", `String "string";
-          "description", `String
-            "A function name, an exact node id, OR a file path (anything \
-             with a '/'): a path returns every function in that module, so \
-             with code_only you get its whole set of source spans in one \
-             call instead of a Read. (A class's methods come back this way; \
-             its bare attributes — slug, options — are data, not functions, \
-             so those still need a small read of the file.)";
+          "description", `String "Function name or exact node id.";
         ];
         "code_only", `Assoc [
           "type", `String "boolean";
