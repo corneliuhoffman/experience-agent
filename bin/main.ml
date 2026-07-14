@@ -314,27 +314,41 @@ let annotate_cmd =
           ~model ~size:(max 1 parallel)
           ~system_prompt:annotate_system ~binary:config.claude_binary () in
       let last = ref (-1) in
+      let empties = ref 0 in
       let rec loop () =
-        let (total, described, _) = Cg.status db in
+        let (total, described, _) = try Cg.status db with _ -> (0, 0, 0) in
         if !last < 0 || described - !last >= progress || described >= total then
           (Printf.printf "annotated %d/%d\n%!" described total; last := described);
-        if described >= total then Lwt.return_unit
+        if total > 0 && described >= total then Lwt.return_unit
         else begin
-          let units = Cg.next_ready_file_units db ~limit:(max 1 parallel) in
-          if units = [] then
-            (Printf.printf "\nstuck: %d/%d described, no ready units\n" described total;
-             Lwt.return_unit)
-          else
-            let* () = Lwt_list.iter_p (fun (u : Cg.file_unit) ->
-              let prompt = build_annot_prompt db u in
-              let* raw =
-                Lwt.catch (fun () -> Urme_claude.Prompts.ask_via_pool pool ~prompt)
-                  (fun _ -> Lwt.return "") in
-              List.iter (fun (id, desc) ->
-                ignore (Cg.set_description db ~id ~description:desc ~code_hash:None))
-                (parse_annot raw);
-              Lwt.return_unit) units in
+          let units = try Cg.next_ready_file_units db ~limit:(max 1 parallel)
+                      with _ -> [] in
+          if units = [] then begin
+            (* Could be transient (a lock made the query return nothing) or a
+               real dead-end. Retry a few times before giving up, so a
+               momentary hiccup doesn't abort the whole run. *)
+            incr empties;
+            if !empties > 8 then
+              (Printf.printf "\nstuck: %d/%d described, no ready units after retries\n"
+                 described total; Lwt.return_unit)
+            else (let* () = Lwt_unix.sleep 2.0 in loop ())
+          end else begin
+            empties := 0;
+            let* () = Lwt.catch (fun () ->
+              Lwt_list.iter_p (fun (u : Cg.file_unit) ->
+                let prompt = build_annot_prompt db u in
+                let* raw =
+                  Lwt.catch (fun () -> Urme_claude.Prompts.ask_via_pool pool ~prompt)
+                    (fun _ -> Lwt.return "") in
+                (try
+                   List.iter (fun (id, desc) ->
+                     ignore (Cg.set_description db ~id ~description:desc ~code_hash:None))
+                     (parse_annot raw)
+                 with _ -> ());
+                Lwt.return_unit) units)
+              (fun _ -> Lwt.return_unit) in
             loop ()
+          end
         end in
       let* () = loop () in
       let* () = Urme_claude.Prompts.close_pool pool in

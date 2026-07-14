@@ -362,7 +362,11 @@ let apply_pragmas db =
   D.exec db "PRAGMA journal_mode = WAL";
   D.exec db "PRAGMA synchronous = NORMAL";
   D.exec db "PRAGMA foreign_keys = ON";
-  D.exec db "PRAGMA temp_store = MEMORY"
+  D.exec db "PRAGMA temp_store = MEMORY";
+  (* Wait up to 30s for a lock instead of erroring SQLITE_BUSY. With many
+     concurrent connections (e.g. the annotate pool's daemons each opening
+     the db), a bare BUSY would otherwise crash the writer mid-run. *)
+  D.exec db "PRAGMA busy_timeout = 30000"
 
 (* --- bootstrap + migrate --- *)
 
