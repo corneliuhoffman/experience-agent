@@ -85,13 +85,19 @@ let server_instructions st =
        the answer is impossible without a literal token that no summary \
        gives — an exact regex, a magic constant/string, a precise operator \
        — AND you have already read the relevant summary and found it truly \
-       absent. When that rare case hits, graph_describe the ONE function \
-       and read only it; never pull graph_neighborhood or dump a file to \
-       get there. If you catch yourself about to read source, first ask \
-       'which summary have I read that fails to answer this?' — if you \
-       can't name it, don't open the file. Use graph_query for structural \
-       FACTS (counts, rankings, caller sets, transitive closures); \
-       graph_describe for one named function."
+       absent. When that rare case hits, get the code from the GRAPH, not \
+       from Read/grep: graph_describe with code_only:true returns exactly \
+       that function's line span and nothing else — the graph knows its \
+       precise bounds, so it is strictly more surgical than opening a file \
+       or grepping (which pull whole files / wide context). Reserve Read \
+       for the one thing the graph has no node for: config/wiring data \
+       (e.g. a setuptools entry_points registry list is strings, not \
+       functions). If you catch yourself about to Read a source file, \
+       first ask 'which summary failed to answer this, and is the code I \
+       need a function (-> graph_describe code_only) or config data \
+       (-> grep that file)?'. Use graph_query for structural FACTS \
+       (counts, rankings, caller sets, transitive closures); graph_describe \
+       for one named function."
       coverage
   | _ -> ""
 
@@ -950,8 +956,15 @@ let handle_graph_describe st args =
   let open Yojson.Safe.Util in
   let db = ensure_db st in
   let query = args |> member "query" |> to_string in
+  (* code_only: the surgical-source path — return just the function's exact
+     line span (start_line..end_line), no summary, no caller/callee sets.
+     This is what to reach for instead of Read/grep when you need the actual
+     code of a function: the graph knows its precise bounds, so it pulls
+     only those lines, never the whole file. Implies include_code. *)
+  let code_only =
+    try args |> member "code_only" |> to_bool with _ -> false in
   let include_code =
-    try args |> member "include_code" |> to_bool with _ -> false in
+    code_only || (try args |> member "include_code" |> to_bool with _ -> false) in
   (* A dispatched-to function (task queue, plugin registry, signal) has
      no static caller edge, but its dispatchers' summaries name it: when
      the callers list is empty, attach the functions whose descriptions
@@ -982,6 +995,18 @@ let handle_graph_describe st args =
      named in the prose. Callers can't be embedded that way (they don't
      exist yet at annotation time), so they are always returned. *)
   let match_json (m : Cg.found) =
+    if code_only then
+      (* Surgical read: exactly this function's lines, nothing else. *)
+      `Assoc [
+        "name", `String m.fname;
+        "file", `String m.ffile;
+        "line", `Int m.fstart;
+        "end_line", `Int m.fend;
+        "code", `String (Urme_engine.Callgraph_load.extract_code
+                           ~file:(cg_abs_file db m.ffile)
+                           ~start_line:m.fstart ~end_line:m.fend);
+      ]
+    else
     let callers = Cg.callers db ~id:m.fid in
     let nb = neighbor_str ~hit_file:m.ffile in
     let base = [

@@ -356,7 +356,14 @@ let tool_definitions = `List [
        functions whose summaries name it — usually its dynamic \
        dispatchers (task queues, plugin registries, event/signal \
        systems). Treat those as probable callers and keep walking from \
-       them.";
+       them.\n\
+       NEED THE ACTUAL CODE of a function? Use code_only:true here — it \
+       returns exactly that function's line span and nothing else. Prefer \
+       it over Read/grep: the graph knows each function's precise bounds, \
+       so it pulls only those lines, never the whole file. (The registry \
+       WIRING itself — e.g. a setuptools entry_points list — is config \
+       data, not a function, so it has no node; grep the config file for \
+       that one part.)";
     "inputSchema", `Assoc [
       "type", `String "object";
       "properties", `Assoc [
@@ -364,10 +371,20 @@ let tool_definitions = `List [
           "type", `String "string";
           "description", `String "Function name or exact node id.";
         ];
+        "code_only", `Assoc [
+          "type", `String "boolean";
+          "description", `String
+            "Surgical source: return just each match's exact line span \
+             (start..end) with no summary or caller/callee sets. This is \
+             the precise alternative to Read/grep when you need a \
+             function's actual code — only its lines, not the whole file.";
+        ];
         "include_code", `Assoc [
           "type", `String "boolean";
           "description", `String
-            "Include the function source in each match (default false).";
+            "Include the function source alongside the summary in each \
+             match (default false). For code with no summary, use \
+             code_only instead.";
         ];
         "include_callees", `Assoc [
           "type", `String "boolean";
