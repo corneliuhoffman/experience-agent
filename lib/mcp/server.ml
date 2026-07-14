@@ -33,7 +33,7 @@ let handle_message state (msg : Yojson.Safe.t) =
   | "notifications/initialized" ->
     Lwt.return `Null
   | "tools/list" ->
-    let result = `Assoc ["tools", Tools.tool_definitions] in
+    let result = `Assoc ["tools", Handlers.served_tools state] in
     Lwt.return (`Assoc [
       "jsonrpc", `String "2.0";
       "id", id;

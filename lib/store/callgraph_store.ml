@@ -194,6 +194,12 @@ let status db =
   let ready = List.length (ready_sccs db ~limit:1_000_000) in
   (total, described, ready)
 
+(* Is the session/turn memory index populated? Gates the memory-search
+   tools out of the advertised surface on a graph-only project, so their
+   schemas don't sit unused in every session's prefix. *)
+let has_memory db =
+  try count db "SELECT COUNT(*) FROM steps" > 0 with _ -> false
+
 (* ---------- queries (ask questions of the graph) ---------- *)
 
 type found = {

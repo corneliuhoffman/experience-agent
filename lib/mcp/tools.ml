@@ -578,3 +578,28 @@ let tool_definitions = `List [
     ];
   ];
 ]
+
+(* Tool-surface trimming: every advertised schema sits in the client's
+   prompt prefix and is re-read on every turn, so tools that can't be used
+   in the current project are pure dead weight. The memory/turn-search set
+   is useless without an indexed session history; the build tools are only
+   needed while annotating a graph, not when querying a finished one. *)
+let memory_names = [
+  "search_history"; "push_synthesis"; "get_turn"; "file_history";
+  "region_blame"; "explain_change"; "commit_links"; "search_by_file" ]
+let build_names = [ "graph_init"; "graph_next_batch"; "graph_set_descriptions" ]
+
+let tools_for ~include_memory ~include_build =
+  let keep name =
+    (include_memory || not (List.mem name memory_names)) &&
+    (include_build  || not (List.mem name build_names)) in
+  match tool_definitions with
+  | `List l ->
+    `List (List.filter (fun t ->
+      match t with
+      | `Assoc a ->
+        (match List.assoc_opt "name" a with
+         | Some (`String n) -> keep n
+         | _ -> true)
+      | _ -> true) l)
+  | other -> other

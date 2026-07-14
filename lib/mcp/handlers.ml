@@ -95,6 +95,17 @@ let server_instructions st =
       coverage
   | _ -> ""
 
+(* The tool list actually advertised for this project. Drop the build tools
+   once the graph is fully annotated (they only matter while constructing
+   it) and the memory-search tools when no session history is indexed —
+   their schemas would otherwise pad every session's prefix unused. *)
+let served_tools st =
+  let db = ensure_db st in
+  let total, described, _ = try Cg.status db with _ -> (0, 0, 0) in
+  let include_build = total = 0 || described < total in
+  let include_memory = try Cg.has_memory db with _ -> true in
+  Tools.tools_for ~include_memory ~include_build
+
 let ensure_repo st =
   match st.repo with
   | Some r -> Lwt.return r
