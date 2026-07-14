@@ -545,6 +545,53 @@ let tool_definitions = `List [
     ];
   ];
   `Assoc [
+    "name", `String "graph_blast_radius";
+    "description", `String
+      "Blast radius / change impact / 'how widely used is X' / transitive \
+       callers (or callees) — USE THIS, don't hand-write the SQL. Give a \
+       function `name`; the tool runs the FULL transitive closure itself, \
+       dispatch-inclusive, and returns `transitive` (the real blast radius), \
+       `direct` (one-hop callers, for contrast), and `by_file` (the closure \
+       grouped by file, so you can read off entry-point categories: \
+       views=REST, cli=CLI, celery=tasks, tests). It cannot get the query \
+       wrong (no forgotten recursion, no forgotten cg_dispatch). \
+       Same-named functions across files (e.g. every issuer's \
+       create_certificate) are returned SEPARATELY — pass `file` to pick \
+       one, or read them all to compare per-implementation. `direction`: \
+       'callers' (default, upstream = what reaches X = change impact) or \
+       'callees' (downstream = what X reaches). Prefer this over a \
+       hand-written recursive graph_query for any impact/reach question.";
+    "inputSchema", `Assoc [
+      "type", `String "object";
+      "properties", `Assoc [
+        "name", `Assoc [
+          "type", `String "string";
+          "description", `String "Function name (e.g. 'session_query').";
+        ];
+        "file", `Assoc [
+          "type", `String "string";
+          "description", `String
+            "Optional path substring to disambiguate a name defined in \
+             several files (e.g. 'lemur_digicert' to pick DigiCert's).";
+        ];
+        "direction", `Assoc [
+          "type", `String "string";
+          "enum", `List [`String "callers"; `String "callees"];
+          "description", `String
+            "'callers' (default) = who reaches X (change impact); \
+             'callees' = what X reaches (downstream).";
+        ];
+        "include_dispatch", `Assoc [
+          "type", `String "boolean";
+          "description", `String
+            "Include dynamic-dispatch edges (Celery/plugin/signal) in the \
+             closure. Default true — leave it on for a real blast radius.";
+        ];
+      ];
+      "required", `List [`String "name"];
+    ];
+  ];
+  `Assoc [
     "name", `String "graph_query";
     "description", `String
       "Run a read-only SQL query over the annotated call graph and get \
@@ -552,7 +599,9 @@ let tool_definitions = `List [
        question; one query does what would otherwise be several \
        graph_search/describe/neighborhood calls. Use it whenever the \
        other tools don't fit the exact shape (filter, join, aggregate, \
-       recursive closure, multi-condition). Read-only (writes are \
+       recursive closure, multi-condition). For blast radius / transitive \
+       callers / change impact, use graph_blast_radius instead — it runs \
+       the dispatch-inclusive closure for you. Read-only (writes are \
        rejected); rows capped — add your own LIMIT.\n\n\
        SCHEMA (paths are repo-relative):\n\
        - cg_nodes(id, name, file, start_line, end_line, kind, scc, topo, \

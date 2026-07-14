@@ -347,6 +347,68 @@ let mentioned_by db ~name ~exclude_id ~limit =
      ORDER BY bm25(cg_fts) LIMIT ?"
     [ t quoted; t exclude_id; ib limit ] ~f:found_of_cols
 
+(* Traversal direction: Callees (downstream — "what X reaches"), Callers
+   (upstream — "what reaches X / change-impact"), or Both. *)
+type direction = Callees | Callers | Both
+
+(* Blast radius, correct by construction. The FULL transitive closure of
+   callers (or callees) of a node, dispatch-inclusive — the traversal
+   models kept composing wrong by hand (a one-hop COUNT, or a recursion
+   that forgot cg_dispatch). Resolves the name to nodes so same-named
+   methods across classes are reported SEPARATELY (no accidental merge),
+   and returns both the one-hop [direct] count and the transitive count
+   plus the closure grouped by file. Direction: Callers = upstream (what
+   reaches X = change impact), Callees = downstream. *)
+type blast = {
+  bnode : found;
+  direct : int;
+  transitive : int;
+  by_file : (string * int) list;
+}
+
+let blast_radius db ~name ~file ~(direction : direction) ~include_dispatch ~file_limit =
+  let nodes =
+    if file = "" then
+      D.query_list db
+        "SELECT id,name,file,start_line,end_line,kind,description FROM cg_nodes \
+         WHERE name=? ORDER BY file,start_line"
+        [ t name ] ~f:found_of_cols
+    else
+      D.query_list db
+        "SELECT id,name,file,start_line,end_line,kind,description FROM cg_nodes \
+         WHERE name=? AND file GLOB ? ORDER BY file,start_line"
+        [ t name; t ("*" ^ file ^ "*") ] ~f:found_of_cols
+  in
+  let edges =
+    if include_dispatch
+    then "(SELECT src,dst FROM cg_edges UNION SELECT src,dst FROM cg_dispatch)"
+    else "cg_edges" in
+  (* Callers: add e.src for every edge whose dst is in the set. Callees: the
+     mirror. Both edge tables are caller->callee, dispatcher->target. *)
+  let nextc, onc = match direction with
+    | Callees -> "e.dst", "e.src"
+    | Callers | Both -> "e.src", "e.dst" in
+  let count_p sql params =
+    D.query_fold db sql params ~init:0 ~f:(fun _ c -> D.data_to_int c.(0)) in
+  let cte = Printf.sprintf
+    "WITH RECURSIVE reach(id) AS (SELECT ? \
+     UNION SELECT %s FROM reach JOIN %s e ON %s=reach.id)" nextc edges onc in
+  List.map (fun (m : found) ->
+    let direct =
+      count_p (Printf.sprintf
+        "SELECT COUNT(DISTINCT %s) FROM %s e WHERE %s=?" nextc edges onc)
+        [ t m.fid ] in
+    let transitive =
+      count_p (cte ^ " SELECT COUNT(*) FROM reach WHERE id<>?") [ t m.fid; t m.fid ] in
+    let by_file =
+      D.query_list db
+        (cte ^ " SELECT n.file, COUNT(*) AS c FROM reach \
+          JOIN cg_nodes n ON n.id=reach.id WHERE reach.id<>? \
+          GROUP BY n.file ORDER BY c DESC LIMIT ?")
+        [ t m.fid; t m.fid; ib file_limit ]
+        ~f:(fun c -> (D.data_to_string c.(0), D.data_to_int c.(1))) in
+    { bnode = m; direct; transitive; by_file }) nodes
+
 (* Neighbour lists are name+file only: full summaries are read on demand
    via lookup/graph_describe, instead of re-sent with every hit. *)
 (* Every node under any of several files/directories, ONE call — the
@@ -402,7 +464,6 @@ let nodes_by_names db ~names ~limit =
    work"), Callers (upstream — "what reaches X / change-impact"), or Both.
    Returns the closure's nodes (deduped, topo-ordered) with descriptions.
    Bounded by [depth] and [limit] so it stays small and one-call. *)
-type direction = Callees | Callers | Both
 
 (* [follow_dispatch] also walks cg_dispatch (materialised dynamic-dispatch
    edges — see populate_dispatch_edges) so a single traversal recovers

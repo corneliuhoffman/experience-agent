@@ -1265,6 +1265,56 @@ let handle_graph_query st args =
       ]))
   end
 
+(* Blast radius as a first-class op: the model names a function, the tool
+   runs the dispatch-inclusive transitive closure itself. Removes the two
+   query-composition mistakes weak models make (one-hop COUNT; forgetting
+   cg_dispatch) and resolves the name-collision by reporting each matching
+   node separately. *)
+let handle_graph_blast_radius st args =
+  let open Yojson.Safe.Util in
+  let db = ensure_db st in
+  let name = try args |> member "name" |> to_string with _ -> "" in
+  let file = try args |> member "file" |> to_string with _ -> "" in
+  let direction =
+    match (try args |> member "direction" |> to_string with _ -> "callers") with
+    | "callees" -> Cg.Callees | _ -> Cg.Callers in
+  let include_dispatch =
+    try args |> member "include_dispatch" |> to_bool with _ -> true in
+  let file_limit =
+    max 1 (min 50 (try args |> member "file_breakdown_limit" |> to_int with _ -> 12)) in
+  if String.trim name = "" then
+    Lwt.return (json_result (`Assoc [
+      "error", `String "graph_blast_radius: 'name' is required" ]))
+  else begin
+    let results =
+      try Cg.blast_radius db ~name ~file ~direction ~include_dispatch ~file_limit
+      with _ -> [] in
+    let dir_s = match direction with Cg.Callees -> "callees" | _ -> "callers" in
+    let json_of (b : Cg.blast) =
+      `Assoc [
+        "name", `String b.bnode.fname;
+        "file", `String b.bnode.ffile;
+        "line", `Int b.bnode.fstart;
+        "direct", `Int b.direct;
+        "transitive", `Int b.transitive;
+        "by_file", `List (List.map (fun (f, c) ->
+          `Assoc [ "file", `String f; "count", `Int c ]) b.by_file);
+      ] in
+    Lwt.return (json_result (`Assoc [
+      "query", `String name;
+      "direction", `String dir_s;
+      "dispatch_included", `Bool include_dispatch;
+      "n_matches", `Int (List.length results);
+      "note", `String
+        "transitive = full dispatch-inclusive closure (THE blast radius); \
+         direct = one-hop callers only. Same-named functions across files \
+         are listed separately — pick the one you mean by file. by_file \
+         groups the closure by file so you can read off entry-point \
+         categories (views=REST, cli=CLI, celery=tasks, tests).";
+      "matches", `List (List.map json_of results);
+    ]))
+  end
+
 (* ---------- Dispatch ---------- *)
 
 let dispatch st name args =
@@ -1285,4 +1335,5 @@ let dispatch st name args =
   | "graph_search"           -> handle_graph_search st args
   | "graph_neighborhood"     -> handle_graph_neighborhood st args
   | "graph_query"            -> handle_graph_query st args
+  | "graph_blast_radius"     -> handle_graph_blast_radius st args
   | _ -> Lwt.return (text_result (Printf.sprintf "Unknown tool: %s" name))
