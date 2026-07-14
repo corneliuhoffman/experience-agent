@@ -584,16 +584,26 @@ let tool_definitions = `List [
        dead-code answer.\n\
        - Summaries are leaves-first, so cg_nodes.description already folds \
        in what the callees do; cg_fts is the FTS index over them.\n\
-       One worked example of the recursive shape (transitive callers / \
-       blast radius, dispatch-inclusive); compose everything else from the \
-       direction rule above:\n\
+       BLAST RADIUS / 'how widely used' / transitive callers / change- \
+       impact / reachability ALL mean the FULL TRANSITIVE CLOSURE — every \
+       function that (in)directly reaches the target — NOT a one-hop count. \
+       Two mistakes give a wrong number, avoid BOTH:\n\
+       \  (1) A plain COUNT over cg_edges = DIRECT callers only (one hop). \
+       That is NOT blast radius. e.g. session_query has ~48 direct callers \
+       but 315 transitive. You MUST recurse.\n\
+       \  (2) Recursing over cg_edges alone MISSES every dynamic call. You \
+       MUST UNION cg_dispatch inside the recursion or you silently drop all \
+       Celery / plugin-registry / signal paths and undercount.\n\
+       Use THIS shape for any such question (edit only the name):\n\
        \  WITH RECURSIVE up(id) AS (\n\
-       \    SELECT id FROM cg_nodes WHERE name='send_default_notification'\n\
+       \    SELECT id FROM cg_nodes WHERE name='session_query'\n\
        \    UNION SELECT e.src FROM up JOIN (SELECT src,dst FROM cg_edges \
        UNION SELECT src,dst FROM cg_dispatch) e ON e.dst=up.id)\n\
-       \  SELECT n.name,n.file FROM up JOIN cg_nodes n ON n.id=up.id;\n\
+       \  SELECT COUNT(*) FROM up;   -- transitive callers = blast radius\n\
        (flip e.dst=up.id -> e.src=up.id and select e.dst for callees / \
-       downstream reach.)\n\
+       downstream reach. To RANK functions by blast radius, run this closure \
+       per candidate and compare the counts — a single GROUP BY over direct \
+       cg_edges is one-hop in-degree, NOT blast radius.)\n\
        KEEP RESULTS SMALL: every row you return stays in context and is \
        re-read on every later turn. For a count/ranking answer with \
        COUNT(*) or GROUP BY, not the raw rows; SELECT name/file, not \
