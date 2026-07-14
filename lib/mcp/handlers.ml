@@ -97,7 +97,14 @@ let server_instructions st =
        need a function (-> graph_describe code_only) or config data \
        (-> grep that file)?'. Use graph_query for structural FACTS \
        (counts, rankings, caller sets, transitive closures); graph_describe \
-       for one named function."
+       for one named function. \
+       REUSE what you have pulled: before each query, check whether the \
+       answer already follows from results earlier in this session — one \
+       caller/closure result often answers several questions (blast radius, \
+       shared helpers, change impact) sliced differently, and a flow you \
+       already traced usually answers the later 'is this safe / where does \
+       it break' question without re-querying. Don't re-fetch what is \
+       already in context."
       coverage
   | _ -> ""
 
