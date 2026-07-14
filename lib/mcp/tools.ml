@@ -682,6 +682,14 @@ let tool_definitions = `List [
           "type", `String "integer";
           "description", `String "Row cap (default 300, max 1000).";
         ];
+        "allow_recursive", `Assoc [
+          "type", `String "boolean";
+          "description", `String
+            "A recursive closure over cg_edges/cg_dispatch (transitive \
+             callers / blast radius) is REDIRECTED to graph_blast_radius by \
+             default — don't hand-write it. Set true only for a genuinely \
+             different recursive traversal that graph_blast_radius can't do.";
+        ];
       ];
       "required", `List [`String "sql"];
     ];

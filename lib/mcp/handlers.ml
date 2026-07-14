@@ -1330,12 +1330,36 @@ let handle_graph_query st args =
   let low = String.lowercase_ascii (String.trim sql) in
   let starts p =
     String.length low >= String.length p && String.sub low 0 (String.length p) = p in
+  let has needle =
+    let nl = String.length needle and hl = String.length low in
+    let rec go i =
+      if i + nl > hl then false
+      else if String.sub low i nl = needle then true else go (i + 1) in
+    nl = 0 || go 0 in
+  let allow_recursive =
+    try args |> member "allow_recursive" |> to_bool with _ -> false in
+  (* A hand-written transitive closure over cg_edges/cg_dispatch IS what
+     graph_blast_radius does — redirect instead of running it, so the model
+     doesn't (redundantly) compute blast radius both ways. Escape hatch:
+     allow_recursive:true for a genuinely different recursive traversal. *)
+  let is_closure = has "recursive" && (has "cg_edges" || has "cg_dispatch") in
   if String.trim sql = "" then
     Lwt.return (json_result (`Assoc [ "error", `String "graph_query: empty sql" ]))
   else if not (starts "select" || starts "with") then
     Lwt.return (json_result (`Assoc [
       "error", `String
         "graph_query: only a single read-only SELECT/WITH query is allowed." ]))
+  else if is_closure && not allow_recursive then
+    Lwt.return (json_result (`Assoc [
+      "error", `String
+        "This is a transitive-closure over the call edges — i.e. blast \
+         radius / transitive callers. Do NOT hand-write it; call \
+         graph_blast_radius(name:<function>) instead — it runs exactly this \
+         (dispatch-inclusive) and returns direct + transitive counts + a \
+         by-file breakdown, in one call. Writing the recursion yourself is \
+         redundant and slower. If you genuinely need a DIFFERENT recursive \
+         traversal (not a caller/callee closure), pass allow_recursive:true.";
+      "use_instead", `String "graph_blast_radius" ]))
   else begin
     (try D.exec db "PRAGMA query_only=ON" with _ -> ());
     let result =
