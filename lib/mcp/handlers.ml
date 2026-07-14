@@ -801,14 +801,15 @@ let handle_graph_init st args =
              point `root` at a standalone repo root (target discovery \
              skips paths nested inside another git repo)."
           else
-            "Graph loaded. Now annotate leaves-first: call \
-             graph_next_batch, write a short but comprehensive \
-             description for every returned function (lead with the \
-             binding name for _tmp_lambda nodes), post them with \
-             graph_set_descriptions, \
-             and repeat until remaining = 0. For large graphs, split \
-             batches across parallel subagents — ready units are \
-             independent." in
+            "Graph loaded. Annotation is leaves-first and runs ONE BATCH \
+             PER AGENT: each agent calls graph_next_batch once, writes a \
+             short but comprehensive description for every returned \
+             function (lead with the binding name for _tmp_lambda nodes), \
+             posts them with graph_set_descriptions, and exits. Do not \
+             loop batches in one context — the cost per function grows \
+             with the history you carry. Annotate in parallel by \
+             launching many short-lived agents instead; batches are \
+             leased, so concurrent agents get disjoint units." in
         Lwt.return (json_result (`Assoc [
           "lang", `String lang;
           "root", `String root;
@@ -887,11 +888,25 @@ let cg_abs_file db file =
     | _ -> file
   else file
 
+(* Identifies the annotator holding a batch's leases. Callers that don't
+   pass one get a fresh token, so an absent `owner` still yields disjoint
+   batches — it only costs the caller the ability to name its own claims. *)
+let owner_token args =
+  let open Yojson.Safe.Util in
+  match (try args |> member "owner" |> to_string with _ -> "") with
+  | "" ->
+    Printf.sprintf "anon-%d-%06d" (Unix.getpid ()) (Random.int 1_000_000)
+  | o -> o
+
 let handle_graph_next_batch st args =
   let open Yojson.Safe.Util in
   let limit = try args |> member "limit" |> to_int with _ -> 5 in
   let db = ensure_db st in
-  let sccs = Cg.ready_sccs db ~limit:(max 1 limit) in
+  (* Claim the units as we hand them out: this call used to be a pure
+     read, so every concurrent annotator got the identical batch and
+     redid the same work. *)
+  let sccs =
+    Cg.acquire_ready_sccs db ~owner:(owner_token args) ~limit:(max 1 limit) in
   let unit_json scc =
     let members = Cg.scc_members db ~scc in
     let callees = Cg.scc_callee_descriptions db ~scc in
@@ -927,37 +942,55 @@ let handle_graph_next_batch st args =
        description (usually 1-2 sentences: what it does, its \
        type/signature, and anything non-obvious a caller must know), \
        using `callees` descriptions for context. \
-       Recursive units: describe the group together. Then call \
-       graph_set_descriptions with {id, description} for each, and call \
-       graph_next_batch again until remaining = 0.";
+       Recursive units: describe the group together. Post them with \
+       graph_set_descriptions, then STOP — do not loop back for another \
+       batch. To annotate the rest, start a fresh agent per batch: each \
+       call leases what it returns, so concurrent agents get disjoint \
+       work, and a short-lived agent doesn't re-read a growing history on \
+       every batch.";
   ]))
 
 let handle_graph_set_descriptions st args =
   let open Yojson.Safe.Util in
   let db = ensure_db st in
   let items = try args |> member "descriptions" |> to_list with _ -> [] in
-  let written =
-    List.fold_left (fun acc j ->
+  (* [written] counts rows that actually changed, not items received: an
+     id that matches no node updates nothing, and reporting it as written
+     would tell an annotator its work landed when it was dropped. Those
+     ids come back in `unknown_ids` so the caller can repost them. *)
+  let (written_ids, unknown_ids) =
+    List.fold_left (fun (ok, bad) j ->
       match (try Some (j |> member "id" |> to_string) with _ -> None),
             (try Some (j |> member "description" |> to_string) with _ -> None)
       with
       | Some id, Some d when String.trim d <> "" ->
-        Cg.set_description db ~id ~description:d ~code_hash:None;
-        acc + 1
-      | _ -> acc) 0 items in
+        if Cg.set_description db ~id ~description:d ~code_hash:None
+        then (id :: ok, bad) else (ok, id :: bad)
+      | Some id, _ -> (ok, id :: bad)   (* empty/absent description *)
+      | None, _ -> (ok, bad)) ([], []) items in
+  let written = List.length written_ids in
+  (* Descriptions are in: let go of the units they belong to instead of
+     parking them until the lease expires. *)
+  (try Cg.release_leases_for_nodes db ~ids:written_ids with _ -> ());
   let (total, described, ready) = Cg.status db in
   (* Dispatch edges are derived from the descriptions; once every function
      is annotated, (re)materialise them so graph_neighborhood can traverse
      dynamic-dispatch paths. *)
   if total > 0 && described >= total then
     (try Cg.populate_dispatch_edges db with _ -> ());
-  Lwt.return (json_result (`Assoc [
+  Lwt.return (json_result (`Assoc ([
     "written", `Int written;
+    "unknown_ids", `List (List.rev_map (fun i -> `String i) unknown_ids);
     "total", `Int total;
     "described", `Int described;
     "remaining", `Int (total - described);
     "ready_units", `Int ready;
-  ]))
+  ] @ (if unknown_ids = [] then [] else [
+    "note", `String
+      "unknown_ids were NOT written — no function has that id, or the \
+       description was empty. Repost them with the exact `id` strings from \
+       graph_next_batch.";
+  ]))))
 
 let handle_graph_describe st args =
   let open Yojson.Safe.Util in

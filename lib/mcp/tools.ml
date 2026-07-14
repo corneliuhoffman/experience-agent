@@ -233,10 +233,12 @@ let tool_definitions = `List [
        (static analysis — can take minutes on big repos), loads the \
        resulting nodes+edges into .urme/db.sqlite with SCC/topo order, \
        and reports how many functions await description. YOU then \
-       produce the annotations: loop graph_next_batch -> write \
-       short-but-comprehensive descriptions -> graph_set_descriptions until \
-       remaining = 0 (parallel subagents are safe: ready units are \
-       independent). Requires the opengrep-interfile-graph binary on \
+       produce the annotations, one batch per agent: launch a fresh \
+       short-lived subagent per batch (graph_next_batch -> write \
+       short-but-comprehensive descriptions -> graph_set_descriptions -> \
+       exit), many in parallel, until remaining = 0. Batches are leased, \
+       so concurrent agents get disjoint units; never loop batches in one \
+       context. Requires the opengrep-interfile-graph binary on \
        PATH or via URME_OPENGREP_EXPORTER. Replaces any existing graph \
        for the project.";
     "inputSchema", `Assoc [
@@ -274,9 +276,10 @@ let tool_definitions = `List [
     "description", `String
       "Progress of the annotated call graph for this repo. Returns \
        {total, described, remaining, ready_units}. `ready_units` is how \
-       many SCC-units can be described right now (all their cross-SCC \
-       callees already have descriptions). remaining=0 means fully \
-       annotated.";
+       many SCC-units could be handed out right now: their cross-SCC \
+       callees are described and no annotator currently holds them. It \
+       measures free work, not progress — use `remaining` for that; \
+       remaining=0 means fully annotated.";
     "inputSchema", `Assoc [
       "type", `String "object";
       "properties", `Assoc [];
@@ -286,10 +289,12 @@ let tool_definitions = `List [
   `Assoc [
     "name", `String "graph_next_batch";
     "description", `String
-      "Drive the leaves-first describe-loop. Returns up to `limit` \
-       SCC-units that are READY to describe: every unit's cross-SCC \
-       callees already have descriptions (included, so you can write \
-       informed summaries). For each function in `functions`, write a \
+      "Take ONE batch of the leaves-first annotation work. Returns up to \
+       `limit` SCC-units that are READY to describe: every unit's \
+       cross-SCC callees already have descriptions (included, so you can \
+       write informed summaries), and the returned units are LEASED to \
+       you for a few minutes, so other agents calling this concurrently \
+       get different units. For each function in `functions`, write a \
        SHORT BUT COMPREHENSIVE description (usually 1-2 sentences) — what \
        it does and its type/signature, plus anything non-obvious a caller \
        must know (side effects, security relevance, error behaviour). \
@@ -299,14 +304,23 @@ let tool_definitions = `List [
        are lambdas: START their description with the real binding name \
        visible in the code (e.g. \"notSolved: (challenge) => ...\") so \
        name searches can find them. Then call `graph_set_descriptions` \
-       with a {id, description} for every function returned, and call \
-       this again. Repeat until `graph_status` shows remaining=0.";
+       with a {id, description} for every function returned — and EXIT. \
+       Do not call this again in the same context: each extra batch \
+       re-reads your whole accumulated history, which costs far more per \
+       function than starting over. To finish a graph, run many \
+       short-lived agents that each do one batch.";
     "inputSchema", `Assoc [
       "type", `String "object";
       "properties", `Assoc [
         "limit", `Assoc [
           "type", `String "integer";
           "description", `String "Max SCC-units to return (default 5).";
+        ];
+        "owner", `Assoc [
+          "type", `String "string";
+          "description", `String
+            "Optional token naming this annotator, recorded on the \
+             leases it takes (default: generated).";
         ];
       ];
       "required", `List [];
@@ -317,8 +331,10 @@ let tool_definitions = `List [
     "description", `String
       "Write function descriptions back into the graph. Pass \
        `descriptions` as an array of {id, description}, using the exact \
-       `id` values from `graph_next_batch`. Returns updated progress \
-       counts.";
+       `id` values from `graph_next_batch`. Releases the batch's leases. \
+       Returns progress counts plus `written` (rows actually updated) and \
+       `unknown_ids` (ids that matched no function, or had an empty \
+       description — those were NOT stored; check this and repost them).";
     "inputSchema", `Assoc [
       "type", `String "object";
       "properties", `Assoc [

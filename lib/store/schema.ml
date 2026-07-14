@@ -309,6 +309,21 @@ let migration_10 = [
   {|CREATE INDEX IF NOT EXISTS cg_dispatch_src_idx ON cg_dispatch(src)|};
 ]
 
+(* Migration 11: SCC leases. graph_next_batch used to be a pure read, so
+   N concurrent annotators were handed the identical frontier and redid
+   each other's work. One row per claimed SCC, with an expiry, lets
+   next_batch hand out disjoint units. Advisory only: a lease never gates
+   a write, and an expired one (crashed annotator) is ignored — so a
+   missing or stale row can lose throughput, never correctness. *)
+let migration_11 = [
+  {|CREATE TABLE IF NOT EXISTS cg_leases (
+      scc         INTEGER PRIMARY KEY,   -- cg_nodes.scc under claim
+      owner       TEXT,                  -- opaque token of the claimant
+      lease_until REAL NOT NULL          -- unix time; <= now means expired
+    )|};
+  {|CREATE INDEX IF NOT EXISTS cg_leases_until_idx ON cg_leases(lease_until)|};
+]
+
 let migrations = [
   1, migration_1;
   2, migration_2;
@@ -320,6 +335,7 @@ let migrations = [
   8, migration_8;
   9, migration_9;
   10, migration_10;
+  11, migration_11;
 ]
 
 (* --- meta helpers --- *)

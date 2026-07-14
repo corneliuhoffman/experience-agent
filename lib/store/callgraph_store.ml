@@ -41,7 +41,10 @@ let ib i = S.Data.INT (Int64.of_int i)
 let clear db =
   D.exec db "DELETE FROM cg_edges";
   D.exec db "DELETE FROM cg_fts";
-  D.exec db "DELETE FROM cg_nodes"
+  D.exec db "DELETE FROM cg_nodes";
+  (* SCC numbers are reassigned by the next compute_scc_topo, so leases
+     from the old graph would name units that no longer exist. *)
+  D.exec db "DELETE FROM cg_leases"
 
 let insert_node db ~lang (n : node) =
   D.exec_params db
@@ -121,24 +124,85 @@ let compute_scc_topo db =
         [ ib c; ib c; t id ])
       ids)
 
+(* ---------- leases ---------- *)
+
+(* How long a claim from [acquire_ready_sccs] parks an SCC before it
+   returns to the frontier. Sized for one annotator's batch: long enough
+   to read a handful of functions and write their summaries, short enough
+   that a crashed worker's units come back within one cycle rather than
+   wedging the graph. Leases are advisory throughput control, never a
+   correctness barrier — [set_description] never checks one. *)
+let lease_ttl_seconds = 300.0
+
 (* ---------- frontier (ready to describe) ---------- *)
 
 (* An SCC is ready when it has at least one undescribed member and every
-   cross-SCC callee of every member is already described. Returned
-   leaves-first. *)
+   cross-SCC callee of every member is already described. Kept as one
+   string so the frontier query and its COUNT (see [status]) cannot
+   drift apart. Written against the alias `n` over cg_nodes. *)
+let ready_where =
+  "EXISTS (SELECT 1 FROM cg_nodes u \
+           WHERE u.scc=n.scc AND u.description IS NULL) \
+   AND NOT EXISTS (SELECT 1 FROM cg_edges e \
+         JOIN cg_nodes s ON s.id=e.src \
+         JOIN cg_nodes d ON d.id=e.dst \
+         WHERE s.scc=n.scc AND d.scc<>n.scc \
+           AND d.description IS NULL)"
+
+(* ...and not claimed by another annotator. An expired lease is invisible
+   here, so a crashed worker's units free themselves. Takes one param:
+   the current time. *)
+let unleased_where =
+  "NOT EXISTS (SELECT 1 FROM cg_leases l \
+               WHERE l.scc=n.scc AND l.lease_until > ?)"
+
+let now () = Unix.gettimeofday ()
+let fl f = S.Data.FLOAT f
+
+(* Ready units, leaves-first, excluding anything under a live lease. Pure
+   read: it hands the same batch to every concurrent caller, so annotators
+   should go through [acquire_ready_sccs] instead. *)
 let ready_sccs db ~limit =
   D.query_list db
-    "SELECT n.scc FROM cg_nodes n \
-     WHERE EXISTS (SELECT 1 FROM cg_nodes u \
-                   WHERE u.scc=n.scc AND u.description IS NULL) \
-       AND NOT EXISTS (SELECT 1 FROM cg_edges e \
-             JOIN cg_nodes s ON s.id=e.src \
-             JOIN cg_nodes d ON d.id=e.dst \
-             WHERE s.scc=n.scc AND d.scc<>n.scc \
-               AND d.description IS NULL) \
-     GROUP BY n.scc ORDER BY MIN(n.topo) ASC LIMIT ?"
-    [ ib limit ]
+    (Printf.sprintf
+       "SELECT n.scc FROM cg_nodes n WHERE %s AND %s \
+        GROUP BY n.scc ORDER BY MIN(n.topo) ASC LIMIT ?"
+       ready_where unleased_where)
+    [ fl (now ()); ib limit ]
     ~f:(fun c -> D.data_to_int c.(0))
+
+(* Take the next [limit] ready units AND claim them for [owner] in one
+   transaction, so two concurrent annotators cannot both be handed the
+   same SCC. BEGIN IMMEDIATE: the select must hold the write lock, or the
+   claims race. Expired rows are reaped on the way past. *)
+let acquire_ready_sccs db ~owner ~limit =
+  D.with_immediate_txn db (fun () ->
+    let t0 = now () in
+    D.exec_params db "DELETE FROM cg_leases WHERE lease_until <= ?" [ fl t0 ];
+    let sccs = ready_sccs db ~limit in
+    let until = t0 +. lease_ttl_seconds in
+    List.iter (fun scc ->
+      D.exec_params db
+        "INSERT INTO cg_leases(scc,owner,lease_until) VALUES(?,?,?) \
+         ON CONFLICT(scc) DO UPDATE SET \
+           owner=excluded.owner, lease_until=excluded.lease_until"
+        [ ib scc; t owner; fl until ])
+      sccs;
+    sccs)
+
+(* Drop the claims on whatever units these nodes belong to — called once
+   their descriptions land, so the units don't sit leased until the TTL
+   runs out. Unknown ids simply match no SCC. *)
+let release_leases_for_nodes db ~ids =
+  match ids with
+  | [] -> ()
+  | _ ->
+    let ph = String.concat "," (List.map (fun _ -> "?") ids) in
+    D.exec_params db
+      (Printf.sprintf
+         "DELETE FROM cg_leases WHERE scc IN \
+          (SELECT scc FROM cg_nodes WHERE id IN (%s))" ph)
+      (List.map t ids)
 
 let node_of_cols c = {
   id = D.data_to_string c.(0);
@@ -168,31 +232,58 @@ let scc_callee_descriptions db ~scc =
 
 (* ---------- write-back ---------- *)
 
+(* Returns whether a node actually took the description. An UPDATE on an
+   id that doesn't exist matches 0 rows and raises nothing, so without
+   this the caller cannot tell a write from a typo — and an annotator
+   posting a malformed id would be told it succeeded while its work went
+   nowhere. Ask SQLite what changed rather than assuming. *)
 let set_description db ~id ~description ~code_hash =
   D.exec_params db
     "UPDATE cg_nodes SET description=?, code_hash=?, described_at=? WHERE id=?"
     [ t description;
       (match code_hash with Some h -> t h | None -> S.Data.NULL);
-      S.Data.FLOAT (Unix.gettimeofday ());
+      fl (now ());
       t id ];
-  (* Keep the FTS row in sync (delete + reinsert; FTS5 has no stable
-     external rowid to UPDATE by here). *)
-  D.exec_params db "DELETE FROM cg_fts WHERE node_id=?" [ t id ];
-  D.exec_params db
-    "INSERT INTO cg_fts(node_id,name,description) \
-     SELECT id,name,? FROM cg_nodes WHERE id=?"
-    [ t description; t id ]
+  let updated = D.changes db > 0 in
+  if updated then begin
+    (* Keep the FTS row in sync (delete + reinsert; FTS5 has no stable
+       external rowid to UPDATE by here). *)
+    D.exec_params db "DELETE FROM cg_fts WHERE node_id=?" [ t id ];
+    D.exec_params db
+      "INSERT INTO cg_fts(node_id,name,description) \
+       SELECT id,name,? FROM cg_nodes WHERE id=?"
+      [ t description; t id ]
+  end;
+  updated
 
 (* ---------- status ---------- *)
 
 let count db sql = D.query_fold db sql [] ~init:0 ~f:(fun _ c -> D.data_to_int c.(0))
 
+(* Size of the frontier. COUNT over the same predicate [ready_sccs]
+   selects on — this used to materialise every ready SCC into a list just
+   to take its length, on a path that graph_status, graph_next_batch and
+   graph_set_descriptions all hit.
+
+   Leased units are deliberately EXCLUDED, matching [ready_sccs]: the
+   number answers "how much work could another annotator pick up right
+   now", which is what a caller uses to decide whether to spawn more
+   annotators. Counting claimed units would advertise work that
+   graph_next_batch would then refuse to hand out. Overall progress is
+   [total]/[described], which leases don't touch. *)
+let count_ready_sccs db =
+  D.query_fold db
+    (Printf.sprintf
+       "SELECT COUNT(*) FROM (SELECT n.scc FROM cg_nodes n \
+        WHERE %s AND %s GROUP BY n.scc)"
+       ready_where unleased_where)
+    [ fl (now ()) ] ~init:0 ~f:(fun _ c -> D.data_to_int c.(0))
+
 let status db =
   let total = count db "SELECT COUNT(*) FROM cg_nodes" in
   let described =
     count db "SELECT COUNT(*) FROM cg_nodes WHERE description IS NOT NULL" in
-  let ready = List.length (ready_sccs db ~limit:1_000_000) in
-  (total, described, ready)
+  (total, described, count_ready_sccs db)
 
 (* Is the session/turn memory index populated? Gates the memory-search
    tools out of the advertised surface on a graph-only project, so their

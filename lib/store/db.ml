@@ -38,6 +38,12 @@ let exec_params db sql params =
    | _ -> fail db (Printf.sprintf "exec_params failed: %s" sql));
   ignore (S.finalize stmt)
 
+(* Rows actually inserted/updated/deleted by the most recent write on this
+   connection. An UPDATE whose WHERE matches nothing is not an error in
+   SQLite — it silently changes 0 rows — so a caller that needs to know
+   whether its write landed must ask. *)
+let changes db = S.changes db
+
 (* Insert that returns last_insert_rowid. *)
 let insert_returning_id db sql params =
   exec_params db sql params;
@@ -81,11 +87,20 @@ let query_rows ?(max_rows = 500) db sql =
   (headers, List.rev rows_rev, truncated)
 
 (* Transaction wrapper — rolls back on exception. *)
-let with_txn db f =
-  exec db "BEGIN";
+let txn_with db begin_stmt f =
+  exec db begin_stmt;
   match f () with
   | v -> exec db "COMMIT"; v
   | exception e -> (try exec db "ROLLBACK" with _ -> ()); raise e
+
+let with_txn db f = txn_with db "BEGIN" f
+
+(* Read-then-write under one lock. A plain BEGIN is deferred: it takes the
+   write lock only at the first write, so two connections can both read the
+   same rows and then race to update them. BEGIN IMMEDIATE takes it up
+   front, which is what a select-then-claim (see Callgraph_store leases)
+   needs to be atomic across processes. *)
+let with_immediate_txn db f = txn_with db "BEGIN IMMEDIATE" f
 
 (* Convenience accessors for Sqlite3.Data.t. *)
 let data_to_string = function
