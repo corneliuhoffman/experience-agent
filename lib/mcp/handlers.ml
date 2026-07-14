@@ -95,9 +95,14 @@ let server_instructions st =
        functions). If you catch yourself about to Read a source file, \
        first ask 'which summary failed to answer this, and is the code I \
        need a function (-> graph_describe code_only) or config data \
-       (-> grep that file)?'. Use graph_query for structural FACTS \
-       (counts, rankings, caller sets, transitive closures); graph_describe \
-       for one named function. \
+       (-> grep that file)?'. For BLAST RADIUS / change impact / 'how \
+       widely used is X' / transitive callers or callees, use the \
+       graph_blast_radius tool (name a function; it runs the dispatch- \
+       inclusive transitive closure for you and returns direct + \
+       transitive counts + a by-file breakdown — do NOT hand-write a \
+       recursive graph_query for this, you will get it wrong). Use \
+       graph_query for other structural FACTS (counts, rankings, caller \
+       sets, filters); graph_describe for one named function. \
        REUSE what you have pulled: before each query, check whether the \
        answer already follows from results earlier in this session — one \
        caller/closure result often answers several questions (blast radius, \
