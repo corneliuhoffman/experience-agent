@@ -52,8 +52,11 @@ let server_instructions st =
     Printf.sprintf
       "This project's call graph is built but only %d of %d functions are \
        ANNOTATED. Your ONLY job this session is to annotate the rest, right \
-       here — a plain loop, no sub-agents, no plans, no TODO lists. Repeat \
-       these three steps until done:\n\
+       here — a plain loop, no sub-agents, no plans, no TODO lists. \
+       Use ONLY the graph_* tools. Do NOT run Bash, write or execute \
+       scripts, Read files, or grep — every function's full source is \
+       already handed to you in each batch's `code` field, so there is \
+       nothing to fetch. Repeat these three steps until done:\n\
        1. Call graph_next_batch. It hands you a batch of functions whose \
        callees are ALREADY described (their summaries come back in \
        `callees`).\n\
@@ -88,7 +91,13 @@ let server_instructions st =
        rankings, deepest/widest). graph_query runs a read-only SQL SELECT \
        over the graph and answers in ONE call what would otherwise mean \
        building your own AST analyzer. Do NOT hand-roll a call-graph \
-       analyzer when these tools exist. \
+       analyzer when these tools exist. NEVER write or run scripts \
+       (Bash/Python) to analyze the codebase's structure, and never \
+       grep/Read to COMPUTE callers, blast radius, dead code, or flows — \
+       the graph_* tools already hold that, precomputed and correct; a \
+       hand-rolled analyzer will be slower and wrong. (Reading source is \
+       only for the rare exact verbatim token, via graph_describe \
+       code_only.) \
        For an UNDERSTAND / DEBUG / REVIEW / 'how does X work' question, \
        start with graph_search on a few concrete nouns (small limit) and \
        answer from the top summaries. TRUST THE SUMMARIES: each was \
@@ -970,8 +979,10 @@ let handle_graph_next_batch st args =
          alone). Post ALL via graph_set_descriptions [{id,description},...], \
          then call graph_next_batch with by_file:true AGAIN for the next \
          file — loop in THIS session until the batch comes back empty. No \
-         sub-agents, no plan; each batch is self-contained (you need nothing \
-         from prior batches, so a compaction between them loses nothing)." ]))
+         sub-agents, no plan, no scripts: the full `code` of every function \
+         is right here in the batch, so do NOT Bash / Read files / grep. \
+         Each batch is self-contained (you need nothing from prior batches, \
+         so a compaction between them loses nothing)." ]))
   end
   else begin
   (* Bigger default batch: in a single-session loop, fewer/larger batches
@@ -1025,8 +1036,9 @@ let handle_graph_next_batch st args =
        descriptions=[{\"id\": <exact id from this batch>, \"description\": \
        <your text>}, ...]. (4) Then call graph_next_batch AGAIN for the \
        next batch and repeat — keep looping in THIS session until a batch \
-       comes back empty. No sub-agents, no plan, no TODO list — just call \
-       the tools in a loop. \
+       comes back empty. No sub-agents, no plan, no TODO list, no scripts \
+       — the full `code` of each function is in the batch, so do NOT Bash / \
+       Read files / grep; just call the tools in a loop. \
        recursive:true units are mutually-recursive — describe them \
        together. Synthetic names (_tmp_lambda) are lambdas — START the \
        description with the real binding name from the code so searches \
