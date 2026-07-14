@@ -166,7 +166,7 @@ let ready_sccs db ~limit =
   D.query_list db
     (Printf.sprintf
        "SELECT n.scc FROM cg_nodes n WHERE %s AND %s \
-        GROUP BY n.scc ORDER BY MIN(n.topo) ASC LIMIT ?"
+        GROUP BY n.scc ORDER BY MIN(n.file), MIN(n.topo) ASC LIMIT ?"
        ready_where unleased_where)
     [ fl (now ()); ib limit ]
     ~f:(fun c -> D.data_to_int c.(0))
