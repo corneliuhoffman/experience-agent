@@ -313,9 +313,20 @@ let tool_definitions = `List [
     "inputSchema", `Assoc [
       "type", `String "object";
       "properties", `Assoc [
+        "by_file", `Assoc [
+          "type", `String "boolean";
+          "description", `String
+            "RECOMMENDED for bulk annotation. Return one whole FILE (or \
+             cyclic file-group) per unit — all its functions together, in \
+             dependency order — instead of scattered SCC units. Read each \
+             file once, describe it as a module: fewer round-trips, better \
+             locality, self-contained. Default false (function-level SCCs).";
+        ];
         "limit", `Assoc [
           "type", `String "integer";
-          "description", `String "Max SCC-units to return (default 5).";
+          "description", `String
+            "Max units per batch (SCC-units, default 5; files when \
+             by_file:true, default 6).";
         ];
         "owner", `Assoc [
           "type", `String "string";

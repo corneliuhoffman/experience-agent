@@ -220,6 +220,95 @@ let scc_members db ~scc =
      FROM cg_nodes WHERE scc=? ORDER BY topo,start_line"
     [ ib scc ] ~f:node_of_cols
 
+(* ---------- file-level annotation units ---------- *)
+
+(* Condense FILES into file-SCCs (files that mutually call each other),
+   leaves-first. A file-SCC is READY when every file-SCC it depends on is
+   already fully described, so a whole module can be summarised in ONE
+   self-contained pass: read the files once, describe all their functions
+   with the cross-file callees' summaries as context. Each unit is fully
+   self-describing — annotation needs no memory between units. *)
+type file_unit = {
+  ufiles   : string list;
+  ufns     : node list;                       (* undescribed fns, topo order *)
+  ucallees : (string * string option) list;   (* cross-file callee summaries *)
+}
+
+let all_files db =
+  D.query_list db "SELECT DISTINCT file FROM cg_nodes" []
+    ~f:(fun c -> D.data_to_string c.(0))
+
+let cross_file_edges db =
+  D.query_list db
+    "SELECT DISTINCT s.file, d.file FROM cg_edges e \
+       JOIN cg_nodes s ON s.id=e.src JOIN cg_nodes d ON d.id=e.dst \
+       WHERE s.file<>d.file \
+     UNION \
+     SELECT DISTINCT s.file, d.file FROM cg_dispatch g \
+       JOIN cg_nodes s ON s.id=g.src JOIN cg_nodes d ON d.id=g.dst \
+       WHERE s.file<>d.file"
+    [] ~f:(fun c -> (D.data_to_string c.(0), D.data_to_string c.(1)))
+
+let next_ready_file_units db ~limit =
+  let files = all_files db in
+  let cfe = cross_file_edges db in
+  let g = Gr.create () in
+  List.iter (fun f -> Gr.add_vertex g f) files;
+  List.iter (fun (s, d) ->
+    if Gr.mem_vertex g s && Gr.mem_vertex g d then Gr.add_edge g s d) cfe;
+  let (_n, comp_of) = Comp.scc g in
+  let undesc = Hashtbl.create 512 in
+  List.iter (fun (f, n) -> Hashtbl.replace undesc f n)
+    (D.query_list db
+       "SELECT file, SUM(CASE WHEN description IS NULL THEN 1 ELSE 0 END) \
+        FROM cg_nodes GROUP BY file" []
+       ~f:(fun c -> (D.data_to_string c.(0), D.data_to_int c.(1))));
+  let comp_undesc = Hashtbl.create 256 in
+  List.iter (fun f ->
+    let c = comp_of f in
+    let u = try Hashtbl.find undesc f with Not_found -> 0 in
+    Hashtbl.replace comp_undesc c
+      ((try Hashtbl.find comp_undesc c with Not_found -> 0) + u)) files;
+  let fully c = (try Hashtbl.find comp_undesc c with Not_found -> 0) = 0 in
+  let out = Hashtbl.create 256 in
+  List.iter (fun (sf, df) ->
+    let cs = comp_of sf and cd = comp_of df in
+    if cs <> cd then begin
+      let s = try Hashtbl.find out cs with Not_found -> [] in
+      if not (List.mem cd s) then Hashtbl.replace out cs (cd :: s)
+    end) cfe;
+  let comps = List.sort_uniq compare (List.map comp_of files) in
+  (* ready: not fully described AND every downstream file-SCC fully described.
+     ocamlgraph numbers callees below callers, so ascending comp id is
+     leaves-first. *)
+  let ready =
+    List.filter (fun c ->
+      (not (fully c))
+      && List.for_all fully (try Hashtbl.find out c with Not_found -> []))
+      comps
+    |> List.sort compare in
+  let rec take n = function
+    | [] -> [] | _ when n <= 0 -> [] | x :: r -> x :: take (n - 1) r in
+  List.map (fun c ->
+    let cfiles = List.filter (fun f -> comp_of f = c) files in
+    let ph = String.concat "," (List.map (fun _ -> "?") cfiles) in
+    let ufns = D.query_list db
+      (Printf.sprintf
+        "SELECT id,name,file,start_line,end_line,end_exact,kind FROM cg_nodes \
+         WHERE description IS NULL AND file IN (%s) ORDER BY file,topo,start_line"
+        ph)
+      (List.map t cfiles) ~f:node_of_cols in
+    let ucallees = D.query_list db
+      (Printf.sprintf
+        "SELECT DISTINCT d.name, d.description FROM cg_edges e \
+           JOIN cg_nodes s ON s.id=e.src JOIN cg_nodes d ON d.id=e.dst \
+           WHERE s.file IN (%s) AND d.file NOT IN (%s) \
+             AND d.description IS NOT NULL"
+        ph ph)
+      (List.map t cfiles @ List.map t cfiles)
+      ~f:(fun c -> (D.data_to_string c.(0), D.data_to_string_opt c.(1))) in
+    { ufiles = cfiles; ufns; ucallees }) (take limit ready)
+
 (* Cross-SCC callees (already described) of any member of this SCC. *)
 let scc_callee_descriptions db ~scc =
   D.query_list db

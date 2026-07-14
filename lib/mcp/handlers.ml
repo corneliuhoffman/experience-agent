@@ -932,10 +932,51 @@ let owner_token args =
 
 let handle_graph_next_batch st args =
   let open Yojson.Safe.Util in
+  let db = ensure_db st in
+  let by_file = try args |> member "by_file" |> to_bool with _ -> false in
+  if by_file then begin
+    (* File-granularity: one whole module (or cyclic file-group) per unit,
+       read once, all its functions described together. Fewer round-trips,
+       better locality, self-contained. Default 6 files/batch. *)
+    let flimit = max 1 (try args |> member "limit" |> to_int with _ -> 6) in
+    let units = try Cg.next_ready_file_units db ~limit:flimit with _ -> [] in
+    let file_unit_json (u : Cg.file_unit) =
+      let fns = List.map (fun (m : Cg.node) ->
+        let code = Urme_engine.Callgraph_load.extract_code
+            ~file:(cg_abs_file db m.file)
+            ~start_line:m.start_line ~end_line:m.end_line in
+        `Assoc [
+          "id", `String m.id; "name", `String m.name; "file", `String m.file;
+          "start_line", `Int m.start_line; "end_line", `Int m.end_line;
+          "kind", `String m.kind; "code", `String code ]) u.ufns in
+      `Assoc [
+        "files", `List (List.map (fun f -> `String f) u.ufiles);
+        "functions", `List fns;
+        "callees", `List (List.map desc_pair u.ucallees) ] in
+    let (total, described, ready) = Cg.status db in
+    Lwt.return (json_result (`Assoc [
+      "mode", `String "by_file";
+      "total", `Int total; "described", `Int described;
+      "remaining", `Int (total - described); "ready_units", `Int ready;
+      "batch", `List (List.map file_unit_json units);
+      "note", `String
+        "BY-FILE batch: each item in `batch` is one file (or a cyclic file- \
+         group, in `files`) whose dependencies are already described. Read \
+         the file(s) as a module and describe EVERY function in `functions` \
+         in one pass — 1-3 sentences each: what it does + signature + \
+         non-obvious behaviour + BUGS, and FOLD IN the `callees` gotchas (a \
+         callee that silently fails / swallows errors / matches by strict \
+         equality / skips on a missed run: say it so the summary stands \
+         alone). Post ALL via graph_set_descriptions [{id,description},...], \
+         then call graph_next_batch with by_file:true AGAIN for the next \
+         file — loop in THIS session until the batch comes back empty. No \
+         sub-agents, no plan; each batch is self-contained (you need nothing \
+         from prior batches, so a compaction between them loses nothing)." ]))
+  end
+  else begin
   (* Bigger default batch: in a single-session loop, fewer/larger batches
      mean fewer round-trips (the whole cost is turns × growing context). *)
   let limit = try args |> member "limit" |> to_int with _ -> 25 in
-  let db = ensure_db st in
   (* Claim the units as we hand them out: this call used to be a pure
      read, so every concurrent annotator got the identical batch and
      redid the same work. *)
@@ -997,6 +1038,7 @@ let handle_graph_next_batch st args =
        equality, so a missed daily run skips that cert permanently; plugin \
        send errors are swallowed (metrics+Sentry only).\"";
   ]))
+  end
 
 let handle_graph_set_descriptions st args =
   let open Yojson.Safe.Util in
