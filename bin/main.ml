@@ -296,7 +296,11 @@ let annotate_cmd =
   let parallel =
     Arg.(value & opt int 6 & info ["parallel"; "j"] ~docv:"N"
            ~doc:"Parallel model calls / files in flight (default 6).") in
-  let run model parallel project_dir =
+  let progress =
+    Arg.(value & opt int 20 & info ["progress"] ~docv:"N"
+           ~doc:"Print a progress line every ~N functions (default 20).") in
+  let run model parallel progress project_dir =
+    let progress = max 1 progress in
     let module Cg = Urme_store.Callgraph_store in
     let project_dir =
       if project_dir = "." then Sys.getcwd ()
@@ -312,7 +316,7 @@ let annotate_cmd =
       let last = ref (-1) in
       let rec loop () =
         let (total, described, _) = Cg.status db in
-        if !last < 0 || described - !last >= 100 || described >= total then
+        if !last < 0 || described - !last >= progress || described >= total then
           (Printf.printf "annotated %d/%d\n%!" described total; last := described);
         if described >= total then Lwt.return_unit
         else begin
@@ -343,7 +347,7 @@ let annotate_cmd =
            ~doc:"Annotate the call graph end-to-end: urme runs the loop, \
                  calling the model (default Haiku, headless, in parallel) \
                  only to write per-function summaries, leaves-first by file.")
-    Term.(const run $ model $ parallel $ project_dir)
+    Term.(const run $ model $ parallel $ progress $ project_dir)
 
 (* --- Default command: launch TUI on a TTY, MCP server otherwise.
        Claude Code spawns `urme` over stdio (no TTY), which trips the
