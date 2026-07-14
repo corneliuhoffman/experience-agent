@@ -223,6 +223,126 @@ let graph_build_cmd =
                  fills in per-function descriptions.")
     Term.(const run $ json $ project_dir)
 
+(* --- Subcommand: annotate ---
+   urme drives the whole annotation loop itself: it pulls ready file-units
+   leaves-first, prompts the model (headless, one file per prompt, N in
+   parallel) purely to WRITE the summaries, parses the JSON back, and writes
+   descriptions — until the graph is fully annotated. The model never sees a
+   batch, a limit, or a tool, so it cannot flail; it only produces prose. *)
+
+let annotate_system =
+  "You annotate functions in a code call graph. For each function you are \
+   given its `id` and full source, plus one-line summaries of the functions \
+   it calls in OTHER files. For EVERY function, write a 1-3 sentence \
+   description: what it does + signature + everything non-obvious a caller \
+   must know (side effects, security relevance, error/empty/edge behaviour, \
+   BUGS). Fold in load-bearing callee gotchas: if a function's behaviour \
+   depends on a callee that silently fails, swallows errors, matches by \
+   strict equality, or skips on a missed run, say so, so the summary stands \
+   alone. Output ONLY a JSON array [{\"id\":\"<id>\",\"description\":\"<text>\"}], \
+   one object per function, no prose and no markdown fences."
+
+let cg_abs db file =
+  if file <> "" && Filename.is_relative file then
+    match Urme_store.Schema.get_meta db "cg_root" with
+    | Some root when root <> "" -> Filename.concat root file
+    | _ -> file
+  else file
+
+let build_annot_prompt db (u : Urme_store.Callgraph_store.file_unit) =
+  let b = Buffer.create 4096 in
+  (if u.ucallees <> [] then begin
+     Buffer.add_string b
+       "CALLEES (functions these call in OTHER files, already summarized):\n";
+     List.iter (fun (n, d) ->
+       Buffer.add_string b
+         (Printf.sprintf "- %s: %s\n" n (match d with Some s -> s | None -> "")))
+       u.ucallees;
+     Buffer.add_char b '\n'
+   end);
+  Buffer.add_string b
+    (Printf.sprintf "FUNCTIONS TO DESCRIBE (file: %s):\n"
+       (String.concat ", " u.ufiles));
+  List.iter (fun (m : Urme_store.Callgraph_store.node) ->
+    let code = Urme_engine.Callgraph_load.extract_code
+        ~file:(cg_abs db m.file) ~start_line:m.start_line ~end_line:m.end_line in
+    Buffer.add_string b
+      (Printf.sprintf "\n--- id=%s  name=%s  (%s:%d)\n%s\n"
+         m.id m.name m.file m.start_line code)) u.ufns;
+  Buffer.add_string b "\nReturn ONLY the JSON array of {id, description}.";
+  Buffer.contents b
+
+let parse_annot raw =
+  match String.index_opt raw '[', String.rindex_opt raw ']' with
+  | Some i, Some j when j > i ->
+    (try
+       match Yojson.Safe.from_string (String.sub raw i (j - i + 1)) with
+       | `List items ->
+         List.filter_map (fun it -> match it with
+           | `Assoc a ->
+             (match List.assoc_opt "id" a, List.assoc_opt "description" a with
+              | Some (`String id), Some (`String d) when String.trim d <> "" ->
+                Some (id, d)
+              | _ -> None)
+           | _ -> None) items
+       | _ -> []
+     with _ -> [])
+  | _ -> []
+
+let annotate_cmd =
+  let model =
+    Arg.(value & opt string "claude-haiku-4-5" & info ["model"; "m"]
+           ~docv:"MODEL" ~doc:"Model to annotate with (default Haiku).") in
+  let parallel =
+    Arg.(value & opt int 6 & info ["parallel"; "j"] ~docv:"N"
+           ~doc:"Parallel model calls / files in flight (default 6).") in
+  let run model parallel project_dir =
+    let module Cg = Urme_store.Callgraph_store in
+    let project_dir =
+      if project_dir = "." then Sys.getcwd ()
+      else if Filename.is_relative project_dir
+      then Filename.concat (Sys.getcwd ()) project_dir else project_dir in
+    let config = Urme_core.Config.load () in
+    let db = Urme_store.Schema.open_or_create ~project_dir in
+    Lwt_main.run begin
+      let open Lwt.Syntax in
+      let* pool = Urme_claude.Prompts.spawn_pool
+          ~model ~size:(max 1 parallel)
+          ~system_prompt:annotate_system ~binary:config.claude_binary () in
+      let rec loop () =
+        let (total, described, _) = Cg.status db in
+        Printf.printf "\rannotating: %d/%d%!" described total;
+        if described >= total then Lwt.return_unit
+        else begin
+          let units = Cg.next_ready_file_units db ~limit:(max 1 parallel) in
+          if units = [] then
+            (Printf.printf "\nstuck: %d/%d described, no ready units\n" described total;
+             Lwt.return_unit)
+          else
+            let* () = Lwt_list.iter_p (fun (u : Cg.file_unit) ->
+              let prompt = build_annot_prompt db u in
+              let* raw =
+                Lwt.catch (fun () -> Urme_claude.Prompts.ask_via_pool pool ~prompt)
+                  (fun _ -> Lwt.return "") in
+              List.iter (fun (id, desc) ->
+                ignore (Cg.set_description db ~id ~description:desc ~code_hash:None))
+                (parse_annot raw);
+              Lwt.return_unit) units in
+            loop ()
+        end in
+      let* () = loop () in
+      let* () = Urme_claude.Prompts.close_pool pool in
+      let (total, described, _) = Cg.status db in
+      Printf.printf "\ndone: %d/%d annotated\n" described total;
+      Lwt.return_unit
+    end;
+    Urme_store.Schema.close db in
+  Cmd.v (Cmd.info "annotate"
+           ~doc:"Annotate the call graph end-to-end: urme runs the loop, \
+                 calling the model (default Haiku, headless, in parallel) \
+                 only to write per-function summaries, leaves-first by file.")
+    Term.(const run $ model $ parallel $ project_dir)
+
 (* --- Default command: launch TUI on a TTY, MCP server otherwise.
        Claude Code spawns `urme` over stdio (no TTY), which trips the
        MCP branch. Humans running `urme` in a terminal get the TUI. *)
@@ -246,6 +366,6 @@ let () =
   let info = Cmd.info "urme" ~doc ~version:"0.1.2" in
   let default = Term.(const default_run $ project_dir) in
   let cmd = Cmd.group ~default info [
-    ask_cmd; init_cmd; export_cmd; import_cmd; graph_build_cmd;
+    ask_cmd; init_cmd; export_cmd; import_cmd; graph_build_cmd; annotate_cmd;
   ] in
   exit (Cmd.eval cmd)
