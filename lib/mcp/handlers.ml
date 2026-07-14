@@ -51,29 +51,27 @@ let server_instructions st =
        (a weak model otherwise flails on the workflow). *)
     Printf.sprintf
       "This project's call graph is built but only %d of %d functions are \
-       ANNOTATED. Your job in this session is to annotate more of it. Do \
-       exactly this loop ONCE, then stop:\n\
-       1. Call graph_next_batch. It leases you a batch of functions whose \
+       ANNOTATED. Your ONLY job this session is to annotate the rest, right \
+       here — a plain loop, no sub-agents, no plans, no TODO lists. Repeat \
+       these three steps until done:\n\
+       1. Call graph_next_batch. It hands you a batch of functions whose \
        callees are ALREADY described (their summaries come back in \
-       `callees`, so you can write informed descriptions).\n\
-       2. For EVERY function in the returned `functions`, read its `code` \
-       and write one `description`: 1-3 sentences covering (a) what it does \
-       and its signature, and (b) everything non-obvious a caller must know \
-       — side effects, security relevance, error/empty/edge behaviour, and \
-       BUGS. CRUCIAL: fold in the load-bearing GOTCHAS of its callees. If \
-       this function's behaviour depends on a callee that silently fails, \
-       swallows errors, matches by strict equality, skips on a missed run, \
-       etc., SAY SO HERE — the summary must be self-contained so a future \
-       reader never has to open the callee. Descriptions are the product; \
-       they are trusted without reading source, so be accurate and \
-       comprehensive.\n\
-       3. Call graph_set_descriptions with an array of {id, description}, \
-       one per function, using the EXACT id from the batch.\n\
-       4. STOP. Do NOT call graph_next_batch again in this session — a \
-       fresh short-lived agent takes the next batch (re-reading a growing \
-       history per batch is what makes annotation expensive).\n\
-       Check graph_set_descriptions' `unknown_ids` and repost any that \
-       didn't store."
+       `callees`).\n\
+       2. For EVERY function in `functions`, read its `code` and write one \
+       `description`: 1-3 sentences = what it does + signature + everything \
+       non-obvious a caller must know (side effects, security, \
+       error/empty/edge behaviour, BUGS). CRUCIAL: fold in the load-bearing \
+       GOTCHAS of its callees — if this function's behaviour depends on a \
+       callee that silently fails, swallows errors, matches by strict \
+       equality, skips on a missed run, etc., SAY SO HERE so the summary \
+       stands alone. Descriptions are trusted without reading source; be \
+       accurate and comprehensive.\n\
+       3. Call graph_set_descriptions with an array of {id, description} \
+       (exact ids from the batch), then go straight back to step 1.\n\
+       Keep looping until graph_next_batch returns an empty batch — THEN \
+       stop. Do not spawn agents or write a workflow; just call the tools \
+       in a loop yourself. If graph_set_descriptions reports `unknown_ids`, \
+       repost those."
       described total
   | Some (total, described, _) when total > 0 ->
     let coverage =
@@ -982,8 +980,10 @@ let handle_graph_next_batch st args =
        so the summary stands alone (a reader must never need to open the \
        callee). (3) Post ALL of them in ONE graph_set_descriptions call: \
        descriptions=[{\"id\": <exact id from this batch>, \"description\": \
-       <your text>}, ...]. (4) STOP — do not call graph_next_batch again; a \
-       fresh agent takes the next batch. \
+       <your text>}, ...]. (4) Then call graph_next_batch AGAIN for the \
+       next batch and repeat — keep looping in THIS session until a batch \
+       comes back empty. No sub-agents, no plan, no TODO list — just call \
+       the tools in a loop. \
        recursive:true units are mutually-recursive — describe them \
        together. Synthetic names (_tmp_lambda) are lambdas — START the \
        description with the real binding name from the code so searches \

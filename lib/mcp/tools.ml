@@ -304,11 +304,12 @@ let tool_definitions = `List [
        are lambdas: START their description with the real binding name \
        visible in the code (e.g. \"notSolved: (challenge) => ...\") so \
        name searches can find them. Then call `graph_set_descriptions` \
-       with a {id, description} for every function returned — and EXIT. \
-       Do not call this again in the same context: each extra batch \
-       re-reads your whole accumulated history, which costs far more per \
-       function than starting over. To finish a graph, run many \
-       short-lived agents that each do one batch.";
+       with a {id, description} for every function returned, and call \
+       graph_next_batch AGAIN for the next batch — loop in THIS session \
+       until a batch comes back empty (the graph is fully annotated). Do \
+       NOT spawn sub-agents or write a workflow/TODO list; just call \
+       graph_next_batch and graph_set_descriptions in a plain loop \
+       yourself.";
     "inputSchema", `Assoc [
       "type", `String "object";
       "properties", `Assoc [
