@@ -136,7 +136,12 @@ let server_instructions st =
        graph_blast_radius tool (name a function; it runs the dispatch- \
        inclusive transitive closure for you and returns direct + \
        transitive counts + a by-file breakdown — do NOT hand-write a \
-       recursive graph_query for this, you will get it wrong). Use \
+       recursive graph_query for this, you will get it wrong). ALWAYS run \
+       graph_blast_radius on the named symbol for these — do NOT answer 'how \
+       central / safe to change X' from memory or a reused earlier result: a \
+       plain name like 'get' or 'send' is often 30–70+ DIFFERENT functions, \
+       and the tool flags that collision (ambiguous:true) so you don't \
+       report one merged number for what are really separate functions. Use \
        graph_query for other structural FACTS (counts, rankings, caller \
        sets, filters); graph_describe for one named function. \
        REUSE what you have pulled: before each query, check whether the \
@@ -1426,17 +1431,34 @@ let handle_graph_blast_radius st args =
         "by_file", `List (List.map (fun (f, c) ->
           `Assoc [ "file", `String f; "count", `Int c ]) b.by_file);
       ] in
+    let nmatch = List.length results in
+    let nfiles =
+      List.sort_uniq compare (List.map (fun (b : Cg.blast) -> b.bnode.ffile) results)
+      |> List.length in
+    let note =
+      if nmatch > 3 then
+        Printf.sprintf
+          "AMBIGUOUS: %d DISTINCT functions are named '%s', across %d files — \
+           these are DIFFERENT functions, not one. There is NO single blast \
+           radius for '%s'; each row below is its own function with its own \
+           count. Any answer that treats '%s' as one function (a merged count) \
+           is WRONG — the question is under-specified. Say so, and either pick \
+           the specific one (by file) or report per-implementation. \
+           (transitive = dispatch-inclusive closure; direct = one-hop.)"
+          nmatch name nfiles name name
+      else
+        "transitive = full dispatch-inclusive closure (THE blast radius); \
+         direct = one-hop callers only. Same-named functions across files are \
+         listed separately — pick the one you mean by file. by_file groups the \
+         closure by file for entry-point categories (views=REST, cli=CLI, \
+         celery=tasks, tests)." in
     Lwt.return (json_result (`Assoc [
       "query", `String name;
       "direction", `String dir_s;
       "dispatch_included", `Bool include_dispatch;
-      "n_matches", `Int (List.length results);
-      "note", `String
-        "transitive = full dispatch-inclusive closure (THE blast radius); \
-         direct = one-hop callers only. Same-named functions across files \
-         are listed separately — pick the one you mean by file. by_file \
-         groups the closure by file so you can read off entry-point \
-         categories (views=REST, cli=CLI, celery=tasks, tests).";
+      "n_matches", `Int nmatch;
+      "ambiguous", `Bool (nmatch > 1);
+      "note", `String note;
       "matches", `List (List.map json_of results);
     ]))
   end
