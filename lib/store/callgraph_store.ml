@@ -326,40 +326,44 @@ let next_ready_file_units ?(per_unit = false) db ~limit =
      next call). *)
   let file_cap = limit and line_cap = 1500 in
   if per_unit then begin
-    (* Each unit is an independent model call: split every ready SCC's
-       undescribed functions into <=line_cap chunks and return up to
-       [file_cap] chunks total — big files parallelize across chunks. *)
-    let rec gather acc nunits = function
-      | [] -> List.rev acc
-      | _ when nunits >= file_cap -> List.rev acc
-      | c :: rest ->
-        let cfiles = List.filter (fun f -> comp_of f = c) files in
-        let all = undesc_fns cfiles in
-        if all = [] then gather acc nunits rest
-        else begin
-          let callees = callees_of cfiles in
-          (* fn_cap: many tiny functions (test files) can pack 100+ into
-             1500 lines — the model's single-turn output cap then truncates
-             the JSON array (error_max_turns). Cap the count per chunk so
-             the response always fits comfortably in one turn. *)
-          let fn_cap = 40 in
-          let rec split chunks cur curl curn = function
-            | [] ->
-              List.rev
-                (if cur = [] then chunks
-                 else { ufiles = cfiles; ufns = List.rev cur;
-                        ucallees = callees } :: chunks)
-            | m :: r ->
-              if cur <> [] && (curl + lines m > line_cap || curn >= fn_cap)
-              then
-                split ({ ufiles = cfiles; ufns = List.rev cur;
-                         ucallees = callees } :: chunks)
-                  [ m ] (lines m) 1 r
-              else split chunks (m :: cur) (curl + lines m) (curn + 1) r in
-          let units = take_k (file_cap - nunits) (split [] [] 0 0 all) in
-          gather (List.rev_append units acc) (nunits + List.length units) rest
-        end in
-    gather [] 0 ready
+    (* Each unit is an independent model call. Functions from CONSECUTIVE
+       ready SCCs are packed into shared units (<= line_cap lines and
+       <= fn_cap functions each): many tiny files would otherwise each pay
+       a whole model call's startup for a handful of functions. Safe wrt
+       leaves-first: ready SCCs are mutually independent (the condensation
+       is a DAG — a ready SCC has no undescribed dependency, so none on
+       another ready SCC). A huge file still splits across units via the
+       same caps. fn_cap exists because 1500 lines of tiny test functions
+       can pack 100+ descriptions, whose JSON array overflows the model's
+       single-turn output cap (error_max_turns). *)
+    let fn_cap = 40 in
+    let units = ref [] and nunits = ref 0 in
+    let cur = ref [] and curf = ref [] and curl = ref 0 and curn = ref 0 in
+    let flush_cur () =
+      if !cur <> [] then begin
+        let cfiles = List.sort_uniq compare !curf in
+        units := { ufiles = cfiles; ufns = List.rev !cur;
+                   ucallees = callees_of cfiles } :: !units;
+        incr nunits;
+        cur := []; curf := []; curl := 0; curn := 0
+      end in
+    let add_fn (m : node) =
+      let lm = lines m in
+      if !cur <> [] && (!curl + lm > line_cap || !curn >= fn_cap) then
+        flush_cur ();
+      cur := m :: !cur;
+      if not (List.mem m.file !curf) then curf := m.file :: !curf;
+      curl := !curl + lm;
+      curn := !curn + 1 in
+    (try
+       List.iter (fun c ->
+         if !nunits >= file_cap then raise Exit;
+         let cfiles = List.filter (fun f -> comp_of f = c) files in
+         List.iter add_fn (undesc_fns cfiles))
+         ready
+     with Exit -> ());
+    if !nunits < file_cap then flush_cur ();
+    List.rev !units
   end else begin
   let rec gather acc nfiles nl = function
     | [] -> List.rev acc
