@@ -139,6 +139,30 @@ grep run were refound by **neither** arm in the next round.
   carry verbatim signatures and registration triggers (which is how Q7
   became findable without an edge).
 
+## Coda: guidance consolidation (c378d93)
+
+The instruction block had accreted a paragraph per lesson (~700 words).
+On Haiku that length itself became the failure: a run under the full
+block ignored the new diagnosis rule entirely, dropped 4 questions, lost
+previously-correct answers, asked a mid-run "token constraints" question,
+and cost $1.06. Rewritten as 8 numbered rules (~300 words, every lesson
+kept) plus a slimmed CLAUDE.md (the doctrine now lives once, not twice):
+
+- **Haiku: $0.33, 3 min, 21/21** — cheapest run of the campaign, full
+  compliance (collision-led N3/N4, exact BR2 contract, get_option in
+  rankings), parallel-batched tool calls. `code_only` still never fires:
+  diagnosis-by-reading is Haiku's ceiling, not an instruction problem.
+- **Opus: $4.75, 21/21** — rule 4b (diagnosis triage → read the code)
+  fires reliably (5 code_only pulls on exactly the implicated functions),
+  the fabrication class is gone, and it landed the 90-day notification
+  query ceiling — a find that had been grep-exclusive in every prior
+  round — plus a new dead-code-corroborating bug (ultradns
+  get_zone_name missing-arg TypeError).
+
+Final tiering: route facts/structure/contracts to Haiku+graph ($0.33);
+route diagnosis/audit questions to Opus+graph ($4.75), which now does
+reading-class discovery the summaries-only doctrine used to forbid.
+
 ## Open items, by payoff
 
 1. **Annotator-emitted dispatch edges** — the model reads
