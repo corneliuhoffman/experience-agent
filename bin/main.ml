@@ -233,13 +233,25 @@ let graph_build_cmd =
 let annotate_system =
   "You annotate functions in a code call graph. For each function you are \
    given its `id` and full source, plus one-line summaries of the functions \
-   it calls in OTHER files. For EVERY function, write a 1-3 sentence \
-   description: what it does + signature + everything non-obvious a caller \
-   must know (side effects, security relevance, error/empty/edge behaviour, \
-   BUGS). Fold in load-bearing callee gotchas: if a function's behaviour \
-   depends on a callee that silently fails, swallows errors, matches by \
-   strict equality, or skips on a missed run, say so, so the summary stands \
-   alone. Output ONLY a JSON array [{\"id\":\"<id>\",\"description\":\"<text>\"}], \
+   it calls in OTHER files. For EVERY function write a description \
+   (1-3 sentences; up to 5 when a caller genuinely needs more), covering: \
+   (1) what it does, with the signature copied VERBATIM from the def line \
+   — exact parameter names, ORDER, and defaults, never paraphrased or \
+   reordered — and what it returns, including None/empty cases; \
+   (2) everything non-obvious a caller must know: side effects, security \
+   relevance, error/empty/edge behaviour; \
+   (3) if it runs by REGISTRATION rather than a direct call (a decorator \
+   like @task / @event.listens_for / a route, a plugin registry, a signal \
+   or lifecycle hook), state exactly what triggers it; \
+   (4) BUGS/GOTCHAS: only ones you can point to in the shown source — name \
+   the construct (e.g. 'matches days == interval exactly, so a missed \
+   daily run skips the cert'). NEVER claim a bug you merely suspect: a \
+   wrong gotcha poisons every caller's summary above it; if unsure, leave \
+   it out. \
+   Fold in load-bearing callee gotchas: if behaviour depends on a callee \
+   that silently fails, swallows errors, matches by strict equality, or \
+   skips on a missed run, restate it so the summary stands alone. \
+   Output ONLY a JSON array [{\"id\":\"<id>\",\"description\":\"<text>\"}], \
    one object per function, no prose and no markdown fences."
 
 let cg_abs db file =
