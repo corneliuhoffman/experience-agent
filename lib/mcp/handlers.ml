@@ -82,95 +82,40 @@ let server_instructions st =
       else Printf.sprintf "%d functions, %d annotated" total described
     in
     Printf.sprintf
-      "This project has a prebuilt call graph of its whole codebase (%s), \
-       queryable through this server's graph_* tools. Prefer them over grep \
-       or manual file reading whenever a question is about call STRUCTURE \
-       spread across files: change-impact / blast radius, cross-file \
-       execution flows, dynamic dispatch (Celery tasks, plugin registries, \
-       signals), or codebase-wide aggregates ('which functions...', counts, \
-       rankings, deepest/widest). graph_query runs a read-only SQL SELECT \
-       over the graph and answers in ONE call what would otherwise mean \
-       building your own AST analyzer. Do NOT hand-roll a call-graph \
-       analyzer when these tools exist. NEVER write or run scripts \
-       (Bash/Python) to analyze the codebase's structure, and never \
-       grep/Read to COMPUTE callers, blast radius, dead code, or flows — \
-       the graph_* tools already hold that, precomputed and correct; a \
-       hand-rolled analyzer will be slower and wrong. (Reading source is \
-       only for the rare exact verbatim token, via graph_describe \
-       code_only.) \
-       For an UNDERSTAND / DEBUG / REVIEW / 'how does X work' question, \
-       start with graph_search on a few concrete nouns (small limit) and \
-       answer from the top summaries. TRUST THE SUMMARIES: each was \
-       written directly from the source, leaves-first, and is accurate \
-       and comprehensive — it already folds in what the callees do and \
-       calls out the specific behaviours, edge cases, gotchas, and bugs \
-       that matter (it carries file:line, so you can cite locations \
-       without opening the file). \
-       DEFAULT: answer WITHOUT opening any source file. The summaries are \
-       the primary source of truth, not a lossy index of it. Whole \
-       question classes that FEEL like they need code do NOT — a flow \
-       trace, an authorization/ordering walk, a 'what breaks if I change \
-       X' impact review, how a plugin registers, how an HTTP/SSH call is \
-       built: the summaries already state the order, the guards, the \
-       behaviours and the file:line for each step. Compose the answer from \
-       them and cite file:line. Do NOT read source to VERIFY, to \
-       double-check, to 'confirm the layer', to 'see the exact checks', or \
-       to 'be thorough' — that is the single biggest waste in this repo; \
-       the summary was built from that exact source and is not less \
-       trustworthy than your own re-reading. Open a source file ONLY when \
-       the answer is impossible without a literal token that no summary \
-       gives — an exact regex, a magic constant/string, a precise operator \
-       — AND you have already read the relevant summary and found it truly \
-       absent. When that rare case hits, get the code from the GRAPH, not \
-       from Read/grep: graph_describe with code_only:true returns exactly \
-       that function's line span and nothing else — the graph knows its \
-       precise bounds, so it is strictly more surgical than opening a file \
-       or grepping (which pull whole files / wide context). Reserve Read \
-       for the one thing the graph has no node for: config/wiring data \
-       (e.g. a setuptools entry_points registry list is strings, not \
-       functions). If you catch yourself about to Read a source file, \
-       first ask 'which summary failed to answer this, and is the code I \
-       need a function (-> graph_describe code_only) or config data \
-       (-> grep that file)?'. \
-       EXCEPTION — DIAGNOSIS-CLASS QUESTIONS: when the ask is 'find the \
-       bug', 'diagnose why X sometimes fails', 'is this safe', or an audit \
-       of guards/permissions/error paths, the summaries are the MAP, not \
-       the territory. Use the graph to TRIAGE — identify the handful of \
-       implicated functions — then pull each one's ACTUAL CODE with \
-       graph_describe code_only and ground the diagnosis in the code. The \
-       failure modes that decide these questions (an accumulator reset \
-       inside a loop, a return value silently ignored, a comparison \
-       against the wrong type, a metric emitted before the call) live in \
-       exactly the lines a good summary legitimately compresses away. \
-       Relatedly, NEVER assert how a specific file or function mechanically \
-       behaves — what it registers, raises, returns, or wires up — unless \
-       a summary states it or you have read that code; a plausible \
-       reconstruction from context is how fabricated mechanics happen. \
-       For BLAST RADIUS / change impact / 'how \
-       widely used is X' / transitive callers or callees, use the \
-       graph_blast_radius tool (name a function; it runs the dispatch- \
-       inclusive transitive closure for you and returns direct + \
-       transitive counts + a by-file breakdown — do NOT hand-write a \
-       recursive graph_query for this, you will get it wrong). ALWAYS run \
-       graph_blast_radius on the named symbol for these — do NOT answer 'how \
-       central / safe to change X' from memory or a reused earlier result: a \
-       plain name like 'get' or 'send' is often 30–70+ DIFFERENT functions, \
-       and the tool flags that collision (ambiguous:true) so you don't \
-       report one merged number for what are really separate functions. Use \
-       graph_query for other structural FACTS (counts, rankings, caller \
-       sets, filters); graph_describe for one named function. \
-       REUSE what you have pulled: before each query, check whether the \
-       answer already follows from results earlier in this session — one \
-       caller/closure result often answers several questions (blast radius, \
-       shared helpers, change impact) sliced differently, and a flow you \
-       already traced usually answers the later 'is this safe / where does \
-       it break' question without re-querying. Don't re-fetch what is \
-       already in context. EXCEPTION — exact contracts: when a question \
-       asks for a precise signature, return shape, or tuple order, re-quote \
-       it from a fresh graph_describe of THAT specific function. Never \
-       reconstruct a contract from memory of earlier results — adjacent \
-       functions' contracts (e.g. a wrapper's return vs its plugin's \
-       return) blur together and produce confident hybrids that are wrong."
+      "This project has a prebuilt, fully-annotated call graph (%s) served \
+       by the graph_* tools. Rules:\n\
+       1. ROUTE. 'How does X work / debug / review' -> graph_search on 2-3 \
+       concrete nouns, answer from the top summaries. Blast radius / change \
+       impact / 'how widely used' -> graph_blast_radius. Other structural \
+       facts (counts, rankings, caller sets, filters) -> graph_query \
+       (read-only SQL). One named function -> graph_describe.\n\
+       2. NEVER compute structure yourself: no Bash/Python analyzers, no \
+       grep/Read to find callers, blast radius, dead code, or flows — the \
+       graph holds these precomputed. Never hand-write a recursive closure; \
+       graph_blast_radius already runs it dispatch-inclusive.\n\
+       3. TRUST THE SUMMARIES. They are written from the source, \
+       leaves-first, fold in callee behaviour, and carry file:line — cite \
+       from them without opening files. Do not read source to 'verify' or \
+       'be thorough'.\n\
+       4. Read code ONLY via graph_describe code_only, in two cases: \
+       (a) a literal token no summary gives (exact regex, constant, \
+       operator); (b) DIAGNOSIS questions — 'find the bug', 'why does X \
+       sometimes fail', 'is it safe', guard/permission audits: triage with \
+       the graph, then pull the few implicated functions' code and ground \
+       the diagnosis in it — bugs live in lines summaries compress away. \
+       Use Read/grep only for config/wiring data with no graph node (e.g. \
+       an entry_points registry).\n\
+       5. NEVER state what a specific file or function registers, raises, \
+       or returns unless a summary says it or you read that code.\n\
+       6. ALWAYS run graph_blast_radius on the symbol a centrality/safety \
+       question names — never answer from memory. A bare name like 'get' \
+       can be 70+ different functions; the tool flags collisions \
+       (ambiguous:true) — never report one merged number for them.\n\
+       7. EXACT contracts (signature, return shape, tuple order): re-quote \
+       from a fresh graph_describe of that function; never reconstruct \
+       from memory — adjacent contracts blur into wrong hybrids.\n\
+       8. Otherwise REUSE results already in context instead of \
+       re-fetching; one closure often answers several questions."
       coverage
   | _ -> ""
 
