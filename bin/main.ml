@@ -310,9 +310,12 @@ let annotate_cmd =
     let db = Urme_store.Schema.open_or_create ~project_dir in
     Lwt_main.run begin
       let open Lwt.Syntax in
-      let* pool = Urme_claude.Prompts.spawn_pool
-          ~model ~size:(max 1 parallel)
-          ~system_prompt:annotate_system ~binary:config.claude_binary () in
+      (* One fresh claude process per file-unit (no daemon pool): a
+         daemon accumulates conversation history, so ask N replays all
+         N-1 earlier units — quadratic cost and eventual context blowup
+         on big graphs. Fresh one-shots keep every call history-free;
+         the constant system prompt still hits the server-side prompt
+         cache across processes. *)
       let last = ref (-1) in
       let empties = ref 0 in
       let rec loop () =
@@ -338,7 +341,10 @@ let annotate_cmd =
               Lwt_list.iter_p (fun (u : Cg.file_unit) ->
                 let prompt = build_annot_prompt db u in
                 let* raw =
-                  Lwt.catch (fun () -> Urme_claude.Prompts.ask_via_pool pool ~prompt)
+                  Lwt.catch (fun () ->
+                      Urme_claude.Prompts.ask ~model
+                        ~system_prompt:annotate_system ~no_tools:true
+                        ~binary:config.claude_binary ~prompt ())
                     (fun _ -> Lwt.return "") in
                 (try
                    List.iter (fun (id, desc) ->
@@ -351,7 +357,6 @@ let annotate_cmd =
           end
         end in
       let* () = loop () in
-      let* () = Urme_claude.Prompts.close_pool pool in
       let (total, described, _) = Cg.status db in
       Printf.printf "\ndone: %d/%d annotated\n" described total;
       Lwt.return_unit

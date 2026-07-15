@@ -31,10 +31,16 @@ let strip_fences s =
   |> String.trim
 
 (* Run a one-shot prompt, return the final Result event's text.
-   [model] defaults to None (= CLI's default model, typically Sonnet). *)
-let ask ?model ~binary ~prompt () =
+   [model] defaults to None (= CLI's default model, typically Sonnet).
+   Each call is a FRESH process — no conversation history accumulates
+   across calls (unlike a daemon, where every ask replays the whole
+   session so far). The constant [system_prompt] still prompt-caches
+   server-side across processes, so one-shots cost no more per call. *)
+let ask ?model ?system_prompt ?(no_tools = false) ~binary ~prompt () =
   let opts = { Process.default_opts with
                model;
+               system_prompt;
+               no_tools;
                allowed_tools = [];
                max_turns = Some 1 } in
   let* proc = Process.spawn_oneshot
