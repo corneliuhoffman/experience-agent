@@ -150,7 +150,12 @@ let server_instructions st =
        shared helpers, change impact) sliced differently, and a flow you \
        already traced usually answers the later 'is this safe / where does \
        it break' question without re-querying. Don't re-fetch what is \
-       already in context."
+       already in context. EXCEPTION — exact contracts: when a question \
+       asks for a precise signature, return shape, or tuple order, re-quote \
+       it from a fresh graph_describe of THAT specific function. Never \
+       reconstruct a contract from memory of earlier results — adjacent \
+       functions' contracts (e.g. a wrapper's return vs its plugin's \
+       return) blur together and produce confident hybrids that are wrong."
       coverage
   | _ -> ""
 
