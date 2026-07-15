@@ -332,7 +332,9 @@ let annotate_cmd =
         let eta =
           if rate > 0. then fmt_dur (float (total - described) /. rate *. 60.)
           else "?" in
-        Printf.printf "annotated %d/%d  [%s, %.0f fn/min, eta %s]\n%!"
+        let tm = Unix.localtime (Unix.gettimeofday ()) in
+        Printf.printf "%02d:%02d:%02d  annotated %d/%d  [%s, %.0f fn/min, eta %s]\n%!"
+          tm.Unix.tm_hour tm.Unix.tm_min tm.Unix.tm_sec
           described total (fmt_dur el) rate eta in
       (* Continuous work queue: keep [parallel] units in flight and refill
          a slot the moment its worker finishes — no per-batch barrier, so
