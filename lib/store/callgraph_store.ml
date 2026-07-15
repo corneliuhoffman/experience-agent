@@ -249,7 +249,14 @@ let cross_file_edges db =
        WHERE s.file<>d.file"
     [] ~f:(fun c -> (D.data_to_string c.(0), D.data_to_string c.(1)))
 
-let next_ready_file_units db ~limit =
+(* [per_unit=false] (MCP by_file batching): the 1500-line budget is GLOBAL
+   across the returned units — they are all destined for ONE model context.
+   [per_unit=true] (urme annotate): each unit is its own model call, so the
+   budget applies PER UNIT and up to [limit] units are returned regardless
+   of their combined size; a huge file yields multiple parallel chunks
+   (safe: prompts carry only cross-file callee summaries, identical for
+   every chunk of the file). *)
+let next_ready_file_units ?(per_unit = false) db ~limit =
   let files = all_files db in
   let cfe = cross_file_edges db in
   let g = Gr.create () in
@@ -318,6 +325,36 @@ let next_ready_file_units db ~limit =
      chunked (its remaining functions stay undescribed, handed out again
      next call). *)
   let file_cap = limit and line_cap = 1500 in
+  if per_unit then begin
+    (* Each unit is an independent model call: split every ready SCC's
+       undescribed functions into <=line_cap chunks and return up to
+       [file_cap] chunks total — big files parallelize across chunks. *)
+    let rec gather acc nunits = function
+      | [] -> List.rev acc
+      | _ when nunits >= file_cap -> List.rev acc
+      | c :: rest ->
+        let cfiles = List.filter (fun f -> comp_of f = c) files in
+        let all = undesc_fns cfiles in
+        if all = [] then gather acc nunits rest
+        else begin
+          let callees = callees_of cfiles in
+          let rec split chunks cur curl = function
+            | [] ->
+              List.rev
+                (if cur = [] then chunks
+                 else { ufiles = cfiles; ufns = List.rev cur;
+                        ucallees = callees } :: chunks)
+            | m :: r ->
+              if cur <> [] && curl + lines m > line_cap then
+                split ({ ufiles = cfiles; ufns = List.rev cur;
+                         ucallees = callees } :: chunks)
+                  [ m ] (lines m) r
+              else split chunks (m :: cur) (curl + lines m) r in
+          let units = take_k (file_cap - nunits) (split [] [] 0 all) in
+          gather (List.rev_append units acc) (nunits + List.length units) rest
+        end in
+    gather [] 0 ready
+  end else begin
   let rec gather acc nfiles nl = function
     | [] -> List.rev acc
     | _ when nfiles >= file_cap -> List.rev acc
@@ -340,6 +377,7 @@ let next_ready_file_units db ~limit =
         List.rev ({ ufiles = cfiles; ufns = chosen; ucallees = callees_of cfiles } :: acc)
       end in
   gather [] 0 0 ready
+  end
 
 (* Cross-SCC callees (already described) of any member of this SCC. *)
 let scc_callee_descriptions db ~scc =

@@ -360,11 +360,18 @@ let annotate_cmd =
         | [] -> String.concat "|" u.Cg.ufiles in
       let run_unit (u : Cg.file_unit) =
         let prompt = build_annot_prompt db u in
+        (* Hard per-ask timeout: a wedged model call must never hold its
+           slot (and its unit's in-flight key) forever — that starves the
+           whole pump. On timeout the unit simply stays undescribed and is
+           refetched. *)
         let* raw =
           Lwt.catch (fun () ->
-              Urme_claude.Prompts.ask ~model
-                ~system_prompt:annotate_system ~no_tools:true
-                ~binary:config.claude_binary ~prompt ())
+              Lwt.pick [
+                Urme_claude.Prompts.ask ~model
+                  ~system_prompt:annotate_system ~no_tools:true
+                  ~binary:config.claude_binary ~prompt ();
+                (let* () = Lwt_unix.sleep 300.0 in Lwt.return "");
+              ])
             (fun _ -> Lwt.return "") in
         (try
            List.iter (fun (id, desc) ->
@@ -383,7 +390,8 @@ let annotate_cmd =
           let fetched =
             if want = 0 then []
             else
-              (try Cg.next_ready_file_units db ~limit:(max 1 parallel * 2)
+              (try Cg.next_ready_file_units ~per_unit:true db
+                     ~limit:(max 1 parallel * 2)
                with _ -> [])
               |> List.filter (fun u -> not (Hashtbl.mem inflight (unit_key u))) in
           let dispatch = List.filteri (fun i _ -> i < want) fetched in

@@ -57,9 +57,13 @@ let drain_stderr err_rd =
     Lwt_io.of_fd ~mode:Lwt_io.input
       (Lwt_unix.of_unix_file_descr ~blocking:false err_rd) in
   Lwt.async (fun () ->
-    Lwt.catch (fun () ->
-      Lwt_stream.iter (fun _ -> ()) (Lwt_io.read_lines ic)
-    ) (fun _ -> Lwt.return_unit))
+    let* () =
+      Lwt.catch (fun () ->
+        Lwt_stream.iter (fun _ -> ()) (Lwt_io.read_lines ic)
+      ) (fun _ -> Lwt.return_unit) in
+    (* Close, or the fd leaks — one per spawn; a long annotate run then
+       exhausts the fd limit and every later spawn fails silently. *)
+    Lwt.catch (fun () -> Lwt_io.close ic) (fun _ -> Lwt.return_unit))
 
 (* ---------- Oneshot ---------- *)
 
@@ -132,7 +136,10 @@ let spawn_oneshot ?(cwd=".") ?(opts=default_opts) ~binary ~prompt () =
        | Some event -> push (Some event)
        | None -> ());
       reader ()
-    | None -> push None; Lwt.return_unit
+    | None ->
+      push None;
+      (* Close on EOF or the stdout fd leaks per spawn (see drain_stderr). *)
+      Lwt.catch (fun () -> Lwt_io.close out_ic) (fun _ -> Lwt.return_unit)
   in
   Lwt.async reader;
   Lwt.return { oneshot_events = events; oneshot_pid = pid }
@@ -213,7 +220,9 @@ let spawn_daemon ?(cwd=".") ?(opts=default_opts) ~binary () =
        | Some event -> push (Some event)
        | None -> ());
       reader ()
-    | None -> push None; Lwt.return_unit
+    | None ->
+      push None;
+      Lwt.catch (fun () -> Lwt_io.close out_ic) (fun _ -> Lwt.return_unit)
   in
   Lwt.async reader;
   Lwt.return { daemon_pid = pid; daemon_stdin = stdin_chan;
