@@ -378,7 +378,10 @@ let annotate_cmd =
              ignore (Cg.set_description db ~id ~description:desc ~code_hash:None))
              (parse_annot raw)
          with _ -> ());
-        Lwt.return_unit in
+        (* Back off after a failed call: the freed slot would otherwise be
+           refilled with this same unit immediately, turning an API
+           rate-limit blip into a tight retry loop that hammers it harder. *)
+        if raw = "" then Lwt_unix.sleep 10.0 else Lwt.return_unit in
       let rec pump () =
         let (total, described, _) = try Cg.status db with _ -> (0, 0, 0) in
         if !d0 < 0 then d0 := described;

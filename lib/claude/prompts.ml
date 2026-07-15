@@ -50,9 +50,9 @@ let ask ?model ?system_prompt ?(no_tools = false) ~binary ~prompt () =
     (match event with
      | Stream.Assistant_message { content; _ } ->
        Buffer.add_string buf (Stream.text_of_content content)
-     | Stream.Result { result; is_error; _ } ->
+     | Stream.Result { result; is_error; subtype; _ } ->
        if is_error then
-         Printf.eprintf "claude CLI error: %s\n%!" result
+         Printf.eprintf "claude CLI error (%s): %s\n%!" subtype result
      | _ -> ());
     Lwt.return_unit) in
   let _ = Process.wait proc in
