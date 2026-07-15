@@ -131,7 +131,22 @@ let server_instructions st =
        functions). If you catch yourself about to Read a source file, \
        first ask 'which summary failed to answer this, and is the code I \
        need a function (-> graph_describe code_only) or config data \
-       (-> grep that file)?'. For BLAST RADIUS / change impact / 'how \
+       (-> grep that file)?'. \
+       EXCEPTION — DIAGNOSIS-CLASS QUESTIONS: when the ask is 'find the \
+       bug', 'diagnose why X sometimes fails', 'is this safe', or an audit \
+       of guards/permissions/error paths, the summaries are the MAP, not \
+       the territory. Use the graph to TRIAGE — identify the handful of \
+       implicated functions — then pull each one's ACTUAL CODE with \
+       graph_describe code_only and ground the diagnosis in the code. The \
+       failure modes that decide these questions (an accumulator reset \
+       inside a loop, a return value silently ignored, a comparison \
+       against the wrong type, a metric emitted before the call) live in \
+       exactly the lines a good summary legitimately compresses away. \
+       Relatedly, NEVER assert how a specific file or function mechanically \
+       behaves — what it registers, raises, returns, or wires up — unless \
+       a summary states it or you have read that code; a plausible \
+       reconstruction from context is how fabricated mechanics happen. \
+       For BLAST RADIUS / change impact / 'how \
        widely used is X' / transitive callers or callees, use the \
        graph_blast_radius tool (name a function; it runs the dispatch- \
        inclusive transitive closure for you and returns direct + \
