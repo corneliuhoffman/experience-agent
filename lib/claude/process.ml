@@ -50,6 +50,15 @@ let clean_env () =
     not (starts_with "CLAUDE_CODE_ENTRYPOINT="))
   |> Array.of_list
 
+(* An empty MCP config file, created once per process: passed with
+   --strict-mcp-config so tool-less children connect no MCP servers. *)
+let empty_mcp_config = lazy (
+  let f = Filename.temp_file "urme-empty-mcp" ".json" in
+  let oc = open_out f in
+  output_string oc "{\"mcpServers\":{}}";
+  close_out oc;
+  f)
+
 (* Shared: consume stderr so the child doesn't block on a full pipe.
    Assumes [err_rd] has already been put into non-blocking mode. *)
 let drain_stderr err_rd =
@@ -79,7 +88,17 @@ let common_flags ~opts =
      each summariser pass recursively summarises summaries. *)
   let args = ["--no-session-persistence"] in
   let args = if opts.bare then args @ ["--bare"] else args in
-  let args = if opts.no_tools then args @ ["--tools"; ""] else args in
+  (* no_tools must also strip MCP servers: --tools "" only filters
+     built-ins; project/user MCP configs (e.g. urme's own graph server in
+     an annotated repo) still connect, hand the model callable tools, and
+     a weak model then burns its turns calling them (error_max_turns) —
+     while every worker also spawns an MCP process against the same
+     SQLite db. *)
+  let args =
+    if opts.no_tools then
+      args @ ["--tools"; ""; "--strict-mcp-config";
+              "--mcp-config"; Lazy.force empty_mcp_config]
+    else args in
   let args = match opts.model with
     | Some m -> args @ ["--model"; m] | None -> args in
   let args = match opts.system_prompt with
