@@ -318,15 +318,73 @@ let annotate_cmd =
          cache across processes. *)
       let last = ref (-1) in
       let empties = ref 0 in
-      let rec loop () =
+      let t0 = Unix.gettimeofday () in
+      let d0 = ref (-1) in
+      let fmt_dur s =
+        let s = int_of_float s in
+        if s >= 3600 then Printf.sprintf "%dh%02dm" (s / 3600) (s mod 3600 / 60)
+        else if s >= 60 then Printf.sprintf "%dm%02ds" (s / 60) (s mod 60)
+        else Printf.sprintf "%ds" s in
+      let print_progress described total =
+        let el = Unix.gettimeofday () -. t0 in
+        let fresh = described - (if !d0 < 0 then described else !d0) in
+        let rate = if el > 1. && fresh > 0 then float fresh /. el *. 60. else 0. in
+        let eta =
+          if rate > 0. then fmt_dur (float (total - described) /. rate *. 60.)
+          else "?" in
+        Printf.printf "annotated %d/%d  [%s, %.0f fn/min, eta %s]\n%!"
+          described total (fmt_dur el) rate eta in
+      (* Continuous work queue: keep [parallel] units in flight and refill
+         a slot the moment its worker finishes — no per-batch barrier, so
+         one slow 1500-line unit no longer parks the other slots idle. *)
+      let inflight : (string, unit) Hashtbl.t = Hashtbl.create 16 in
+      let active = ref 0 in
+      let cond = Lwt_condition.create () in
+      let unit_key (u : Cg.file_unit) =
+        match u.Cg.ufns with
+        | n :: _ -> n.Cg.id
+        | [] -> String.concat "|" u.Cg.ufiles in
+      let run_unit (u : Cg.file_unit) =
+        let prompt = build_annot_prompt db u in
+        let* raw =
+          Lwt.catch (fun () ->
+              Urme_claude.Prompts.ask ~model
+                ~system_prompt:annotate_system ~no_tools:true
+                ~binary:config.claude_binary ~prompt ())
+            (fun _ -> Lwt.return "") in
+        (try
+           List.iter (fun (id, desc) ->
+             ignore (Cg.set_description db ~id ~description:desc ~code_hash:None))
+             (parse_annot raw)
+         with _ -> ());
+        Lwt.return_unit in
+      let rec pump () =
         let (total, described, _) = try Cg.status db with _ -> (0, 0, 0) in
+        if !d0 < 0 then d0 := described;
         if !last < 0 || described - !last >= progress || described >= total then
-          (Printf.printf "annotated %d/%d\n%!" described total; last := described);
-        if total > 0 && described >= total then Lwt.return_unit
+          (print_progress described total; last := described);
+        if total > 0 && described >= total && !active = 0 then Lwt.return_unit
         else begin
-          let units = try Cg.next_ready_file_units db ~limit:(max 1 parallel)
-                      with _ -> [] in
-          if units = [] then begin
+          let want = max 0 (max 1 parallel - !active) in
+          let fetched =
+            if want = 0 then []
+            else
+              (try Cg.next_ready_file_units db ~limit:(max 1 parallel * 2)
+               with _ -> [])
+              |> List.filter (fun u -> not (Hashtbl.mem inflight (unit_key u))) in
+          let dispatch = List.filteri (fun i _ -> i < want) fetched in
+          List.iter (fun u ->
+            Hashtbl.replace inflight (unit_key u) ();
+            incr active;
+            Lwt.async (fun () ->
+              Lwt.finalize (fun () -> run_unit u)
+                (fun () ->
+                   Hashtbl.remove inflight (unit_key u);
+                   decr active;
+                   Lwt_condition.signal cond ();
+                   Lwt.return_unit)))
+            dispatch;
+          if dispatch = [] && !active = 0 then begin
             (* Could be transient (a lock made the query return nothing) or a
                real dead-end. Retry a few times before giving up, so a
                momentary hiccup doesn't abort the whole run. *)
@@ -334,29 +392,17 @@ let annotate_cmd =
             if !empties > 8 then
               (Printf.printf "\nstuck: %d/%d described, no ready units after retries\n"
                  described total; Lwt.return_unit)
-            else (let* () = Lwt_unix.sleep 2.0 in loop ())
+            else (let* () = Lwt_unix.sleep 2.0 in pump ())
           end else begin
             empties := 0;
-            let* () = Lwt.catch (fun () ->
-              Lwt_list.iter_p (fun (u : Cg.file_unit) ->
-                let prompt = build_annot_prompt db u in
-                let* raw =
-                  Lwt.catch (fun () ->
-                      Urme_claude.Prompts.ask ~model
-                        ~system_prompt:annotate_system ~no_tools:true
-                        ~binary:config.claude_binary ~prompt ())
-                    (fun _ -> Lwt.return "") in
-                (try
-                   List.iter (fun (id, desc) ->
-                     ignore (Cg.set_description db ~id ~description:desc ~code_hash:None))
-                     (parse_annot raw)
-                 with _ -> ());
-                Lwt.return_unit) units)
-              (fun _ -> Lwt.return_unit) in
-            loop ()
+            (* Wake when any worker finishes (or every 5s as a heartbeat)
+               and top the queue back up. *)
+            let* () = Lwt.pick [ Lwt_condition.wait cond;
+                                 Lwt_unix.sleep 5.0 ] in
+            pump ()
           end
         end in
-      let* () = loop () in
+      let* () = pump () in
       let (total, described, _) = Cg.status db in
       Printf.printf "\ndone: %d/%d annotated\n" described total;
       Lwt.return_unit
