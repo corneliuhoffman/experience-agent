@@ -338,19 +338,25 @@ let next_ready_file_units ?(per_unit = false) db ~limit =
         if all = [] then gather acc nunits rest
         else begin
           let callees = callees_of cfiles in
-          let rec split chunks cur curl = function
+          (* fn_cap: many tiny functions (test files) can pack 100+ into
+             1500 lines — the model's single-turn output cap then truncates
+             the JSON array (error_max_turns). Cap the count per chunk so
+             the response always fits comfortably in one turn. *)
+          let fn_cap = 40 in
+          let rec split chunks cur curl curn = function
             | [] ->
               List.rev
                 (if cur = [] then chunks
                  else { ufiles = cfiles; ufns = List.rev cur;
                         ucallees = callees } :: chunks)
             | m :: r ->
-              if cur <> [] && curl + lines m > line_cap then
+              if cur <> [] && (curl + lines m > line_cap || curn >= fn_cap)
+              then
                 split ({ ufiles = cfiles; ufns = List.rev cur;
                          ucallees = callees } :: chunks)
-                  [ m ] (lines m) r
-              else split chunks (m :: cur) (curl + lines m) r in
-          let units = take_k (file_cap - nunits) (split [] [] 0 all) in
+                  [ m ] (lines m) 1 r
+              else split chunks (m :: cur) (curl + lines m) (curn + 1) r in
+          let units = take_k (file_cap - nunits) (split [] [] 0 0 all) in
           gather (List.rev_append units acc) (nunits + List.length units) rest
         end in
     gather [] 0 ready

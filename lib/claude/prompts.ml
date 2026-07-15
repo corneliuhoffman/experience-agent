@@ -37,12 +37,16 @@ let strip_fences s =
    session so far). The constant [system_prompt] still prompt-caches
    server-side across processes, so one-shots cost no more per call. *)
 let ask ?model ?system_prompt ?(no_tools = false) ~binary ~prompt () =
+  (* max_turns 4, not 1: when a long answer hits the per-turn output cap
+     the CLI continues it in another turn (error_max_turns otherwise).
+     With no tools there is nothing else a spare turn can do, and the
+     assistant text is accumulated across turns below. *)
   let opts = { Process.default_opts with
                model;
                system_prompt;
                no_tools;
                allowed_tools = [];
-               max_turns = Some 1 } in
+               max_turns = Some 4 } in
   let* proc = Process.spawn_oneshot
       ~cwd:"." ~opts ~binary ~prompt () in
   let buf = Buffer.create 1024 in
