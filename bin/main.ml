@@ -223,6 +223,112 @@ let graph_build_cmd =
                  fills in per-function descriptions.")
     Term.(const run $ json $ project_dir)
 
+(* --- Subcommand: graph-init ---
+   One-step bootstrap: run the opengrep-interfile-graph extractor, load
+   the export, report status. Refuses to clobber an annotated graph
+   unless --force (graph-build wipes descriptions). *)
+
+let graph_init_cmd =
+  let lang =
+    Arg.(value & opt (some string) None & info ["lang"; "l"] ~docv:"LANG"
+           ~doc:"Language to extract (default: auto-detect by file count).") in
+  let jobs =
+    Arg.(value & opt int 16 & info ["j"; "jobs"] ~docv:"N"
+           ~doc:"Extractor parallelism (default 16).") in
+  let extractor =
+    Arg.(value & opt string "opengrep-interfile-graph" & info ["extractor"]
+           ~docv:"BIN" ~doc:"Path to the opengrep-interfile-graph binary.") in
+  let force =
+    Arg.(value & flag & info ["force"]
+           ~doc:"Rebuild even if the existing graph has annotations \
+                 (they are WIPED by a rebuild).") in
+  let run lang jobs extractor force project_dir =
+    let project_dir =
+      if project_dir = "." then Sys.getcwd ()
+      else if Filename.is_relative project_dir
+      then Filename.concat (Sys.getcwd ()) project_dir else project_dir in
+    (* language auto-detection: dominant source extension *)
+    let detect () =
+      let exts = [ ".py", "python"; ".kt", "kotlin"; ".kts", "kotlin";
+                   ".rb", "ruby"; ".go", "go"; ".java", "java";
+                   ".ts", "typescript"; ".js", "javascript" ] in
+      let skip = [ ".git"; "node_modules"; "_build"; "vendor"; "venv";
+                   ".venv"; "dist"; "build" ] in
+      let counts = Hashtbl.create 8 in
+      let rec walk dir depth =
+        if depth <= 8 then
+          match Sys.readdir dir with
+          | entries ->
+            Array.iter (fun e ->
+              if e <> "" && e.[0] <> '.' && not (List.mem e skip) then begin
+                let p = Filename.concat dir e in
+                if (try Sys.is_directory p with _ -> false) then
+                  walk p (depth + 1)
+                else
+                  match List.assoc_opt (Filename.extension e) exts with
+                  | Some l ->
+                    Hashtbl.replace counts l
+                      (1 + (try Hashtbl.find counts l with Not_found -> 0))
+                  | None -> ()
+              end) entries
+          | exception _ -> () in
+      walk project_dir 0;
+      Hashtbl.fold (fun l n best -> match best with
+        | Some (_, bn) when bn >= n -> best
+        | _ -> Some (l, n)) counts None
+      |> Option.map fst in
+    let lang = match lang with
+      | Some l -> l
+      | None ->
+        (match detect () with
+         | Some l -> Printf.printf "detected language: %s\n%!" l; l
+         | None ->
+           prerr_endline "graph-init: could not detect a language; pass --lang";
+           exit 1) in
+    (* clobber guard *)
+    let db = Urme_store.Schema.open_or_create ~project_dir in
+    let (_, described, _) =
+      try Urme_store.Callgraph_store.status db with _ -> (0, 0, 0) in
+    if described > 0 && not force then begin
+      Printf.eprintf
+        "graph-init: existing graph has %d annotated functions; a rebuild \
+         WIPES them. Re-run with --force, or just run `urme annotate` to \
+         fill in what's missing.\n" described;
+      Urme_store.Schema.close db;
+      exit 1
+    end;
+    Urme_store.Schema.close db;
+    let urme_dir = Filename.concat project_dir ".urme" in
+    (try Unix.mkdir urme_dir 0o755 with Unix.Unix_error (Unix.EEXIST, _, _) -> ());
+    let out = Filename.concat urme_dir ("callgraph-" ^ lang ^ ".json") in
+    let cmd = Printf.sprintf "%s export -l %s -r %s -o %s -j %d"
+        (Filename.quote extractor) (Filename.quote lang)
+        (Filename.quote project_dir) (Filename.quote out) jobs in
+    Printf.printf "extracting %s call graph...\n%!" lang;
+    let rc = Sys.command cmd in
+    if rc <> 0 then begin
+      Printf.eprintf
+        "graph-init: extractor failed (exit %d). Is %s installed and on \
+         PATH? (brew install opengrep-interfile-graph, or pass --extractor)\n"
+        rc extractor;
+      exit 1
+    end;
+    let db = Urme_store.Schema.open_or_create ~project_dir in
+    let (nn, ne) = Urme_engine.Callgraph_load.build ~db ~json_path:out in
+    let (total, described, ready) = Urme_store.Callgraph_store.status db in
+    Urme_store.Schema.close db;
+    Printf.printf
+      "loaded call graph: %d nodes, %d edges (described %d/%d, %d units \
+       ready)\nnext: run `urme annotate` to write the summaries.\n"
+      nn ne described total ready
+  in
+  Cmd.v (Cmd.info "graph-init"
+           ~doc:"Bootstrap the call graph in one step: run the \
+                 opengrep-interfile-graph extractor, load the export into \
+                 the urme store, and report status. Follow with `urme \
+                 annotate`.")
+    Term.(const run $ lang $ jobs $ extractor $ force $ project_dir)
+
 (* --- Subcommand: annotate ---
    urme drives the whole annotation loop itself: it pulls ready file-units
    leaves-first, prompts the model (headless, one file per prompt, N in
@@ -462,6 +568,7 @@ let () =
   let info = Cmd.info "urme" ~doc ~version:"0.1.2" in
   let default = Term.(const default_run $ project_dir) in
   let cmd = Cmd.group ~default info [
-    ask_cmd; init_cmd; export_cmd; import_cmd; graph_build_cmd; annotate_cmd;
+    ask_cmd; init_cmd; export_cmd; import_cmd; graph_init_cmd;
+    graph_build_cmd; annotate_cmd;
   ] in
   exit (Cmd.eval cmd)
