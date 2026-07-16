@@ -17,9 +17,9 @@ depends: [
   "irmin-git" {>= "3.6"}
   "cmdliner" {>= "1.2"}
   "notty" {>= "0.2"}
-  "nottui"
-  "nottui-lwt"
-  "lwd"
+  "nottui" {>= "0.4" & < "0.5"}
+  "nottui-lwt" {< "0.5"}
+  "lwd" {>= "0.4"}
   "patch" {>= "3.1"}
   "domainslib" {>= "0.5"}
   "conf-libev"
