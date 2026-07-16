@@ -8,6 +8,7 @@ modifications, and search past interactions.
 
 ```sh
 brew tap urme-dev/urme
+brew trust urme-dev/urme   # one-time: Homebrew requires trusting third-party taps
 brew install urme
 ```
 
