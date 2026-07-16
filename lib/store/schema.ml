@@ -14,7 +14,7 @@
 module D = Db
 module S = Sqlite3
 
-let schema_version = 7
+let schema_version = 8
 
 (* Migration 1: initial schema. *)
 let migration_1 = [
@@ -224,6 +224,106 @@ let migration_7 = [
   {|ALTER TABLE sessions ADD COLUMN title TEXT|};
 ]
 
+(* Migration 8: annotated call graph. Nodes + edges loaded from an
+   opengrep-callgraph/v1 export; [scc]/[topo] filled by SCC condensation
+   + leaves-first topological order; [description] filled leaves-first by
+   the MCP describe-loop (each node described once all its cross-SCC
+   callees are). Lives in the same DB so the MCP can both drive the loop
+   and answer questions about the graph. *)
+let migration_8 = [
+  {|CREATE TABLE IF NOT EXISTS cg_nodes (
+      id           TEXT PRIMARY KEY,     -- name|file|line|col (opengrep id)
+      name         TEXT NOT NULL,
+      file         TEXT NOT NULL,
+      start_line   INTEGER NOT NULL,
+      end_line     INTEGER NOT NULL,
+      end_exact    INTEGER NOT NULL DEFAULT 0,
+      kind         TEXT NOT NULL,        -- normal|toplevel|lambda
+      lang         TEXT,
+      scc          INTEGER,              -- SCC group id (Tarjan)
+      topo         INTEGER,              -- leaves-first order of the SCC
+      code_hash    TEXT,                 -- hash of extracted source (for re-desc)
+      description  TEXT,                 -- filled by the describe-loop
+      described_at REAL
+    )|};
+  {|CREATE INDEX IF NOT EXISTS cg_nodes_scc_idx  ON cg_nodes(scc)|};
+  {|CREATE INDEX IF NOT EXISTS cg_nodes_topo_idx ON cg_nodes(topo)|};
+  {|CREATE INDEX IF NOT EXISTS cg_nodes_name_idx ON cg_nodes(name)|};
+
+  {|CREATE TABLE IF NOT EXISTS cg_edges (
+      src        TEXT NOT NULL,          -- caller node id
+      dst        TEXT NOT NULL,          -- callee node id
+      kind       TEXT NOT NULL,          -- call|dispatch
+      call_file  TEXT,
+      call_line  INTEGER,
+      call_col   INTEGER,
+      UNIQUE(src, dst, call_line, call_col)
+    )|};
+  {|CREATE INDEX IF NOT EXISTS cg_edges_src_idx ON cg_edges(src)|};
+  {|CREATE INDEX IF NOT EXISTS cg_edges_dst_idx ON cg_edges(dst)|};
+
+  (* FTS5 over the function summaries so natural-language questions can be
+     answered by searching descriptions + traversing edges, rather than
+     re-reading the repo. Standalone (own content): kept in sync by
+     Callgraph_store on insert / describe. *)
+  {|CREATE VIRTUAL TABLE IF NOT EXISTS cg_fts USING fts5(
+      node_id UNINDEXED, name, description,
+      tokenize='porter unicode61'
+    )|};
+]
+
+(* Migration 9: store call-graph paths relative to the analyzed root
+   (meta key [cg_root]). The node id embeds the file path, so absolute
+   paths repeated the repo prefix in every id, file, and edge endpoint of
+   every MCP response. New graphs are relativized at load time
+   (Callgraph_load.relativize); this strips the prefix from existing rows
+   and rebuilds the FTS mirror. replace() with an empty pattern is a
+   no-op, so databases without a cg_root pass through unchanged. *)
+let migration_9 = [
+  {|UPDATE cg_nodes SET
+      id   = replace(id,   COALESCE((SELECT value||'/' FROM meta WHERE key='cg_root'), ''), ''),
+      file = replace(file, COALESCE((SELECT value||'/' FROM meta WHERE key='cg_root'), ''), '')|};
+  {|UPDATE cg_edges SET
+      src       = replace(src,       COALESCE((SELECT value||'/' FROM meta WHERE key='cg_root'), ''), ''),
+      dst       = replace(dst,       COALESCE((SELECT value||'/' FROM meta WHERE key='cg_root'), ''), ''),
+      call_file = replace(call_file, COALESCE((SELECT value||'/' FROM meta WHERE key='cg_root'), ''), '')|};
+  {|DELETE FROM cg_fts|};
+  {|INSERT INTO cg_fts(node_id, name, description)
+     SELECT id, name, COALESCE(description, '') FROM cg_nodes|};
+]
+
+(* Migration 10: dynamic-dispatch edges. Celery .delay/.apply_async,
+   plugin-registry lookups, and signal handlers have no static call edge,
+   but the dispatcher's summary names its target. We materialise those
+   name-mentions as edges (src dispatches dst) so graph_neighborhood can
+   traverse them alongside real call edges — recovering async paths in
+   one query instead of a per-hop mentioned_by chase. Populated from the
+   FTS index by Callgraph_store.populate_dispatch_edges. *)
+let migration_10 = [
+  {|CREATE TABLE IF NOT EXISTS cg_dispatch (
+      src TEXT NOT NULL,   -- dispatcher (its summary names the target)
+      dst TEXT NOT NULL,   -- dispatched-to function
+      UNIQUE(src, dst)
+    )|};
+  {|CREATE INDEX IF NOT EXISTS cg_dispatch_dst_idx ON cg_dispatch(dst)|};
+  {|CREATE INDEX IF NOT EXISTS cg_dispatch_src_idx ON cg_dispatch(src)|};
+]
+
+(* Migration 11: SCC leases. graph_next_batch used to be a pure read, so
+   N concurrent annotators were handed the identical frontier and redid
+   each other's work. One row per claimed SCC, with an expiry, lets
+   next_batch hand out disjoint units. Advisory only: a lease never gates
+   a write, and an expired one (crashed annotator) is ignored — so a
+   missing or stale row can lose throughput, never correctness. *)
+let migration_11 = [
+  {|CREATE TABLE IF NOT EXISTS cg_leases (
+      scc         INTEGER PRIMARY KEY,   -- cg_nodes.scc under claim
+      owner       TEXT,                  -- opaque token of the claimant
+      lease_until REAL NOT NULL          -- unix time; <= now means expired
+    )|};
+  {|CREATE INDEX IF NOT EXISTS cg_leases_until_idx ON cg_leases(lease_until)|};
+]
+
 let migrations = [
   1, migration_1;
   2, migration_2;
@@ -232,6 +332,10 @@ let migrations = [
   5, migration_5;
   6, migration_6;
   7, migration_7;
+  8, migration_8;
+  9, migration_9;
+  10, migration_10;
+  11, migration_11;
 ]
 
 (* --- meta helpers --- *)
@@ -258,7 +362,11 @@ let apply_pragmas db =
   D.exec db "PRAGMA journal_mode = WAL";
   D.exec db "PRAGMA synchronous = NORMAL";
   D.exec db "PRAGMA foreign_keys = ON";
-  D.exec db "PRAGMA temp_store = MEMORY"
+  D.exec db "PRAGMA temp_store = MEMORY";
+  (* Wait up to 30s for a lock instead of erroring SQLITE_BUSY. With many
+     concurrent connections (e.g. the annotate pool's daemons each opening
+     the db), a bare BUSY would otherwise crash the writer mid-run. *)
+  D.exec db "PRAGMA busy_timeout = 30000"
 
 (* --- bootstrap + migrate --- *)
 

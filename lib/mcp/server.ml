@@ -9,7 +9,7 @@ let handle_message state (msg : Yojson.Safe.t) =
     |> Option.value ~default:"" in
   match method_ with
   | "initialize" ->
-    let result = `Assoc [
+    let base = [
       "protocolVersion", `String "2024-11-05";
       "capabilities", `Assoc [
         "tools", `Assoc [];
@@ -19,6 +19,12 @@ let handle_message state (msg : Yojson.Safe.t) =
         "version", `String "0.2.0";
       ];
     ] in
+    (* Advertise the call graph (and how to route to it) via the MCP
+       [instructions] field when one exists — omitted otherwise. *)
+    let result = `Assoc (
+      match Handlers.server_instructions state with
+      | "" -> base
+      | s -> base @ [ "instructions", `String s ]) in
     Lwt.return (`Assoc [
       "jsonrpc", `String "2.0";
       "id", id;
@@ -27,7 +33,7 @@ let handle_message state (msg : Yojson.Safe.t) =
   | "notifications/initialized" ->
     Lwt.return `Null
   | "tools/list" ->
-    let result = `Assoc ["tools", Tools.tool_definitions] in
+    let result = `Assoc ["tools", Handlers.served_tools state] in
     Lwt.return (`Assoc [
       "jsonrpc", `String "2.0";
       "id", id;

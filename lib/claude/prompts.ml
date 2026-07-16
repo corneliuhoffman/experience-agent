@@ -31,12 +31,22 @@ let strip_fences s =
   |> String.trim
 
 (* Run a one-shot prompt, return the final Result event's text.
-   [model] defaults to None (= CLI's default model, typically Sonnet). *)
-let ask ?model ~binary ~prompt () =
+   [model] defaults to None (= CLI's default model, typically Sonnet).
+   Each call is a FRESH process — no conversation history accumulates
+   across calls (unlike a daemon, where every ask replays the whole
+   session so far). The constant [system_prompt] still prompt-caches
+   server-side across processes, so one-shots cost no more per call. *)
+let ask ?model ?system_prompt ?(no_tools = false) ~binary ~prompt () =
+  (* max_turns 4, not 1: when a long answer hits the per-turn output cap
+     the CLI continues it in another turn (error_max_turns otherwise).
+     With no tools there is nothing else a spare turn can do, and the
+     assistant text is accumulated across turns below. *)
   let opts = { Process.default_opts with
                model;
+               system_prompt;
+               no_tools;
                allowed_tools = [];
-               max_turns = Some 1 } in
+               max_turns = Some 4 } in
   let* proc = Process.spawn_oneshot
       ~cwd:"." ~opts ~binary ~prompt () in
   let buf = Buffer.create 1024 in
@@ -44,9 +54,9 @@ let ask ?model ~binary ~prompt () =
     (match event with
      | Stream.Assistant_message { content; _ } ->
        Buffer.add_string buf (Stream.text_of_content content)
-     | Stream.Result { result; is_error; _ } ->
+     | Stream.Result { result; is_error; subtype; _ } ->
        if is_error then
-         Printf.eprintf "claude CLI error: %s\n%!" result
+         Printf.eprintf "claude CLI error (%s): %s\n%!" subtype result
      | _ -> ());
     Lwt.return_unit) in
   let _ = Process.wait proc in

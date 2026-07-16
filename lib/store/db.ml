@@ -38,6 +38,12 @@ let exec_params db sql params =
    | _ -> fail db (Printf.sprintf "exec_params failed: %s" sql));
   ignore (S.finalize stmt)
 
+(* Rows actually inserted/updated/deleted by the most recent write on this
+   connection. An UPDATE whose WHERE matches nothing is not an error in
+   SQLite — it silently changes 0 rows — so a caller that needs to know
+   whether its write landed must ask. *)
+let changes db = S.changes db
+
 (* Insert that returns last_insert_rowid. *)
 let insert_returning_id db sql params =
   exec_params db sql params;
@@ -63,12 +69,38 @@ let query_fold db sql params ~init ~f =
 let query_list db sql params ~f =
   List.rev (query_fold db sql params ~init:[] ~f:(fun acc cols -> f cols :: acc))
 
+(* Generic no-params query: returns column names and rows (Data.t arrays),
+   capped at [max_rows]. For running caller-supplied read-only SELECTs. *)
+let query_rows ?(max_rows = 500) db sql =
+  let stmt = S.prepare db sql in
+  let ncol = S.column_count stmt in
+  let headers = Array.to_list (Array.init ncol (S.column_name stmt)) in
+  let rec loop n acc =
+    if n >= max_rows then (acc, true)
+    else match S.step stmt with
+      | S.Rc.ROW -> loop (n + 1) (Array.init ncol (S.column stmt) :: acc)
+      | S.Rc.DONE -> (acc, false)
+      | _ -> fail db (Printf.sprintf "query failed: %s" sql)
+  in
+  let (rows_rev, truncated) = loop 0 [] in
+  ignore (S.finalize stmt);
+  (headers, List.rev rows_rev, truncated)
+
 (* Transaction wrapper — rolls back on exception. *)
-let with_txn db f =
-  exec db "BEGIN";
+let txn_with db begin_stmt f =
+  exec db begin_stmt;
   match f () with
   | v -> exec db "COMMIT"; v
   | exception e -> (try exec db "ROLLBACK" with _ -> ()); raise e
+
+let with_txn db f = txn_with db "BEGIN" f
+
+(* Read-then-write under one lock. A plain BEGIN is deferred: it takes the
+   write lock only at the first write, so two connections can both read the
+   same rows and then race to update them. BEGIN IMMEDIATE takes it up
+   front, which is what a select-then-claim (see Callgraph_store leases)
+   needs to be atomic across processes. *)
+let with_immediate_txn db f = txn_with db "BEGIN IMMEDIATE" f
 
 (* Convenience accessors for Sqlite3.Data.t. *)
 let data_to_string = function

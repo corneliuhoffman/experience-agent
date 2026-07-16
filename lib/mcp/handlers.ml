@@ -9,6 +9,7 @@ open Urme_engine.Git_link_types
 module D = Urme_store.Db
 module Schema = Urme_store.Schema
 module Search = Urme_search.Search
+module Cg = Urme_store.Callgraph_store
 module S = Sqlite3
 
 type state = {
@@ -35,6 +36,99 @@ let ensure_db st =
     let db = Schema.open_or_create ~project_dir:st.project_dir in
     st.db <- Some db;
     db
+
+(* The MCP [instructions] string, injected into the client's system prompt
+   at connect. When an annotated call graph exists we advertise it and how
+   to route to it — this is what makes a fresh session reach for the graph
+   tools on structural/impact/aggregate questions instead of defaulting to
+   grep (which, on those questions, means hand-building a worse analyzer).
+   Empty when there is no graph, so nothing is advertised that can't be
+   used. *)
+let server_instructions st =
+  match (try Some (Cg.status (ensure_db st)) with _ -> None) with
+  | Some (total, described, _) when total > 0 && described < total ->
+    (* Graph exists but is still being ANNOTATED — teach the describe loop
+       (a weak model otherwise flails on the workflow). *)
+    Printf.sprintf
+      "This project's call graph is built but only %d of %d functions are \
+       ANNOTATED. Your ONLY job this session is to annotate the rest, right \
+       here — a plain loop, no sub-agents, no plans, no TODO lists. \
+       Use ONLY the graph_* tools. Do NOT run Bash, write or execute \
+       scripts, Read files, or grep — every function's full source is \
+       already handed to you in each batch's `code` field, so there is \
+       nothing to fetch. Repeat these three steps until done:\n\
+       1. Call graph_next_batch. It hands you a batch of functions whose \
+       callees are ALREADY described (their summaries come back in \
+       `callees`).\n\
+       2. For EVERY function in `functions`, read its `code` and write one \
+       `description`: 1-3 sentences = what it does + signature + everything \
+       non-obvious a caller must know (side effects, security, \
+       error/empty/edge behaviour, BUGS). CRUCIAL: fold in the load-bearing \
+       GOTCHAS of its callees — if this function's behaviour depends on a \
+       callee that silently fails, swallows errors, matches by strict \
+       equality, skips on a missed run, etc., SAY SO HERE so the summary \
+       stands alone. Descriptions are trusted without reading source; be \
+       accurate and comprehensive.\n\
+       3. Call graph_set_descriptions with an array of {id, description} \
+       (exact ids from the batch), then go straight back to step 1.\n\
+       Keep looping until graph_next_batch returns an empty batch — THEN \
+       stop. Do not spawn agents or write a workflow; just call the tools \
+       in a loop yourself. If graph_set_descriptions reports `unknown_ids`, \
+       repost those."
+      described total
+  | Some (total, described, _) when total > 0 ->
+    let coverage =
+      if described >= total then Printf.sprintf "%d functions, all annotated" total
+      else Printf.sprintf "%d functions, %d annotated" total described
+    in
+    Printf.sprintf
+      "This project has a prebuilt, fully-annotated call graph (%s) served \
+       by the graph_* tools. Rules:\n\
+       1. ROUTE. 'How does X work / debug / review' -> graph_search on 2-3 \
+       concrete nouns, answer from the top summaries. Blast radius / change \
+       impact / 'how widely used' -> graph_blast_radius. Other structural \
+       facts (counts, rankings, caller sets, filters) -> graph_query \
+       (read-only SQL). One named function -> graph_describe.\n\
+       2. NEVER compute structure yourself: no Bash/Python analyzers, no \
+       grep/Read to find callers, blast radius, dead code, or flows — the \
+       graph holds these precomputed. Never hand-write a recursive closure; \
+       graph_blast_radius already runs it dispatch-inclusive.\n\
+       3. TRUST THE SUMMARIES. They are written from the source, \
+       leaves-first, fold in callee behaviour, and carry file:line — cite \
+       from them without opening files. Do not read source to 'verify' or \
+       'be thorough'.\n\
+       4. Read code ONLY via graph_describe code_only, in two cases: \
+       (a) a literal token no summary gives (exact regex, constant, \
+       operator); (b) DIAGNOSIS questions — 'find the bug', 'why does X \
+       sometimes fail', 'is it safe', guard/permission audits: triage with \
+       the graph, then pull the few implicated functions' code and ground \
+       the diagnosis in it — bugs live in lines summaries compress away. \
+       Use Read/grep only for config/wiring data with no graph node (e.g. \
+       an entry_points registry).\n\
+       5. NEVER state what a specific file or function registers, raises, \
+       or returns unless a summary says it or you read that code.\n\
+       6. ALWAYS run graph_blast_radius on the symbol a centrality/safety \
+       question names — never answer from memory. A bare name like 'get' \
+       can be 70+ different functions; the tool flags collisions \
+       (ambiguous:true) — never report one merged number for them.\n\
+       7. EXACT contracts (signature, return shape, tuple order): re-quote \
+       from a fresh graph_describe of that function; never reconstruct \
+       from memory — adjacent contracts blur into wrong hybrids.\n\
+       8. Otherwise REUSE results already in context instead of \
+       re-fetching; one closure often answers several questions."
+      coverage
+  | _ -> ""
+
+(* The tool list actually advertised for this project. Drop the build tools
+   once the graph is fully annotated (they only matter while constructing
+   it) and the memory-search tools when no session history is indexed —
+   their schemas would otherwise pad every session's prefix unused. *)
+let served_tools st =
+  let db = ensure_db st in
+  let total, described, _ = try Cg.status db with _ -> (0, 0, 0) in
+  let include_build = total = 0 || described < total in
+  let include_memory = try Cg.has_memory db with _ -> true in
+  Tools.tools_for ~include_memory ~include_build
 
 let ensure_repo st =
   match st.repo with
@@ -72,7 +166,9 @@ let text_result text =
     ];
   ]
 
-let json_result j = text_result (Yojson.Safe.pretty_to_string j)
+(* Compact, not pretty-printed: MCP results are read by a model, and
+   pretty-printing spends tokens on indentation in every response. *)
+let json_result j = text_result (Yojson.Safe.to_string j)
 
 let rec provenance_to_json = function
   | DirectEdit e ->
@@ -666,6 +762,672 @@ let handle_push_synthesis st args =
     (Printf.sprintf "Pushed synthesis (%d cited) to TUI."
        (List.length cited_results)))
 
+(* ---------- Annotated call graph ---------- *)
+
+(* Build the call graph by running the opengrep interfile exporter (the
+   static analyzer — descriptions still come from the calling session),
+   then load the JSON into the store. *)
+let handle_graph_init st args =
+  let open Yojson.Safe.Util in
+  let lang = args |> member "lang" |> to_string in
+  let root =
+    match args |> member "root" with
+    | `String r when r <> "" ->
+      if Filename.is_relative r then Filename.concat st.project_dir r else r
+    | _ -> st.project_dir in
+  let ncores = try args |> member "ncores" |> to_int with _ -> 4 in
+  let exporter =
+    match args |> member "exporter" with
+    | `String e when e <> "" -> e
+    | _ ->
+      (match Sys.getenv_opt "URME_OPENGREP_EXPORTER" with
+       | Some p when p <> "" -> p
+       | _ -> "opengrep-interfile-graph") in
+  let urme_dir = Filename.concat st.project_dir ".urme" in
+  if not (Sys.file_exists urme_dir) then Unix.mkdir urme_dir 0o755;
+  let out_json =
+    Filename.concat urme_dir (Printf.sprintf "callgraph-%s.json" lang) in
+  let cmd =
+    (exporter,
+     [| exporter; "export"; "--lang"; lang; "-r"; root;
+        "-o"; out_json; "-j"; string_of_int ncores |]) in
+  let tail s =
+    let n = String.length s in
+    if n > 800 then String.sub s (n - 800) 800 else s in
+  Lwt.catch
+    (fun () ->
+      let proc = Lwt_process.open_process_full cmd in
+      let* out = Lwt_io.read proc#stdout in
+      let* err = Lwt_io.read proc#stderr in
+      let* status = proc#close in
+      match status with
+      | Unix.WEXITED 0 ->
+        let db = ensure_db st in
+        let (nn, ne) =
+          Urme_engine.Callgraph_load.build ~db ~json_path:out_json in
+        let (total, described, ready) = Cg.status db in
+        let note =
+          if nn = 0 then
+            "0 nodes: the analyzer found no files — check `lang`, and \
+             point `root` at a standalone repo root (target discovery \
+             skips paths nested inside another git repo)."
+          else
+            "Graph loaded. Annotation is leaves-first and runs ONE BATCH \
+             PER AGENT: each agent calls graph_next_batch once, writes a \
+             short but comprehensive description for every returned \
+             function (lead with the binding name for _tmp_lambda nodes), \
+             posts them with graph_set_descriptions, and exits. Do not \
+             loop batches in one context — the cost per function grows \
+             with the history you carry. Annotate in parallel by \
+             launching many short-lived agents instead; batches are \
+             leased, so concurrent agents get disjoint units." in
+        Lwt.return (json_result (`Assoc [
+          "lang", `String lang;
+          "root", `String root;
+          "json", `String out_json;
+          "nodes", `Int nn;
+          "edges", `Int ne;
+          "total", `Int total;
+          "described", `Int described;
+          "remaining", `Int (total - described);
+          "ready_units", `Int ready;
+          "note", `String note;
+        ]))
+      | _ ->
+        let code = match status with
+          | Unix.WEXITED c -> Printf.sprintf "exit %d" c
+          | Unix.WSIGNALED s -> Printf.sprintf "signal %d" s
+          | Unix.WSTOPPED s -> Printf.sprintf "stopped %d" s in
+        Lwt.return (text_result (Printf.sprintf
+          "graph_init: %s failed (%s)%s.\nstdout: %s\nstderr: %s"
+          exporter code
+          (if code = "exit 127" then
+             " — binary not found; set URME_OPENGREP_EXPORTER or put \
+              opengrep-interfile-graph on PATH"
+           else "")
+          (tail out) (tail err))))
+    (fun exn ->
+      Lwt.return (text_result (Printf.sprintf
+        "graph_init: could not run %s (%s). Set URME_OPENGREP_EXPORTER \
+         to the opengrep-interfile-graph binary or put it on PATH."
+        exporter (Printexc.to_string exn))))
+
+let handle_graph_status st _args =
+  let db = ensure_db st in
+  let (total, described, ready) = Cg.status db in
+  Lwt.return (json_result (`Assoc [
+    "total", `Int total;
+    "described", `Int described;
+    "remaining", `Int (total - described);
+    "ready_units", `Int ready;
+  ]))
+
+let desc_pair (nm, d) =
+  `Assoc [ "name", `String nm;
+           "description", (match d with Some s -> `String s | None -> `Null) ]
+
+(* Neighbour lists carry names only — an agent that needs a neighbour's
+   summary describes it directly, instead of every hit re-sending full
+   paragraphs for its whole fan-out. Rendered as compact strings: bare
+   "name" when the neighbour lives in the same file as the hit,
+   "name (file)" otherwise. *)
+let neighbor_str ~hit_file (nm, file) =
+  if file = hit_file then `String nm
+  else `String (Printf.sprintf "%s (%s)" nm file)
+
+(* First sentence of a description — the "gist" for wide bulk pulls where
+   full paragraphs would blow the tool-result size budget. Cuts at the
+   first ". " (or the whole string if none), capped so a runaway summary
+   can't dominate. *)
+let first_sentence s =
+  let n = String.length s in
+  let stop = ref n in
+  let i = ref 0 in
+  while !i < n - 1 && !stop = n do
+    (if s.[!i] = '.' && s.[!i + 1] = ' ' then stop := !i + 1);
+    incr i
+  done;
+  let stop = if !stop > 220 then 220 else !stop in
+  if stop >= n then s else String.sub s 0 stop
+
+(* Node paths are stored relative to the analyzed root (meta cg_root);
+   resolve before reading source off disk. *)
+let cg_abs_file db file =
+  if file <> "" && Filename.is_relative file then
+    match Schema.get_meta db "cg_root" with
+    | Some root when root <> "" -> Filename.concat root file
+    | _ -> file
+  else file
+
+(* Identifies the annotator holding a batch's leases. Callers that don't
+   pass one get a fresh token, so an absent `owner` still yields disjoint
+   batches — it only costs the caller the ability to name its own claims. *)
+let owner_token args =
+  let open Yojson.Safe.Util in
+  match (try args |> member "owner" |> to_string with _ -> "") with
+  | "" ->
+    Printf.sprintf "anon-%d-%06d" (Unix.getpid ()) (Random.int 1_000_000)
+  | o -> o
+
+let handle_graph_next_batch st args =
+  let open Yojson.Safe.Util in
+  let db = ensure_db st in
+  let by_file = try args |> member "by_file" |> to_bool with _ -> false in
+  if by_file then begin
+    (* File-granularity: whole files, `limit` of them per batch (default 3),
+       line-budgeted in the store so a pathologically huge file can't
+       overflow (it chunks). Normal files come whole. *)
+    let flimit = max 1 (try args |> member "limit" |> to_int with _ -> 3) in
+    let units = try Cg.next_ready_file_units db ~limit:flimit with _ -> [] in
+    let file_unit_json (u : Cg.file_unit) =
+      let fns = List.map (fun (m : Cg.node) ->
+        let code = Urme_engine.Callgraph_load.extract_code
+            ~file:(cg_abs_file db m.file)
+            ~start_line:m.start_line ~end_line:m.end_line in
+        `Assoc [
+          "id", `String m.id; "name", `String m.name; "file", `String m.file;
+          "start_line", `Int m.start_line; "end_line", `Int m.end_line;
+          "kind", `String m.kind; "code", `String code ]) u.ufns in
+      `Assoc [
+        "files", `List (List.map (fun f -> `String f) u.ufiles);
+        "functions", `List fns;
+        "callees", `List (List.map desc_pair u.ucallees) ] in
+    let (total, described, ready) = Cg.status db in
+    Lwt.return (json_result (`Assoc [
+      "mode", `String "by_file";
+      "total", `Int total; "described", `Int described;
+      "remaining", `Int (total - described); "ready_units", `Int ready;
+      "batch", `List (List.map file_unit_json units);
+      "note", `String
+        "BY-FILE batch: each item in `batch` is one file (or a cyclic file- \
+         group, in `files`) whose dependencies are already described. Read \
+         the file(s) as a module and describe EVERY function in `functions` \
+         in one pass — 1-3 sentences each: what it does + signature + \
+         non-obvious behaviour + BUGS, and FOLD IN the `callees` gotchas (a \
+         callee that silently fails / swallows errors / matches by strict \
+         equality / skips on a missed run: say it so the summary stands \
+         alone). Post ALL via graph_set_descriptions [{id,description},...], \
+         then call graph_next_batch with by_file:true AGAIN for the next \
+         file — loop in THIS session until the batch comes back empty. No \
+         sub-agents, no plan, no scripts: the full `code` of every function \
+         is right here in the batch, so do NOT Bash / Read files / grep. \
+         Each batch is self-contained (you need nothing from prior batches, \
+         so a compaction between them loses nothing)." ]))
+  end
+  else begin
+  (* Bigger default batch: in a single-session loop, fewer/larger batches
+     mean fewer round-trips (the whole cost is turns × growing context). *)
+  let limit = try args |> member "limit" |> to_int with _ -> 25 in
+  (* Claim the units as we hand them out: this call used to be a pure
+     read, so every concurrent annotator got the identical batch and
+     redid the same work. *)
+  let sccs =
+    Cg.acquire_ready_sccs db ~owner:(owner_token args) ~limit:(max 1 limit) in
+  let unit_json scc =
+    let members = Cg.scc_members db ~scc in
+    let callees = Cg.scc_callee_descriptions db ~scc in
+    let fns = List.map (fun (m : Cg.node) ->
+      let code = Urme_engine.Callgraph_load.extract_code
+          ~file:(cg_abs_file db m.file)
+          ~start_line:m.start_line ~end_line:m.end_line in
+      `Assoc [
+        "id", `String m.id;
+        "name", `String m.name;
+        "file", `String m.file;
+        "start_line", `Int m.start_line;
+        "end_line", `Int m.end_line;
+        "kind", `String m.kind;
+        "code", `String code;
+      ]) members in
+    `Assoc [
+      "scc", `Int scc;
+      "recursive", `Bool (List.length members > 1);
+      "functions", `List fns;
+      "callees", `List (List.map desc_pair callees);
+    ] in
+  let batch = List.map unit_json sccs in
+  let (total, described, ready) = Cg.status db in
+  Lwt.return (json_result (`Assoc [
+    "total", `Int total;
+    "described", `Int described;
+    "remaining", `Int (total - described);
+    "ready_units", `Int ready;
+    "batch", `List batch;
+    "note", `String
+      "STEPS: (1) For EVERY function in `functions`, read its `code` and \
+       write a `description`: 1-3 sentences = what it does + signature + \
+       everything non-obvious a caller must know (side effects, security \
+       relevance, error/empty/edge behaviour, BUGS). (2) FOLD IN CALLEE \
+       GOTCHAS: use the `callees` summaries — if this function's behaviour \
+       hinges on a callee that silently fails / swallows errors / matches \
+       by strict equality / skips on a missed run, state that gotcha HERE \
+       so the summary stands alone (a reader must never need to open the \
+       callee). (3) Post ALL of them in ONE graph_set_descriptions call: \
+       descriptions=[{\"id\": <exact id from this batch>, \"description\": \
+       <your text>}, ...]. (4) Then call graph_next_batch AGAIN for the \
+       next batch and repeat — keep looping in THIS session until a batch \
+       comes back empty. No sub-agents, no plan, no TODO list, no scripts \
+       — the full `code` of each function is in the batch, so do NOT Bash / \
+       Read files / grep; just call the tools in a loop. \
+       recursive:true units are mutually-recursive — describe them \
+       together. Synthetic names (_tmp_lambda) are lambdas — START the \
+       description with the real binding name from the code so searches \
+       find it. \
+       EXAMPLE description (note the folded-in callee gotcha): \"Sends \
+       expiration emails for due certs: groups eligible certs by owner and \
+       dispatches plugin.send per notification. GOTCHA: eligibility runs \
+       through needs_notification, which matches days-to-expiry by STRICT \
+       equality, so a missed daily run skips that cert permanently; plugin \
+       send errors are swallowed (metrics+Sentry only).\"";
+  ]))
+  end
+
+let handle_graph_set_descriptions st args =
+  let open Yojson.Safe.Util in
+  let db = ensure_db st in
+  let items = try args |> member "descriptions" |> to_list with _ -> [] in
+  (* [written] counts rows that actually changed, not items received: an
+     id that matches no node updates nothing, and reporting it as written
+     would tell an annotator its work landed when it was dropped. Those
+     ids come back in `unknown_ids` so the caller can repost them. *)
+  let (written_ids, unknown_ids) =
+    List.fold_left (fun (ok, bad) j ->
+      match (try Some (j |> member "id" |> to_string) with _ -> None),
+            (try Some (j |> member "description" |> to_string) with _ -> None)
+      with
+      | Some id, Some d when String.trim d <> "" ->
+        if Cg.set_description db ~id ~description:d ~code_hash:None
+        then (id :: ok, bad) else (ok, id :: bad)
+      | Some id, _ -> (ok, id :: bad)   (* empty/absent description *)
+      | None, _ -> (ok, bad)) ([], []) items in
+  let written = List.length written_ids in
+  (* Descriptions are in: let go of the units they belong to instead of
+     parking them until the lease expires. *)
+  (try Cg.release_leases_for_nodes db ~ids:written_ids with _ -> ());
+  let (total, described, ready) = Cg.status db in
+  (* Dispatch edges are derived from the descriptions; once every function
+     is annotated, (re)materialise them so graph_neighborhood can traverse
+     dynamic-dispatch paths. *)
+  if total > 0 && described >= total then
+    (try Cg.populate_dispatch_edges db with _ -> ());
+  Lwt.return (json_result (`Assoc ([
+    "written", `Int written;
+    "unknown_ids", `List (List.rev_map (fun i -> `String i) unknown_ids);
+    "total", `Int total;
+    "described", `Int described;
+    "remaining", `Int (total - described);
+    "ready_units", `Int ready;
+  ] @ (if unknown_ids = [] then [] else [
+    "note", `String
+      "unknown_ids were NOT written — no function has that id, or the \
+       description was empty. Repost them with the exact `id` strings from \
+       graph_next_batch.";
+  ]))))
+
+let handle_graph_describe st args =
+  let open Yojson.Safe.Util in
+  let db = ensure_db st in
+  let query = args |> member "query" |> to_string in
+  (* code_only: the surgical-source path — return just the function's exact
+     line span (start_line..end_line), no summary, no caller/callee sets.
+     This is what to reach for instead of Read/grep when you need the actual
+     code of a function: the graph knows its precise bounds, so it pulls
+     only those lines, never the whole file. Implies include_code. *)
+  let code_only =
+    try args |> member "code_only" |> to_bool with _ -> false in
+  let include_code =
+    code_only || (try args |> member "include_code" |> to_bool with _ -> false) in
+  (* A dispatched-to function (task queue, plugin registry, signal) has
+     no static caller edge, but its dispatchers' summaries name it: when
+     the callers list is empty, attach the functions whose descriptions
+     mention this one. Synthetic names (<top_level>, _tmp_lambda) would
+     only phrase-match noise, so skip them. *)
+  let mentions (m : Cg.found) =
+    let synthetic =
+      m.fname = "" || m.fname.[0] = '<'
+      || (String.length m.fname >= 5 && String.sub m.fname 0 5 = "_tmp_") in
+    if synthetic then []
+    else
+      try Cg.mentioned_by db ~name:m.fname ~exclude_id:m.fid ~limit:5
+      with _ -> [] in
+  let mention_json (h : Cg.found) =
+    `Assoc [
+      "name", `String h.fname;
+      "file", `String h.ffile;
+      "line", `Int h.fstart;
+      "description",
+        (match h.fdesc with Some s -> `String s | None -> `Null);
+    ] in
+  let include_callees =
+    try args |> member "include_callees" |> to_bool with _ -> false in
+  (* No `id`: it only restates name|file|line, and consumers query by
+     name. No end_line/normal-kind either — dead weight per match.
+     Callees are omitted by default: descriptions are written leaves-first
+     with callee summaries in hand, so the ones that matter are already
+     named in the prose. Callers can't be embedded that way (they don't
+     exist yet at annotation time), so they are always returned. *)
+  let match_json (m : Cg.found) =
+    if code_only then
+      (* Surgical read: exactly this function's lines, nothing else. *)
+      `Assoc [
+        "name", `String m.fname;
+        "file", `String m.ffile;
+        "line", `Int m.fstart;
+        "end_line", `Int m.fend;
+        "code", `String (Urme_engine.Callgraph_load.extract_code
+                           ~file:(cg_abs_file db m.ffile)
+                           ~start_line:m.fstart ~end_line:m.fend);
+      ]
+    else
+    let callers = Cg.callers db ~id:m.fid in
+    let nb = neighbor_str ~hit_file:m.ffile in
+    let base = [
+      "name", `String m.fname;
+      "file", `String m.ffile;
+      "line", `Int m.fstart;
+    ] in
+    let base =
+      if m.fkind = "normal" then base
+      else base @ [ "kind", `String m.fkind ] in
+    let base = base @ [
+      "description",
+        (match m.fdesc with Some s -> `String s | None -> `Null);
+    ] in
+    let base =
+      if include_callees then
+        base @ [ "callees", `List (List.map nb (Cg.callees db ~id:m.fid)) ]
+      else base in
+    let base = base @ [ "callers", `List (List.map nb callers) ] in
+    let base =
+      match (if callers = [] then mentions m else []) with
+      | [] -> base
+      | ms ->
+        base @ [ "mentioned_by", `List (List.map mention_json ms) ] in
+    let base =
+      if include_code then
+        base @ [ "code", `String (Urme_engine.Callgraph_load.extract_code
+                                    ~file:(cg_abs_file db m.ffile)
+                                    ~start_line:m.fstart
+                                    ~end_line:m.fend) ]
+      else base in
+    `Assoc base in
+  (* Lambdas carry synthetic node names (e.g. _tmp_lambda), so an exact
+     name miss falls back to FTS over name+description — the described
+     graph usually knows the binding name from the summary text. *)
+  let matches =
+    match Cg.lookup db ~query with
+    | [] -> (try Cg.search db ~fts:query ~limit:10 with _ -> [])
+    | ms -> ms in
+  Lwt.return (json_result (`Assoc [
+    "query", `String query;
+    "n_matches", `Int (List.length matches);
+    "matches", `List (List.map match_json matches);
+  ]))
+
+(* Reachable-subgraph query: seed from named functions, walk call edges
+   `depth` hops in a direction, return only the closure. Turns a question
+   ("how does issuance work") into exactly the relevant nodes — the
+   entry points' callee-closure — instead of a whole-package dump. *)
+let handle_graph_neighborhood st args =
+  let open Yojson.Safe.Util in
+  let db = ensure_db st in
+  let roots =
+    try args |> member "roots" |> to_list |> List.filter_map (fun j ->
+      try Some (to_string j) with _ -> None)
+    with _ -> [] in
+  let direction =
+    match (try args |> member "direction" |> to_string with _ -> "callees") with
+    | "callers" -> Cg.Callers | "both" -> Cg.Both | _ -> Cg.Callees in
+  let include_code =
+    try args |> member "include_code" |> to_bool with _ -> false in
+  let depth =
+    (* A code-trace pulls source for every node reached, and each new
+       function's source is billed at the cache-WRITE rate — so an extra
+       hop is expensive. Default include_code traces to a tight 2 hops
+       (the direct flow) unless the caller asked for more; plain
+       (description-only) walks stay at 3. *)
+    let default_depth = if include_code then 2 else 3 in
+    let d = try args |> member "depth" |> to_int with _ -> default_depth in
+    max 1 (min 8 d) in
+  let limit = try args |> member "limit" |> to_int with _ -> 250 in
+  let detail = try args |> member "detail" |> to_string with _ -> "" in
+  let seed_file = try args |> member "file" |> to_string with _ -> "" in
+  let follow_dispatch =
+    try args |> member "follow_dispatch" |> to_bool with _ -> true in
+  (* Lazy backfill: a graph annotated before dispatch edges existed has an
+     empty cg_dispatch; populate it once so this (and later) traversals
+     can follow dynamic dispatch. *)
+  (if follow_dispatch && Cg.dispatch_edge_count db = 0
+      && (let (t, d, _) = Cg.status db in t > 0 && d >= t)
+   then try Cg.populate_dispatch_edges db with _ -> ());
+  let capped = max 1 (min 2000 limit) in
+  let nodes =
+    if roots = [] then []
+    else try Cg.neighborhood db ~roots ~direction ~depth ~follow_dispatch
+               ~limit:capped ~seed_file
+         with _ -> [] in
+  (* With code present, the source is the detail — full paragraph summaries
+     alongside it are largely redundant tokens, so brief the descriptions to
+     a one-line gist unless the caller explicitly asked for "full". Without
+     code, only brief once the slice is wide. *)
+  let brief =
+    detail = "brief"
+    || (detail <> "full"
+        && (include_code || List.length nodes > 60)) in
+  let node_json (m : Cg.found) =
+    let base = [
+      "name", `String m.fname;
+      "file", `String m.ffile;
+      "line", `Int m.fstart;
+    ] in
+    let base =
+      if m.fkind = "normal" then base else base @ [ "kind", `String m.fkind ] in
+    let base = base @ [
+      "description",
+        (match m.fdesc with
+         | Some s -> `String (if brief then first_sentence s else s)
+         | None -> `Null);
+    ] in
+    if include_code then
+      base @ [ "code", `String (Urme_engine.Callgraph_load.extract_code
+                                  ~file:(cg_abs_file db m.ffile)
+                                  ~start_line:m.fstart ~end_line:m.fend) ]
+    else base in
+  let dir_s = match direction with
+    | Cg.Callees -> "callees" | Cg.Callers -> "callers" | Cg.Both -> "both" in
+  Lwt.return (json_result (`Assoc [
+    "roots", `List (List.map (fun r -> `String r) roots);
+    "direction", `String dir_s;
+    "depth", `Int depth;
+    "n_nodes", `Int (List.length nodes);
+    "detail", `String (if brief then "brief" else "full");
+    "nodes", `List (List.map (fun m -> `Assoc (node_json m)) nodes);
+    "note", `String
+      "The reachable subgraph from the seed functions (deduped, \
+       leaves-first). This is the task-relevant slice — not a whole-file \
+       dump. Widen with a larger `depth`; use graph_describe for a \
+       specific function's callers/mentioned_by.";
+  ]))
+
+let handle_graph_search st args =
+  let open Yojson.Safe.Util in
+  let db = ensure_db st in
+  let fts = try args |> member "fts_terms" |> to_string with _ -> "" in
+  (* Lean defaults: the leaves-first summaries are self-contained, so a few
+     hits usually answer the question; return no caller lists unless asked
+     (they're only for change-impact). Keeps the response — and the context
+     every later turn re-reads — small. *)
+  let limit = try args |> member "limit" |> to_int with _ -> 6 in
+  let neighbors = try args |> member "neighbors" |> to_bool with _ -> false in
+  (* FTS MATCH can raise on odd syntax; degrade to no hits rather than fail. *)
+  let hits =
+    if String.trim fts = "" then []
+    else try Cg.search db ~fts ~limit:(max 1 (min 100 limit)) with _ -> [] in
+  (* Callers only: callee knowledge is already embedded in the
+     description (written leaves-first with callee summaries in hand). *)
+  let hit_json (m : Cg.found) =
+    let nb = neighbor_str ~hit_file:m.ffile in
+    let base = [
+      "name", `String m.fname;
+      "file", `String m.ffile;
+      "line", `Int m.fstart;
+      "description",
+        (match m.fdesc with Some s -> `String s | None -> `Null);
+    ] in
+    let base =
+      if neighbors then
+        base @ [ "callers", `List (List.map nb (Cg.callers db ~id:m.fid)) ]
+      else base in
+    `Assoc base in
+  Lwt.return (json_result (`Assoc [
+    "fts_terms", `String fts;
+    "n_results", `Int (List.length hits);
+    "results", `List (List.map hit_json hits);
+  ]))
+
+(* Run a caller-supplied read-only SELECT over the graph schema and return
+   columns + rows. The model writes the query for its question — one tool
+   subsumes search / describe / overview / neighborhood / trace. Safety:
+   PRAGMA query_only makes any write fail at runtime (real enforcement,
+   no keyword heuristics), rows are capped, and only SELECT/WITH start. *)
+let handle_graph_query st args =
+  let open Yojson.Safe.Util in
+  let db = ensure_db st in
+  let sql = try args |> member "sql" |> to_string with _ -> "" in
+  let limit =
+    let l = try args |> member "max_rows" |> to_int with _ -> 300 in
+    max 1 (min 1000 l) in
+  let low = String.lowercase_ascii (String.trim sql) in
+  let starts p =
+    String.length low >= String.length p && String.sub low 0 (String.length p) = p in
+  let has needle =
+    let nl = String.length needle and hl = String.length low in
+    let rec go i =
+      if i + nl > hl then false
+      else if String.sub low i nl = needle then true else go (i + 1) in
+    nl = 0 || go 0 in
+  let allow_recursive =
+    try args |> member "allow_recursive" |> to_bool with _ -> false in
+  (* A hand-written transitive closure over cg_edges/cg_dispatch IS what
+     graph_blast_radius does — redirect instead of running it, so the model
+     doesn't (redundantly) compute blast radius both ways. Escape hatch:
+     allow_recursive:true for a genuinely different recursive traversal. *)
+  let is_closure = has "recursive" && (has "cg_edges" || has "cg_dispatch") in
+  if String.trim sql = "" then
+    Lwt.return (json_result (`Assoc [ "error", `String "graph_query: empty sql" ]))
+  else if not (starts "select" || starts "with") then
+    Lwt.return (json_result (`Assoc [
+      "error", `String
+        "graph_query: only a single read-only SELECT/WITH query is allowed." ]))
+  else if is_closure && not allow_recursive then
+    Lwt.return (json_result (`Assoc [
+      "error", `String
+        "This is a transitive-closure over the call edges — i.e. blast \
+         radius / transitive callers. Do NOT hand-write it; call \
+         graph_blast_radius(name:<function>) instead — it runs exactly this \
+         (dispatch-inclusive) and returns direct + transitive counts + a \
+         by-file breakdown, in one call. Writing the recursion yourself is \
+         redundant and slower. If you genuinely need a DIFFERENT recursive \
+         traversal (not a caller/callee closure), pass allow_recursive:true.";
+      "use_instead", `String "graph_blast_radius" ]))
+  else begin
+    (try D.exec db "PRAGMA query_only=ON" with _ -> ());
+    let result =
+      try Ok (D.query_rows ~max_rows:limit db sql)
+      with e -> Error (Printexc.to_string e) in
+    (try D.exec db "PRAGMA query_only=OFF" with _ -> ());
+    match result with
+    | Error msg ->
+      Lwt.return (json_result (`Assoc [
+        "error", `String ("SQL error: " ^ msg);
+        "hint", `String
+          "Schema: cg_nodes(id,name,file,start_line,end_line,kind,scc,topo,\
+           description); cg_edges(src,dst) caller->callee; cg_dispatch(src,dst) \
+           dynamic dispatcher->target; cg_fts(node_id,name,description) FTS5 \
+           (use: cg_fts MATCH 'description:\"term\"'). Paths are repo-relative.";
+      ]))
+    | Ok (headers, rows, truncated) ->
+      let data_json = function
+        | S.Data.NULL | S.Data.NONE -> `Null
+        | S.Data.INT i -> `Int (Int64.to_int i)
+        | S.Data.FLOAT f -> `Float f
+        | S.Data.TEXT s | S.Data.BLOB s -> `String s in
+      let row_json r = `List (Array.to_list (Array.map data_json r)) in
+      Lwt.return (json_result (`Assoc [
+        "columns", `List (List.map (fun h -> `String h) headers);
+        "n_rows", `Int (List.length rows);
+        "truncated", `Bool truncated;
+        "rows", `List (List.map row_json rows);
+      ]))
+  end
+
+(* Blast radius as a first-class op: the model names a function, the tool
+   runs the dispatch-inclusive transitive closure itself. Removes the two
+   query-composition mistakes weak models make (one-hop COUNT; forgetting
+   cg_dispatch) and resolves the name-collision by reporting each matching
+   node separately. *)
+let handle_graph_blast_radius st args =
+  let open Yojson.Safe.Util in
+  let db = ensure_db st in
+  let name = try args |> member "name" |> to_string with _ -> "" in
+  let file = try args |> member "file" |> to_string with _ -> "" in
+  let direction =
+    match (try args |> member "direction" |> to_string with _ -> "callers") with
+    | "callees" -> Cg.Callees | _ -> Cg.Callers in
+  let include_dispatch =
+    try args |> member "include_dispatch" |> to_bool with _ -> true in
+  let file_limit =
+    max 1 (min 50 (try args |> member "file_breakdown_limit" |> to_int with _ -> 12)) in
+  if String.trim name = "" then
+    Lwt.return (json_result (`Assoc [
+      "error", `String "graph_blast_radius: 'name' is required" ]))
+  else begin
+    let results =
+      try Cg.blast_radius db ~name ~file ~direction ~include_dispatch ~file_limit
+      with _ -> [] in
+    let dir_s = match direction with Cg.Callees -> "callees" | _ -> "callers" in
+    let json_of (b : Cg.blast) =
+      `Assoc [
+        "name", `String b.bnode.fname;
+        "file", `String b.bnode.ffile;
+        "line", `Int b.bnode.fstart;
+        "direct", `Int b.direct;
+        "transitive", `Int b.transitive;
+        "by_file", `List (List.map (fun (f, c) ->
+          `Assoc [ "file", `String f; "count", `Int c ]) b.by_file);
+      ] in
+    let nmatch = List.length results in
+    let nfiles =
+      List.sort_uniq compare (List.map (fun (b : Cg.blast) -> b.bnode.ffile) results)
+      |> List.length in
+    let note =
+      if nmatch > 3 then
+        Printf.sprintf
+          "AMBIGUOUS: %d DISTINCT functions are named '%s', across %d files — \
+           these are DIFFERENT functions, not one. There is NO single blast \
+           radius for '%s'; each row below is its own function with its own \
+           count. Any answer that treats '%s' as one function (a merged count) \
+           is WRONG — the question is under-specified. Say so, and either pick \
+           the specific one (by file) or report per-implementation. \
+           (transitive = dispatch-inclusive closure; direct = one-hop.)"
+          nmatch name nfiles name name
+      else
+        "transitive = full dispatch-inclusive closure (THE blast radius); \
+         direct = one-hop callers only. Same-named functions across files are \
+         listed separately — pick the one you mean by file. by_file groups the \
+         closure by file for entry-point categories (views=REST, cli=CLI, \
+         celery=tasks, tests)." in
+    Lwt.return (json_result (`Assoc [
+      "query", `String name;
+      "direction", `String dir_s;
+      "dispatch_included", `Bool include_dispatch;
+      "n_matches", `Int nmatch;
+      "ambiguous", `Bool (nmatch > 1);
+      "note", `String note;
+      "matches", `List (List.map json_of results);
+    ]))
+  end
+
 (* ---------- Dispatch ---------- *)
 
 let dispatch st name args =
@@ -678,4 +1440,13 @@ let dispatch st name args =
   | "explain_change" -> handle_explain_change st args
   | "commit_links"   -> handle_commit_links st args
   | "search_by_file" -> handle_search_by_file st args
+  | "graph_init"             -> handle_graph_init st args
+  | "graph_status"           -> handle_graph_status st args
+  | "graph_next_batch"       -> handle_graph_next_batch st args
+  | "graph_set_descriptions" -> handle_graph_set_descriptions st args
+  | "graph_describe"         -> handle_graph_describe st args
+  | "graph_search"           -> handle_graph_search st args
+  | "graph_neighborhood"     -> handle_graph_neighborhood st args
+  | "graph_query"            -> handle_graph_query st args
+  | "graph_blast_radius"     -> handle_graph_blast_radius st args
   | _ -> Lwt.return (text_result (Printf.sprintf "Unknown tool: %s" name))
