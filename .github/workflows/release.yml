@@ -31,6 +31,13 @@ jobs:
             sleep 30
           done
 
+      - name: Sync binary version with the tag
+        shell: bash
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          sed -i '' "s/~version:\"[^\"]*\"/~version:\"${version}\"/" bin/main.ml
+          grep -n '~version' bin/main.ml
+
       - run: opam exec -- dune build --profile release bin/main.exe
 
       - name: Bundle dylibs
@@ -46,6 +53,15 @@ jobs:
           # Brew's symlink in bin/ resolves @executable_path to the
           # libexec location where we ship both urme and lib/.
           dylibbundler -od -b -x dist/urme -d dist/lib -p '@executable_path/lib/'
+          # Re-sign AFTER dylibbundler: rewriting install names
+          # invalidates the code signature, and arm64 macOS SIGKILLs
+          # binaries with a stale signature. Ad-hoc is sufficient.
+          codesign -s - -f dist/urme dist/lib/*.dylib
+          # Smoke test the staged layout, and make sure the version we
+          # ship is the tag we shipped it under.
+          got="$(dist/urme --version)"
+          echo "urme --version -> $got (tag: $version)"
+          [ "$got" = "$version" ] || { echo "version mismatch"; exit 1; }
           tar -C dist -czf "$tarball" urme lib
           shasum -a 256 "$tarball" | tee "$tarball.sha256"
           echo "tarball=$tarball" >> "$GITHUB_OUTPUT"
@@ -56,6 +72,44 @@ jobs:
             ${{ steps.stage.outputs.tarball }}
             ${{ steps.stage.outputs.tarball }}.sha256
           generate_release_notes: true
+
+  # Install the canonical formula template (packaging/homebrew) into the
+  # tap (urme-dev/homebrew-urme) with version + sha256 filled from this
+  # release — a full copy, not a patch, so structure/URL changes to the
+  # template always propagate. Needs a TAP_GITHUB_TOKEN secret
+  # (fine-grained PAT, contents:write on homebrew-urme); silently skipped
+  # when the secret is absent.
+  bump-tap:
+    needs: [macos, linux]
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Render formula and push to the tap
+        shell: bash
+        env:
+          TAP_TOKEN: ${{ secrets.TAP_GITHUB_TOKEN }}
+        run: |
+          [ -n "$TAP_TOKEN" ] || { echo "no TAP_GITHUB_TOKEN; skipping tap bump"; exit 0; }
+          version="${GITHUB_REF_NAME#v}"
+          base="https://github.com/${GITHUB_REPOSITORY}/releases/download/v${version}"
+          mac_sha=$(curl -sL "$base/urme-${version}-arm64-darwin.tar.gz" | sha256sum | cut -d' ' -f1)
+          linux_sha=$(curl -sL "$base/urme-${version}-x86_64-linux.tar.gz" | sha256sum | cut -d' ' -f1)
+          echo "arm64-darwin: $mac_sha"
+          echo "x86_64-linux: $linux_sha"
+          sed -e "s/@VERSION@/${version}/g" \
+              -e "s/@ARM64_DARWIN_SHA256@/${mac_sha}/" \
+              -e "s/@X86_64_LINUX_SHA256@/${linux_sha}/" \
+              packaging/homebrew/Formula/urme.rb > /tmp/urme.rb
+          ruby -c /tmp/urme.rb
+          ! grep -Eq '@[A-Z0-9_]+@' /tmp/urme.rb || { echo "unfilled placeholder"; exit 1; }
+          git clone "https://x-access-token:${TAP_TOKEN}@github.com/urme-dev/homebrew-urme.git" tap
+          cp /tmp/urme.rb tap/Formula/urme.rb
+          cd tap
+          git config user.name "urme-release-bot"
+          git config user.email "release-bot@users.noreply.github.com"
+          git commit -am "urme ${version}"
+          git push
 
   linux:
     name: x86_64-linux
@@ -84,6 +138,13 @@ jobs:
             sleep 30
           done
 
+      - name: Sync binary version with the tag
+        shell: bash
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          sed -i "s/~version:\"[^\"]*\"/~version:\"${version}\"/" bin/main.ml
+          grep -n '~version' bin/main.ml
+
       - run: opam exec -- dune build --profile release bin/main.exe
 
       - name: Bundle .so files
@@ -107,6 +168,10 @@ jobs:
           file dist/urme
           ldd dist/urme
           ls -lh dist/lib/
+          # Smoke test the staged layout + tag/version agreement.
+          got="$(dist/urme --version)"
+          echo "urme --version -> $got (tag: $version)"
+          [ "$got" = "$version" ] || { echo "version mismatch"; exit 1; }
           tar -C dist -czf "$tarball" urme lib
           sha256sum "$tarball" | tee "$tarball.sha256"
           echo "tarball=$tarball" >> "$GITHUB_OUTPUT"
