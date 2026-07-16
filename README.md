@@ -83,6 +83,68 @@ urme is a single binary backed by a local SQLite store (`.urme/db.sqlite` at the
 
 Claude access goes exclusively through the `claude` CLI subprocess — no `ANTHROPIC_API_KEY`, no direct API calls. Uses your subscription.
 
+## Code navigation: the annotated call graph
+
+Besides session history, urme can serve an **annotated call graph** of a
+codebase over MCP: every function gets a summary written from its source
+(leaves-first, so callers' summaries fold in what their callees do), and
+`graph_*` tools answer structure questions — blast radius, flows,
+rankings, dead code — without grep or file reading.
+
+```sh
+cd my-repo
+urme graph-init         # loads .urme/callgraph-<lang>.json (a call-graph export is needed — see below)
+urme annotate           # writes per-function summaries via the claude CLI (Haiku by default, -m to change)
+```
+
+Then add urme as an MCP server and the `graph_search` / `graph_describe` /
+`graph_query` / `graph_blast_radius` / `graph_neighborhood` tools become
+available, with usage rules served in the MCP instructions.
+
+`graph-init` needs a call-graph export of the repo. If a supported
+extractor is installed it runs it automatically; otherwise place a JSON
+with the shape below at `.urme/callgraph-<lang>.json` and re-run — any
+tool that can enumerate functions and resolved calls can produce it.
+
+### Call-graph JSON format
+
+One JSON object:
+
+```jsonc
+{
+  "schema": "…",            // informational; ignored by the loader
+  "lang": "python",
+  "root": "/abs/path/to/repo",   // prefix stripped from all paths on load
+  "nodes": [
+    {
+      "id": "b|/abs/path/to/repo/src/x.py|4|4",  // name|file|line|col of the def's name token
+      "name": "b",
+      "file": "/abs/path/to/repo/src/x.py",
+      "start_line": 4,          // 1-based; the `def` line (decorators handled at read time)
+      "start_col": 4,
+      "end_line": 5,            // last line of the body
+      "end_exact": true,        // false if end_line is a best-effort bound
+      "kind": "normal"          // "normal" | "lambda" | "toplevel"
+    }
+  ],
+  "edges": [
+    {
+      "source": "a|…|1|4",      // the CALLEE's node id
+      "target": "b|…|4|4",      // the CALLER's node id
+      "kind": "call",
+      "call_site": { "file": "/abs/…/x.py", "line": 5, "col": 11 }  // inside the caller
+    }
+  ]
+}
+```
+
+Note the edge orientation: exports are **callee → caller** (`source` is
+the callee, `target` the caller, and `call_site` falls inside the
+caller's span); urme swaps them on load and stores caller → callee.
+Node ids must be unique and stable — same-named functions are told apart
+by file/line/col. `urme graph-build <file.json>` loads an export
+directly if you keep it somewhere other than `.urme/`.
+
 ## One-shot questions: `urme ask`
 
 ```sh

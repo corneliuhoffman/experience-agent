@@ -198,7 +198,8 @@ let import_cmd =
 let graph_build_cmd =
   let json =
     Arg.(required & pos 0 (some string) None & info [] ~docv:"CALLGRAPH_JSON"
-           ~doc:"Path to an opengrep-callgraph/v1 JSON export.") in
+           ~doc:"Path to a call-graph JSON export (see the README section \
+                 'Call-graph JSON format').") in
   let run json project_dir =
     let project_dir =
       if project_dir = "." then Sys.getcwd ()
@@ -218,7 +219,7 @@ let graph_build_cmd =
        %d SCC-units ready)\n" nn ne described total ready
   in
   Cmd.v (Cmd.info "graph-build"
-           ~doc:"Load an opengrep-callgraph/v1 export into the urme store \
+           ~doc:"Load a call-graph JSON export into the urme store \
                  (nodes + edges + SCC/topo). The MCP describe-loop then \
                  fills in per-function descriptions.")
     Term.(const run $ json $ project_dir)
@@ -238,8 +239,9 @@ let graph_init_cmd =
   let extractor =
     Arg.(value & opt (some string) None & info ["extractor"]
            ~docv:"BIN"
-           ~doc:"Path to the opengrep-interfile-graph binary (default: \
-                 bundled next to urme, then \\$PATH).") in
+           ~doc:"Path to a call-graph extractor binary (advanced; by \
+                 default any supported extractor found on this machine \
+                 is used).") in
   let force =
     Arg.(value & flag & info ["force"]
            ~doc:"Rebuild even if the existing graph has annotations \
@@ -361,20 +363,18 @@ let graph_init_cmd =
         let produced () =
           Sys.file_exists out
           && (try (Unix.stat out).Unix.st_size > 2 with _ -> false) in
+        Printf.printf "extracting %s call graph...\n%!" lang;
         let ok =
           List.exists (fun cand ->
-            let cmd, shown = cmd_of cand in
-            Printf.printf "extracting %s call graph (%s)...\n%!" lang shown;
+            let cmd, _ = cmd_of cand in
             Sys.command (cmd ^ " 2>/dev/null") = 0 && produced ())
             candidates in
         if not ok then begin
           Printf.eprintf
-            "graph-init: no export found in .urme/ and no working \
-             extractor. Either place an opengrep-callgraph/v1 JSON at \
-             .urme/callgraph-<lang>.json and rerun, or install an opengrep \
-             with `show dump-interfile-graph --json`, or pass --extractor \
-             with a path to the standalone opengrep-interfile-graph \
-             binary.\n";
+            "graph-init: no call-graph export found and no supported \
+             extractor is available on this machine. Place a call-graph \
+             JSON at .urme/callgraph-<lang>.json (see the README section \
+             'Call-graph JSON format') and rerun.\n";
           exit 1
         end;
         out in
@@ -388,10 +388,10 @@ let graph_init_cmd =
       nn ne described total ready
   in
   Cmd.v (Cmd.info "graph-init"
-           ~doc:"Bootstrap the call graph in one step: run the \
-                 opengrep-interfile-graph extractor, load the export into \
-                 the urme store, and report status. Follow with `urme \
-                 annotate`.")
+           ~doc:"Set up the call graph: load .urme/callgraph-<lang>.json \
+                 when present (see the README section 'Call-graph JSON \
+                 format'), otherwise extract one if a supported extractor \
+                 is installed. Follow with `urme annotate`.")
     Term.(const run $ lang $ jobs $ extractor $ force $ project_dir)
 
 (* --- Subcommand: annotate ---
