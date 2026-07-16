@@ -66,12 +66,42 @@ jobs:
           shasum -a 256 "$tarball" | tee "$tarball.sha256"
           echo "tarball=$tarball" >> "$GITHUB_OUTPUT"
 
-      - uses: softprops/action-gh-release@v2
+      # Assets are collected by the single `publish` job: with immutable
+      # releases, a published release accepts no further uploads, so the
+      # per-platform jobs must not race to create it.
+      - uses: actions/upload-artifact@v4
         with:
-          files: |
+          name: tarball-arm64-darwin
+          path: |
             ${{ steps.stage.outputs.tarball }}
             ${{ steps.stage.outputs.tarball }}.sha256
-          generate_release_notes: true
+          if-no-files-found: error
+
+  # Single publisher: with immutable releases, assets can only be attached
+  # while the release is a draft — so collect both platforms' artifacts,
+  # create the release as a draft with everything, then flip it live.
+  publish:
+    needs: [macos, linux]
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: tarball-*
+          merge-multiple: true
+
+      - name: Create draft release with all assets, then publish
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          ls -lh urme-*
+          gh release create "$GITHUB_REF_NAME" \
+            --repo "$GITHUB_REPOSITORY" \
+            --draft --generate-notes \
+            urme-*.tar.gz urme-*.sha256
+          gh release edit "$GITHUB_REF_NAME" \
+            --repo "$GITHUB_REPOSITORY" --draft=false
 
   # Install the canonical formula template (packaging/homebrew) into the
   # tap (urme-dev/homebrew-urme) with version + sha256 filled from this
@@ -80,7 +110,7 @@ jobs:
   # (fine-grained PAT, contents:write on homebrew-urme); silently skipped
   # when the secret is absent.
   bump-tap:
-    needs: [macos, linux]
+    needs: [publish]
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
@@ -176,9 +206,10 @@ jobs:
           sha256sum "$tarball" | tee "$tarball.sha256"
           echo "tarball=$tarball" >> "$GITHUB_OUTPUT"
 
-      - uses: softprops/action-gh-release@v2
+      - uses: actions/upload-artifact@v4
         with:
-          files: |
+          name: tarball-x86_64-linux
+          path: |
             ${{ steps.stage.outputs.tarball }}
             ${{ steps.stage.outputs.tarball }}.sha256
-          generate_release_notes: true
+          if-no-files-found: error
