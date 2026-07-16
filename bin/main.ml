@@ -249,25 +249,31 @@ let graph_init_cmd =
       if project_dir = "." then Sys.getcwd ()
       else if Filename.is_relative project_dir
       then Filename.concat (Sys.getcwd ()) project_dir else project_dir in
-    (* Extractor resolution: --extractor flag, else bundled alongside the
-       urme executable (same dir, or ../libexec/{urme/,} for the Homebrew
-       layout where bin/urme is a symlink into the Cellar), else PATH. *)
-    let extractor = match extractor with
-      | Some p -> p
+    (* Extractor candidates, tried in order until one succeeds:
+       --extractor flag; `opengrep show dump-interfile-graph --json`
+       (recent opengrep ships the exporter; older ones fail fast and we
+       fall through); the standalone opengrep-interfile-graph dev binary,
+       bundled next to urme or on PATH. *)
+    let quiet_ok c = Sys.command (c ^ " >/dev/null 2>&1") = 0 in
+    let candidates = match extractor with
+      | Some p -> [ `Standalone p ]
       | None ->
+        let opengrep =
+          if quiet_ok "opengrep show supported-languages" then [ `Opengrep ]
+          else [] in
         let self =
           try Unix.realpath Sys.executable_name
           with _ -> Sys.executable_name in
         let dir = Filename.dirname self in
         let parent = Filename.dirname dir in
-        let candidates = [
-          Filename.concat dir "opengrep-interfile-graph";
-          Filename.concat parent "libexec/urme/opengrep-interfile-graph";
-          Filename.concat parent "libexec/opengrep-interfile-graph";
-        ] in
-        (match List.find_opt Sys.file_exists candidates with
-         | Some p -> p
-         | None -> "opengrep-interfile-graph") in
+        let bundled =
+          [ Filename.concat dir "opengrep-interfile-graph";
+            Filename.concat parent "libexec/urme/opengrep-interfile-graph";
+            Filename.concat parent "libexec/opengrep-interfile-graph" ]
+          |> List.filter Sys.file_exists in
+        opengrep
+        @ List.map (fun p -> `Standalone p) bundled
+        @ [ `Standalone "opengrep-interfile-graph" ] in
     (* language auto-detection: dominant source extension *)
     let detect () =
       let exts = [ ".py", "python"; ".kt", "kotlin"; ".kts", "kotlin";
@@ -322,17 +328,32 @@ let graph_init_cmd =
     let urme_dir = Filename.concat project_dir ".urme" in
     (try Unix.mkdir urme_dir 0o755 with Unix.Unix_error (Unix.EEXIST, _, _) -> ());
     let out = Filename.concat urme_dir ("callgraph-" ^ lang ^ ".json") in
-    let cmd = Printf.sprintf "%s export -l %s -r %s -o %s -j %d"
-        (Filename.quote extractor) (Filename.quote lang)
-        (Filename.quote project_dir) (Filename.quote out) jobs in
-    Printf.printf "extracting %s call graph...\n%!" lang;
-    let rc = Sys.command cmd in
-    if rc <> 0 then begin
+    let cmd_of = function
+      | `Opengrep ->
+        Printf.sprintf "opengrep show dump-interfile-graph %s %s --json > %s"
+          (Filename.quote lang) (Filename.quote project_dir)
+          (Filename.quote out),
+        "opengrep show dump-interfile-graph --json"
+      | `Standalone bin ->
+        Printf.sprintf "%s export -l %s -r %s -o %s -j %d"
+          (Filename.quote bin) (Filename.quote lang)
+          (Filename.quote project_dir) (Filename.quote out) jobs,
+        bin in
+    let produced () =
+      Sys.file_exists out
+      && (try (Unix.stat out).Unix.st_size > 2 with _ -> false) in
+    let ok =
+      List.exists (fun cand ->
+        let cmd, shown = cmd_of cand in
+        Printf.printf "extracting %s call graph (%s)...\n%!" lang shown;
+        Sys.command (cmd ^ " 2>/dev/null") = 0 && produced ())
+        candidates in
+    if not ok then begin
       Printf.eprintf
-        "graph-init: extractor failed (exit %d). Tried %s — it ships \
-         bundled with urme; if you built urme yourself, pass --extractor \
-         with the path to opengrep-interfile-graph.\n"
-        rc extractor;
+        "graph-init: no working extractor. Install a recent opengrep (its \
+         `show dump-interfile-graph --json` provides the export), or pass \
+         --extractor with a path to the standalone \
+         opengrep-interfile-graph binary.\n";
       exit 1
     end;
     let db = Urme_store.Schema.open_or_create ~project_dir in
