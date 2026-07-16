@@ -327,35 +327,57 @@ let graph_init_cmd =
     Urme_store.Schema.close db;
     let urme_dir = Filename.concat project_dir ".urme" in
     (try Unix.mkdir urme_dir 0o755 with Unix.Unix_error (Unix.EEXIST, _, _) -> ());
-    let out = Filename.concat urme_dir ("callgraph-" ^ lang ^ ".json") in
-    let cmd_of = function
-      | `Opengrep ->
-        Printf.sprintf "opengrep show dump-interfile-graph %s %s --json > %s"
-          (Filename.quote lang) (Filename.quote project_dir)
-          (Filename.quote out),
-        "opengrep show dump-interfile-graph --json"
-      | `Standalone bin ->
-        Printf.sprintf "%s export -l %s -r %s -o %s -j %d"
-          (Filename.quote bin) (Filename.quote lang)
-          (Filename.quote project_dir) (Filename.quote out) jobs,
-        bin in
-    let produced () =
-      Sys.file_exists out
-      && (try (Unix.stat out).Unix.st_size > 2 with _ -> false) in
-    let ok =
-      List.exists (fun cand ->
-        let cmd, shown = cmd_of cand in
-        Printf.printf "extracting %s call graph (%s)...\n%!" lang shown;
-        Sys.command (cmd ^ " 2>/dev/null") = 0 && produced ())
-        candidates in
-    if not ok then begin
-      Printf.eprintf
-        "graph-init: no working extractor. Install a recent opengrep (its \
-         `show dump-interfile-graph --json` provides the export), or pass \
-         --extractor with a path to the standalone \
-         opengrep-interfile-graph binary.\n";
-      exit 1
-    end;
+    (* An existing export in .urme/ wins: users without an extractor drop
+       a callgraph-<lang>.json there (opengrep-callgraph/v1) and graph-init
+       just loads it. Extraction only runs when there is nothing to load. *)
+    let existing =
+      (try Sys.readdir urme_dir with _ -> [||])
+      |> Array.to_list
+      |> List.filter (fun f ->
+        String.length f > 15
+        && String.sub f 0 10 = "callgraph-"
+        && Filename.check_suffix f ".json")
+      |> List.map (Filename.concat urme_dir)
+      |> List.sort (fun a b ->
+        compare (Unix.stat b).Unix.st_mtime (Unix.stat a).Unix.st_mtime) in
+    let out = match existing with
+      | j :: _ ->
+        Printf.printf "using existing export %s\n%!" j;
+        j
+      | [] ->
+        let out = Filename.concat urme_dir ("callgraph-" ^ lang ^ ".json") in
+        let cmd_of = function
+          | `Opengrep ->
+            Printf.sprintf
+              "opengrep show dump-interfile-graph %s %s --json > %s"
+              (Filename.quote lang) (Filename.quote project_dir)
+              (Filename.quote out),
+            "opengrep show dump-interfile-graph --json"
+          | `Standalone bin ->
+            Printf.sprintf "%s export -l %s -r %s -o %s -j %d"
+              (Filename.quote bin) (Filename.quote lang)
+              (Filename.quote project_dir) (Filename.quote out) jobs,
+            bin in
+        let produced () =
+          Sys.file_exists out
+          && (try (Unix.stat out).Unix.st_size > 2 with _ -> false) in
+        let ok =
+          List.exists (fun cand ->
+            let cmd, shown = cmd_of cand in
+            Printf.printf "extracting %s call graph (%s)...\n%!" lang shown;
+            Sys.command (cmd ^ " 2>/dev/null") = 0 && produced ())
+            candidates in
+        if not ok then begin
+          Printf.eprintf
+            "graph-init: no export found in .urme/ and no working \
+             extractor. Either place an opengrep-callgraph/v1 JSON at \
+             .urme/callgraph-<lang>.json and rerun, or install an opengrep \
+             with `show dump-interfile-graph --json`, or pass --extractor \
+             with a path to the standalone opengrep-interfile-graph \
+             binary.\n";
+          exit 1
+        end;
+        out in
     let db = Urme_store.Schema.open_or_create ~project_dir in
     let (nn, ne) = Urme_engine.Callgraph_load.build ~db ~json_path:out in
     let (total, described, ready) = Urme_store.Callgraph_store.status db in
