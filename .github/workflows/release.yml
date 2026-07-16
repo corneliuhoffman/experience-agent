@@ -73,15 +73,19 @@ jobs:
             ${{ steps.stage.outputs.tarball }}.sha256
           generate_release_notes: true
 
-  # Rewrite version + sha256 in the tap formula (urme-dev/homebrew-urme)
-  # once both tarballs are published. Needs a TAP_GITHUB_TOKEN secret
+  # Install the canonical formula template (packaging/homebrew) into the
+  # tap (urme-dev/homebrew-urme) with version + sha256 filled from this
+  # release — a full copy, not a patch, so structure/URL changes to the
+  # template always propagate. Needs a TAP_GITHUB_TOKEN secret
   # (fine-grained PAT, contents:write on homebrew-urme); silently skipped
-  # when the secret is absent so releases work before the tap exists.
+  # when the secret is absent.
   bump-tap:
     needs: [macos, linux]
     runs-on: ubuntu-22.04
     steps:
-      - name: Bump formula in the tap
+      - uses: actions/checkout@v4
+
+      - name: Render formula and push to the tap
         shell: bash
         env:
           TAP_TOKEN: ${{ secrets.TAP_GITHUB_TOKEN }}
@@ -89,16 +93,19 @@ jobs:
           [ -n "$TAP_TOKEN" ] || { echo "no TAP_GITHUB_TOKEN; skipping tap bump"; exit 0; }
           version="${GITHUB_REF_NAME#v}"
           base="https://github.com/${GITHUB_REPOSITORY}/releases/download/v${version}"
-          mac_sha=$(curl -sL "$base/urme-${version}-arm64-darwin.tar.gz" | shasum -a 256 | cut -d' ' -f1)
+          mac_sha=$(curl -sL "$base/urme-${version}-arm64-darwin.tar.gz" | sha256sum | cut -d' ' -f1)
           linux_sha=$(curl -sL "$base/urme-${version}-x86_64-linux.tar.gz" | sha256sum | cut -d' ' -f1)
+          echo "arm64-darwin: $mac_sha"
+          echo "x86_64-linux: $linux_sha"
+          sed -e "s/@VERSION@/${version}/g" \
+              -e "s/@ARM64_DARWIN_SHA256@/${mac_sha}/" \
+              -e "s/@X86_64_LINUX_SHA256@/${linux_sha}/" \
+              packaging/homebrew/Formula/urme.rb > /tmp/urme.rb
+          ruby -c /tmp/urme.rb
+          ! grep -Eq '@[A-Z0-9_]+@' /tmp/urme.rb || { echo "unfilled placeholder"; exit 1; }
           git clone "https://x-access-token:${TAP_TOKEN}@github.com/urme-dev/homebrew-urme.git" tap
+          cp /tmp/urme.rb tap/Formula/urme.rb
           cd tap
-          f=Formula/urme.rb
-          sed -i "s/^  version \".*\"/  version \"${version}\"/" "$f"
-          # First sha256 line = darwin block, second = linux block.
-          sed -i "0,/sha256 \".*\"/s//sha256 \"${mac_sha}\"/" "$f"
-          sed -i "0,/sha256 \"${mac_sha}\"/!{0,/sha256 \".*\"/s//sha256 \"${linux_sha}\"/}" "$f"
-          grep -n 'version \|sha256' "$f"
           git config user.name "urme-release-bot"
           git config user.email "release-bot@users.noreply.github.com"
           git commit -am "urme ${version}"

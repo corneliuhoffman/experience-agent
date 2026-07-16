@@ -1,30 +1,35 @@
-# Canonical copy of the tap formula. Lives in urme-dev/homebrew-urme as
-# Formula/urme.rb; the release workflow's tap-bump job rewrites the
-# version/sha256 lines there on every tagged release. Edit THIS file for
-# structural changes and copy it over.
+# Canonical tap formula (template). The release workflow's bump-tap job
+# copies this file into urme-dev/homebrew-urme as Formula/urme.rb,
+# substituting @VERSION@ and the two @..._SHA256@ placeholders — so edit
+# structure HERE, never in the tap.
 class Urme < Formula
   desc "TUI + MCP server: git/Claude session history and an annotated call graph"
   homepage "https://github.com/urme-dev/urme"
-  version "0.2.0"
+  version "@VERSION@"
   license "MIT"
 
+  # urme shells out to git at runtime; everything else is bundled into
+  # the tarball (macos: dylibbundler, linux: bundled .so + $ORIGIN rpath).
+  depends_on "git"
+
   on_macos do
-    # Prebuilt binaries are arm64-only for now; Intel Macs build from source.
-    depends_on arch: :arm64
-    url "https://github.com/urme-dev/urme/releases/download/v#{version}/urme-#{version}-arm64-darwin.tar.gz"
-    sha256 "REPLACE_ARM64_DARWIN_SHA256"
+    on_arm do
+      url "https://github.com/urme-dev/urme/releases/download/v@VERSION@/urme-@VERSION@-arm64-darwin.tar.gz"
+      sha256 "@ARM64_DARWIN_SHA256@"
+    end
   end
 
   on_linux do
-    depends_on arch: :x86_64
-    url "https://github.com/urme-dev/urme/releases/download/v#{version}/urme-#{version}-x86_64-linux.tar.gz"
-    sha256 "REPLACE_X86_64_LINUX_SHA256"
+    on_intel do
+      url "https://github.com/urme-dev/urme/releases/download/v@VERSION@/urme-@VERSION@-x86_64-linux.tar.gz"
+      sha256 "@X86_64_LINUX_SHA256@"
+    end
   end
 
   def install
-    # The tarball ships `urme` + `lib/` with install names rewritten to
-    # @executable_path/lib ($ORIGIN/lib on Linux), so binary and libs
-    # must stay siblings: install both under libexec and symlink into bin.
+    # Both tarballs ship `urme` + `lib/` side-by-side. Install into
+    # libexec so the binary's RPATH / @executable_path resolves the
+    # bundled libs, then symlink into bin.
     libexec.install "urme", "lib"
     bin.install_symlink libexec/"urme"
   end
