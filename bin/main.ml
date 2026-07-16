@@ -236,8 +236,10 @@ let graph_init_cmd =
     Arg.(value & opt int 16 & info ["j"; "jobs"] ~docv:"N"
            ~doc:"Extractor parallelism (default 16).") in
   let extractor =
-    Arg.(value & opt string "opengrep-interfile-graph" & info ["extractor"]
-           ~docv:"BIN" ~doc:"Path to the opengrep-interfile-graph binary.") in
+    Arg.(value & opt (some string) None & info ["extractor"]
+           ~docv:"BIN"
+           ~doc:"Path to the opengrep-interfile-graph binary (default: \
+                 bundled next to urme, then \\$PATH).") in
   let force =
     Arg.(value & flag & info ["force"]
            ~doc:"Rebuild even if the existing graph has annotations \
@@ -247,6 +249,25 @@ let graph_init_cmd =
       if project_dir = "." then Sys.getcwd ()
       else if Filename.is_relative project_dir
       then Filename.concat (Sys.getcwd ()) project_dir else project_dir in
+    (* Extractor resolution: --extractor flag, else bundled alongside the
+       urme executable (same dir, or ../libexec/{urme/,} for the Homebrew
+       layout where bin/urme is a symlink into the Cellar), else PATH. *)
+    let extractor = match extractor with
+      | Some p -> p
+      | None ->
+        let self =
+          try Unix.realpath Sys.executable_name
+          with _ -> Sys.executable_name in
+        let dir = Filename.dirname self in
+        let parent = Filename.dirname dir in
+        let candidates = [
+          Filename.concat dir "opengrep-interfile-graph";
+          Filename.concat parent "libexec/urme/opengrep-interfile-graph";
+          Filename.concat parent "libexec/opengrep-interfile-graph";
+        ] in
+        (match List.find_opt Sys.file_exists candidates with
+         | Some p -> p
+         | None -> "opengrep-interfile-graph") in
     (* language auto-detection: dominant source extension *)
     let detect () =
       let exts = [ ".py", "python"; ".kt", "kotlin"; ".kts", "kotlin";
@@ -308,8 +329,9 @@ let graph_init_cmd =
     let rc = Sys.command cmd in
     if rc <> 0 then begin
       Printf.eprintf
-        "graph-init: extractor failed (exit %d). Is %s installed and on \
-         PATH? (brew install opengrep-interfile-graph, or pass --extractor)\n"
+        "graph-init: extractor failed (exit %d). Tried %s — it ships \
+         bundled with urme; if you built urme yourself, pass --extractor \
+         with the path to opengrep-interfile-graph.\n"
         rc extractor;
       exit 1
     end;
