@@ -7,7 +7,7 @@ modifications, and search past interactions.
 ## Install
 
 ```sh
-brew tap corneliuhoffman/urme
+brew tap urme-dev/urme
 brew install urme
 ```
 
