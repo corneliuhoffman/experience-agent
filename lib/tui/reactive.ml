@@ -18,7 +18,7 @@ module I = Notty.I
    but classified the context as unsafe — which can prevent proper
    invalidation propagation. *)
 let () =
-  Lwd.unsafe_mutation_logger := (fun () ->
+  Lwd.unsafe_action_logger := (fun _ ->
     let oc = open_out_gen [Open_append; Open_creat] 0o644
         "/tmp/urme_reactive.log" in
     Printf.fprintf oc "%.3f UNSAFE MUTATION detected\n"
